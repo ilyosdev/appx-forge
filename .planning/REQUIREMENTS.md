@@ -9,10 +9,10 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Infrastructure Validation
 
-- [ ] **INFRA-01**: Tailscale UDP connectivity verified between Contabo VDS nodes (direct peering, not DERP relay)
-- [ ] **INFRA-02**: Docker Engine 27.x installed and confirmed on target nodes
-- [ ] **INFRA-03**: Kernel inotify watch limit set to support 80+ containers with Metro file watchers
-- [ ] **INFRA-04**: Cloudflare wildcard DNS configured for `*.myappx.live` pointing at proxy node(s)
+- [x] **INFRA-01**: Tailscale UDP connectivity verified between Contabo VDS nodes (direct peering, not DERP relay)
+- [x] **INFRA-02**: Docker Engine 27.x installed and confirmed on target nodes
+- [x] **INFRA-03**: Kernel inotify watch limit set to support 80+ containers with Metro file watchers
+- [x] **INFRA-04**: Cloudflare wildcard DNS configured for `*.myappx.live` pointing at proxy node(s)
 
 ### Contracts & Schema
 
@@ -172,10 +172,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | Phase 1 | Pending |
-| INFRA-02 | Phase 1 | Pending |
-| INFRA-03 | Phase 1 | Pending |
-| INFRA-04 | Phase 1 | Pending |
+| INFRA-01 | Phase 1 | Complete |
+| INFRA-02 | Phase 1 | Complete |
+| INFRA-03 | Phase 1 | Complete |
+| INFRA-04 | Phase 1 | Complete |
 | CNTR-01 | Phase 1 | Complete |
 | CNTR-02 | Phase 1 | Complete |
 | CNTR-03 | Phase 1 | Complete |

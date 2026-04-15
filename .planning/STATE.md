@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: "Completed 01-03-PLAN.md (contract documents: OpenAPI, agent, file-push, proxy routing)"
-last_updated: "2026-04-15T19:32:27.504Z"
+stopped_at: Completed 01-04-PLAN.md (infrastructure verification scripts)
+last_updated: "2026-04-15T19:37:33.758Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 0
   total_plans: 5
-  completed_plans: 2
-  percent: 40
+  completed_plans: 3
+  percent: 60
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 01 (Infrastructure & Contracts) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
 Last activity: 2026-04-15
 
@@ -54,6 +54,7 @@ Progress: [░░░░░░░░░░] 0%
 *Updated after each plan completion*
 | Phase 01 P01 | 7min | 2 tasks | 11 files |
 | Phase 01 P03 | 6min | 2 tasks | 4 files |
+| Phase 01 P04 | 3min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -71,6 +72,7 @@ Recent decisions affecting current work:
 - [Phase 01]: Error responses use RFC 7807 application/problem+json with type/title/status/detail/instance fields
 - [Phase 01]: Agent registration endpoint is unauthenticated (security: []) since it provides the token
 - [Phase 01]: File push HMAC uses full URL path+query canonical message for stronger security
+- [Phase 01]: DNS verification uses dig with nslookup fallback for portability
 
 ### Pending Todos
 
@@ -92,6 +94,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T19:32:27.502Z
-Stopped at: Completed 01-03-PLAN.md (contract documents: OpenAPI, agent, file-push, proxy routing)
+Last session: 2026-04-15T19:37:33.756Z
+Stopped at: Completed 01-04-PLAN.md (infrastructure verification scripts)
 Resume file: None
