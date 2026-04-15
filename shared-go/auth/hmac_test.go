@@ -47,18 +47,15 @@ func TestVerifyRejectsExpiredURL(t *testing.T) {
 	key := []byte("test-secret-key-256bit-minimum!!")
 	rawURL := "https://agent.internal:8080/sandboxes/abc123/files"
 
-	// Sign with zero expiry (already expired)
-	signed, err := SignURL(rawURL, key, 0)
+	// Sign with negative expiry (already expired)
+	signed, err := SignURL(rawURL, key, -1*time.Second)
 	if err != nil {
 		t.Fatalf("SignURL failed: %v", err)
 	}
 
-	// Small sleep to ensure we're past expiry
-	time.Sleep(10 * time.Millisecond)
-
 	_, err = VerifyURL(signed, key)
 	if err == nil {
-		t.Error("VerifyURL should reject expired URL")
+		t.Fatal("VerifyURL should reject expired URL")
 	}
 	if !strings.Contains(err.Error(), "expired") {
 		t.Errorf("error should mention expiry, got: %v", err)
