@@ -55,6 +55,37 @@ func (q *Queries) AssignSandboxToNode(ctx context.Context, arg AssignSandboxToNo
 	return i, err
 }
 
+const countSandboxesByState = `-- name: CountSandboxesByState :many
+SELECT state, COUNT(*)::int AS count
+FROM sandboxes
+GROUP BY state
+`
+
+type CountSandboxesByStateRow struct {
+	State string `json:"state"`
+	Count int32  `json:"count"`
+}
+
+func (q *Queries) CountSandboxesByState(ctx context.Context) ([]CountSandboxesByStateRow, error) {
+	rows, err := q.db.Query(ctx, countSandboxesByState)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountSandboxesByStateRow{}
+	for rows.Next() {
+		var i CountSandboxesByStateRow
+		if err := rows.Scan(&i.State, &i.Count); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createSandbox = `-- name: CreateSandbox :one
 INSERT INTO sandboxes (id, app_name, user_id, image, state, resources, env, idle_timeout_seconds, metadata)
 VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8)
@@ -141,6 +172,38 @@ SELECT id, app_name, user_id, node_id, container_id, host_port, image, state, st
 
 func (q *Queries) GetSandboxByAppName(ctx context.Context, appName string) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, getSandboxByAppName, appName)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.AppName,
+		&i.UserID,
+		&i.NodeID,
+		&i.ContainerID,
+		&i.HostPort,
+		&i.Image,
+		&i.State,
+		&i.StateVersion,
+		&i.Resources,
+		&i.Env,
+		&i.IdleTimeoutSeconds,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastActiveAt,
+		&i.FailureCount,
+		&i.Metadata,
+	)
+	return i, err
+}
+
+const incrementSandboxFailureCount = `-- name: IncrementSandboxFailureCount :one
+UPDATE sandboxes
+SET failure_count = failure_count + 1, updated_at = NOW()
+WHERE id = $1
+RETURNING id, app_name, user_id, node_id, container_id, host_port, image, state, state_version, resources, env, idle_timeout_seconds, created_at, updated_at, last_active_at, failure_count, metadata
+`
+
+func (q *Queries) IncrementSandboxFailureCount(ctx context.Context, id pgtype.UUID) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, incrementSandboxFailureCount, id)
 	var i Sandbox
 	err := row.Scan(
 		&i.ID,
@@ -375,6 +438,17 @@ func (q *Queries) ListSandboxesByUser(ctx context.Context, userID string) ([]San
 		return nil, err
 	}
 	return items, nil
+}
+
+const resetSandboxFailureCount = `-- name: ResetSandboxFailureCount :exec
+UPDATE sandboxes
+SET failure_count = 0, updated_at = NOW()
+WHERE id = $1
+`
+
+func (q *Queries) ResetSandboxFailureCount(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, resetSandboxFailureCount, id)
+	return err
 }
 
 const transitionSandboxState = `-- name: TransitionSandboxState :one

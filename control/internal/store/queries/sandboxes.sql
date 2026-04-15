@@ -41,3 +41,19 @@ SELECT * FROM sandboxes
 WHERE state = 'running'
   AND last_active_at < NOW() - (idle_timeout_seconds || ' seconds')::INTERVAL
 ORDER BY last_active_at ASC;
+
+-- name: IncrementSandboxFailureCount :one
+UPDATE sandboxes
+SET failure_count = failure_count + 1, updated_at = NOW()
+WHERE id = $1
+RETURNING *;
+
+-- name: ResetSandboxFailureCount :exec
+UPDATE sandboxes
+SET failure_count = 0, updated_at = NOW()
+WHERE id = $1;
+
+-- name: CountSandboxesByState :many
+SELECT state, COUNT(*)::int AS count
+FROM sandboxes
+GROUP BY state;
