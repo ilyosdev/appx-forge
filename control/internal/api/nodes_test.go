@@ -21,25 +21,25 @@ import (
 
 // mockNodeStore implements NodeStore for testing registration and heartbeat.
 type mockNodeStore struct {
-	getByHostnameAndIPFn func(ctx context.Context, hostname string, ip netip.Addr) (nodeRecord, error)
-	createNodeFn         func(ctx context.Context, arg createNodeArgs) (nodeRecord, error)
+	getByHostnameAndIPFn func(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error)
+	createNodeFn         func(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error)
 	updateNodeTokenFn    func(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error
-	getNodeFn            func(ctx context.Context, id pgtype.UUID) (nodeRecord, error)
+	getNodeFn            func(ctx context.Context, id pgtype.UUID) (NodeRecord, error)
 	updateHeartbeatFn    func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error
 }
 
-func (m *mockNodeStore) GetNodeByHostnameAndIP(ctx context.Context, hostname string, ip netip.Addr) (nodeRecord, error) {
+func (m *mockNodeStore) GetNodeByHostnameAndIP(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error) {
 	if m.getByHostnameAndIPFn != nil {
 		return m.getByHostnameAndIPFn(ctx, hostname, ip)
 	}
-	return nodeRecord{}, pgx.ErrNoRows
+	return NodeRecord{}, pgx.ErrNoRows
 }
 
-func (m *mockNodeStore) CreateNode(ctx context.Context, arg createNodeArgs) (nodeRecord, error) {
+func (m *mockNodeStore) CreateNode(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error) {
 	if m.createNodeFn != nil {
 		return m.createNodeFn(ctx, arg)
 	}
-	return nodeRecord{}, nil
+	return NodeRecord{}, nil
 }
 
 func (m *mockNodeStore) UpdateNodeToken(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error {
@@ -49,11 +49,11 @@ func (m *mockNodeStore) UpdateNodeToken(ctx context.Context, token string, agent
 	return nil
 }
 
-func (m *mockNodeStore) GetNode(ctx context.Context, id pgtype.UUID) (nodeRecord, error) {
+func (m *mockNodeStore) GetNode(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
 	if m.getNodeFn != nil {
 		return m.getNodeFn(ctx, id)
 	}
-	return nodeRecord{}, pgx.ErrNoRows
+	return NodeRecord{}, pgx.ErrNoRows
 }
 
 func (m *mockNodeStore) UpdateNodeHeartbeat(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error {
@@ -72,11 +72,11 @@ func testLogger() *slog.Logger {
 
 func TestRegisterNode_ValidRequest(t *testing.T) {
 	store := &mockNodeStore{
-		getByHostnameAndIPFn: func(ctx context.Context, hostname string, ip netip.Addr) (nodeRecord, error) {
-			return nodeRecord{}, pgx.ErrNoRows
+		getByHostnameAndIPFn: func(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error) {
+			return NodeRecord{}, pgx.ErrNoRows
 		},
-		createNodeFn: func(ctx context.Context, arg createNodeArgs) (nodeRecord, error) {
-			return nodeRecord{ID: arg.ID, Hostname: arg.Hostname}, nil
+		createNodeFn: func(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error) {
+			return NodeRecord{ID: arg.ID, Hostname: arg.Hostname}, nil
 		},
 	}
 
@@ -119,8 +119,8 @@ func TestRegisterNode_ReRegistration(t *testing.T) {
 
 	var capturedToken string
 	store := &mockNodeStore{
-		getByHostnameAndIPFn: func(ctx context.Context, hostname string, ip netip.Addr) (nodeRecord, error) {
-			return nodeRecord{ID: existingID, Hostname: hostname}, nil
+		getByHostnameAndIPFn: func(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error) {
+			return NodeRecord{ID: existingID, Hostname: hostname}, nil
 		},
 		updateNodeTokenFn: func(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error {
 			capturedToken = token
@@ -214,11 +214,11 @@ func TestRegisterNode_InvalidJSON(t *testing.T) {
 func TestRegisterNode_NoAuthRequired(t *testing.T) {
 	// Registration should work without any auth token
 	store := &mockNodeStore{
-		getByHostnameAndIPFn: func(ctx context.Context, hostname string, ip netip.Addr) (nodeRecord, error) {
-			return nodeRecord{}, pgx.ErrNoRows
+		getByHostnameAndIPFn: func(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error) {
+			return NodeRecord{}, pgx.ErrNoRows
 		},
-		createNodeFn: func(ctx context.Context, arg createNodeArgs) (nodeRecord, error) {
-			return nodeRecord{ID: arg.ID, Hostname: arg.Hostname}, nil
+		createNodeFn: func(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error) {
+			return NodeRecord{ID: arg.ID, Hostname: arg.Hostname}, nil
 		},
 	}
 
@@ -254,11 +254,11 @@ func TestHeartbeat_ValidRequest(t *testing.T) {
 	var capturedUsedMb int32
 	var capturedRunning int32
 	store := &mockNodeStore{
-		getNodeFn: func(ctx context.Context, id pgtype.UUID) (nodeRecord, error) {
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
 			if id != nodeID {
 				t.Fatalf("unexpected node ID in GetNode")
 			}
-			return nodeRecord{ID: nodeID, Hostname: "node-1"}, nil
+			return NodeRecord{ID: nodeID, Hostname: "node-1"}, nil
 		},
 		updateHeartbeatFn: func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error {
 			capturedUsedMb = usedMb
@@ -292,8 +292,8 @@ func TestHeartbeat_ValidRequest(t *testing.T) {
 
 func TestHeartbeat_UnknownNode(t *testing.T) {
 	store := &mockNodeStore{
-		getNodeFn: func(ctx context.Context, id pgtype.UUID) (nodeRecord, error) {
-			return nodeRecord{}, pgx.ErrNoRows
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{}, pgx.ErrNoRows
 		},
 	}
 

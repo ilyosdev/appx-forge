@@ -18,22 +18,22 @@ import (
 // In production, a wrapper around *store.Queries satisfies this interface.
 // In tests, a mock implementation is injected.
 type NodeStore interface {
-	GetNodeByHostnameAndIP(ctx context.Context, hostname string, ip netip.Addr) (nodeRecord, error)
-	CreateNode(ctx context.Context, arg createNodeArgs) (nodeRecord, error)
+	GetNodeByHostnameAndIP(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error)
+	CreateNode(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error)
 	UpdateNodeToken(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error
-	GetNode(ctx context.Context, id pgtype.UUID) (nodeRecord, error)
+	GetNode(ctx context.Context, id pgtype.UUID) (NodeRecord, error)
 	UpdateNodeHeartbeat(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error
 }
 
-// nodeRecord is the minimal node data handlers need. It decouples handlers from
+// NodeRecord is the minimal node data handlers need. It decouples handlers from
 // the sqlc-generated store.Node type.
-type nodeRecord struct {
+type NodeRecord struct {
 	ID       pgtype.UUID
 	Hostname string
 }
 
-// createNodeArgs are the parameters for creating a new node.
-type createNodeArgs struct {
+// CreateNodeArgs are the parameters for creating a new node.
+type CreateNodeArgs struct {
 	ID              pgtype.UUID
 	Hostname        string
 	TailscaleIP     netip.Addr
@@ -162,7 +162,7 @@ func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		metadata = []byte(*req.Metadata)
 	}
 
-	_, err = s.nodeStore.CreateNode(ctx, createNodeArgs{
+	_, err = s.nodeStore.CreateNode(ctx, CreateNodeArgs{
 		ID:              pgID,
 		Hostname:        req.Hostname,
 		TailscaleIP:     ip,
