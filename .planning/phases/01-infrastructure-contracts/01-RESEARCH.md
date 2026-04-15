@@ -950,22 +950,22 @@ fi
 | A4 | Existing bundle-server app/package.json packages are all needed for sandbox image | Sandbox Image / IMG-03 | Some packages (camera, contacts, calendar) may be removable to reduce image size |
 | A5 | sqlc handles pgx `ErrNoRows` correctly for CAS queries returning zero rows | CAS Pattern | May need custom error handling wrapper around sqlc-generated code |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Sandbox image CMD: `expo start` vs custom server?**
    - What we know: Dockerfile.v2 uses `npx tsx src/server-v2.ts` (custom Express+Metro server). Expo CLI `expo start` is simpler but may lack custom endpoints (`/status`, `/update`).
    - What's unclear: Whether the sandbox needs a custom HTTP server (for file push direct endpoint, status checks) or if Metro's built-in dev server is sufficient.
-   - Recommendation: Start with `expo start` for simplicity. If custom endpoints are needed, the agent provides them (file push goes to agent, not container). Container only needs Metro.
+   - RESOLVED: Use `expo start` for simplicity. Agent provides file push and health endpoints — container only needs Metro.
 
 2. **Should `commands` table be in Phase 1 or Phase 3?**
    - What we know: Phase 1 defines contracts and schema. The `commands` table supports long-poll dispatch which is Phase 3 (control plane) functionality.
    - What's unclear: Whether to create the table now (complete schema) or defer to Phase 3.
-   - Recommendation: Create it now. Schema is cheap. Having the complete schema in Phase 1 means downstream phases don't need migration changes for core tables.
+   - RESOLVED: Create it now in Phase 1. Schema is cheap. Complete schema in Phase 1 means downstream phases don't need migration changes for core tables.
 
 3. **Postgres hosting: local Docker or managed service?**
    - What we know: STARTER_PLAN mentions Neon/Supabase. Local development uses Docker Compose.
    - What's unclear: Whether to set up managed Postgres now or defer.
-   - Recommendation: Local Docker for development (in docker-compose.dev.yml). Managed Postgres is a deployment concern, not Phase 1.
+   - RESOLVED: Local Docker for development (docker-compose.dev.yml). Managed Postgres is a deployment concern for Phase 6/7.
 
 ## Environment Availability
 
