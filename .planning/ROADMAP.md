@@ -12,7 +12,7 @@ AppX Forge replaces Railover/CapRover/Docker Swarm with a purpose-built Go conta
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Infrastructure & Contracts** - Validate infra assumptions and define all API contracts, schemas, and state machine
+- [x] **Phase 1: Infrastructure & Contracts** - Validate infra assumptions and define all API contracts, schemas, and state machine
 - [ ] **Phase 2: Agent & Container Lifecycle** - Go agent binary that creates, monitors, and reports on Docker containers
 - [ ] **Phase 3: Control Plane API** - HTTP API that orchestrates sandbox lifecycle via scheduler and command dispatch
 - [ ] **Phase 4: Proxy, Routing & File Push** - Caddy dynamic routing and file push protocol for live sandbox access
@@ -116,7 +116,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Infrastructure & Contracts | 0/5 | Planning complete | - |
+| 1. Infrastructure & Contracts | 5/5 | Complete | 2026-04-16 |
 | 2. Agent & Container Lifecycle | 0/0 | Not started | - |
 | 3. Control Plane API | 0/0 | Not started | - |
 | 4. Proxy, Routing & File Push | 0/0 | Not started | - |
