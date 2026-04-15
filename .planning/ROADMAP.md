@@ -59,7 +59,7 @@ Plans:
 - [x] 02-03-PLAN.md -- Docker events watcher + image pre-pull + log retrieval TDD
 - [x] 02-04-PLAN.md -- Control plane HTTP client + heartbeat sender TDD
 - [x] 02-05-PLAN.md -- File push HTTP handler with HMAC validation TDD
-- [ ] 02-06-PLAN.md -- Agent main binary + command executor + systemd service
+- [x] 02-06-PLAN.md -- Agent main binary + command executor + systemd service
 
 ### Phase 3: Control Plane API
 **Goal**: A running Go HTTP API that accepts sandbox requests, schedules them to nodes, dispatches commands to agents via long-poll, and transitions sandbox state based on agent reports
