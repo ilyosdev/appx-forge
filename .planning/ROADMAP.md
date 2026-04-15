@@ -13,7 +13,7 @@ AppX Forge replaces Railover/CapRover/Docker Swarm with a purpose-built Go conta
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Infrastructure & Contracts** - Validate infra assumptions and define all API contracts, schemas, and state machine
-- [ ] **Phase 2: Agent & Container Lifecycle** - Go agent binary that creates, monitors, and reports on Docker containers
+- [x] **Phase 2: Agent & Container Lifecycle** - Go agent binary that creates, monitors, and reports on Docker containers
 - [ ] **Phase 3: Control Plane API** - HTTP API that orchestrates sandbox lifecycle via scheduler and command dispatch
 - [ ] **Phase 4: Proxy, Routing & File Push** - Caddy dynamic routing and file push protocol for live sandbox access
 - [ ] **Phase 5: Reliability & Security** - Crash recovery, idle reaping, seccomp hardening, and observability
