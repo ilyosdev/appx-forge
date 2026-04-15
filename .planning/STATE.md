@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: executing
-stopped_at: Completed 01-05-PLAN.md (sandbox Docker image)
-last_updated: "2026-04-15T19:42:35.719Z"
+status: verifying
+stopped_at: Completed 01-02-PLAN.md (Postgres schema + migrations + CAS tests)
+last_updated: "2026-04-15T19:58:33.149Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
-  completed_phases: 0
+  completed_phases: 1
   total_plans: 5
-  completed_plans: 4
-  percent: 80
+  completed_plans: 5
+  percent: 100
 ---
 
 # Project State
@@ -27,7 +27,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 
 Phase: 01 (Infrastructure & Contracts) — EXECUTING
 Plan: 5 of 5
-Status: Ready to execute
+Status: Phase complete — ready for verification
 Last activity: 2026-04-15
 
 Progress: [░░░░░░░░░░] 0%
@@ -56,6 +56,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P03 | 6min | 2 tasks | 4 files |
 | Phase 01 P04 | 3min | 2 tasks | 4 files |
 | Phase 01 P05 | 3min | 2 tasks | 9 files |
+| Phase 01 P02 | 12min | 2 tasks | 20 files |
 
 ## Accumulated Context
 
@@ -76,6 +77,9 @@ Recent decisions affecting current work:
 - [Phase 01]: DNS verification uses dig with nslookup fallback for portability
 - [Phase 01]: npm install without --production flag -- babel-preset-expo and typescript needed at runtime for Metro bundling
 - [Phase 01]: Shared deps at /opt/expo-shared-deps with symlink into app -- separates heavy Docker layer from app template for cache efficiency
+- [Phase 01]: Used runtime.Caller for migration path resolution instead of go:embed (embed cannot traverse parent dirs)
+- [Phase 01]: CAS pattern: UPDATE WHERE state=$expected returns pgx.ErrNoRows on rejection -- proven with integration tests
+- [Phase 01]: Close database/sql connection before testcontainers Snapshot to avoid template DB lock
 
 ### Pending Todos
 
@@ -97,6 +101,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T19:42:35.716Z
-Stopped at: Completed 01-05-PLAN.md (sandbox Docker image)
+Last session: 2026-04-15T19:58:33.146Z
+Stopped at: Completed 01-02-PLAN.md (Postgres schema + migrations + CAS tests)
 Resume file: None
