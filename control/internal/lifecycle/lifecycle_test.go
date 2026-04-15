@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"testing"
 
 	"github.com/google/uuid"
@@ -24,6 +25,7 @@ type mockStore struct {
 	createCommandFn       func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	ackCommandFn          func(ctx context.Context, arg store.AckCommandParams) error
 	recordEventFn         func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+	getNodeFn             func(ctx context.Context, id pgtype.UUID) (store.Node, error)
 }
 
 func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
@@ -87,6 +89,13 @@ func (m *mockStore) RecordEvent(ctx context.Context, arg store.RecordEventParams
 		return m.recordEventFn(ctx, arg)
 	}
 	return store.Event{}, nil
+}
+
+func (m *mockStore) GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	if m.getNodeFn != nil {
+		return m.getNodeFn(ctx, id)
+	}
+	return store.Node{}, errors.New("not found")
 }
 
 // ── Test Helpers ─────────────────────────────────────────────────────
@@ -512,5 +521,211 @@ func TestRestartSandbox_HappyPath(t *testing.T) {
 	// No state transition for restart (stays running)
 	if transitionCalled {
 		t.Fatal("expected no state transition for restart")
+	}
+}
+
+// ── Mock RouteNotifier ─────────────────────────────────────────────
+
+type mockRouteNotifier struct {
+	runningCalls []routeRunningCall
+	stoppedCalls []string // app names
+}
+
+type routeRunningCall struct {
+	AppName   string
+	SandboxID string
+	Upstream  string
+}
+
+func (m *mockRouteNotifier) OnSandboxRunning(_ context.Context, appName, sandboxID, upstream string) error {
+	m.runningCalls = append(m.runningCalls, routeRunningCall{AppName: appName, SandboxID: sandboxID, Upstream: upstream})
+	return nil
+}
+
+func (m *mockRouteNotifier) OnSandboxStopped(_ context.Context, appName string) error {
+	m.stoppedCalls = append(m.stoppedCalls, appName)
+	return nil
+}
+
+// ── Lifecycle Route Notification Tests ─────────────────────────────
+
+func TestLifecycle_Route_HandleAck_StartSandboxSuccess_CallsOnSandboxRunning(t *testing.T) {
+	sandboxID := uuid.New()
+	nodeID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	pgNodeID := makePgUUID(nodeID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:       pgSandboxID,
+				State:    "starting",
+				AppName:  "test-app",
+				NodeID:   pgNodeID,
+				HostPort: pgtype.Int4{Int32: 8081, Valid: true},
+			}, nil
+		},
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+			return store.Node{
+				ID:          pgNodeID,
+				TailscaleIp: netip.MustParseAddr("100.64.0.1"),
+			}, nil
+		},
+	}
+
+	rn := &mockRouteNotifier{}
+	svc := New(ms, nil)
+	svc.SetRouteNotifier(rn)
+
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "start_sandbox", "success",
+		json.RawMessage(`{"container_id":"abc123","host_port":8081}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(rn.runningCalls) != 1 {
+		t.Fatalf("expected 1 OnSandboxRunning call, got %d", len(rn.runningCalls))
+	}
+	call := rn.runningCalls[0]
+	if call.AppName != "test-app" {
+		t.Errorf("appName = %q, want test-app", call.AppName)
+	}
+	if call.Upstream != "100.64.0.1:8081" {
+		t.Errorf("upstream = %q, want 100.64.0.1:8081", call.Upstream)
+	}
+	if call.SandboxID != sandboxID.String() {
+		t.Errorf("sandboxID = %q, want %s", call.SandboxID, sandboxID.String())
+	}
+}
+
+func TestLifecycle_Route_HandleAck_StopSandboxSuccess_CallsOnSandboxStopped(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgSandboxID,
+				State:   "destroying",
+				AppName: "test-app",
+				NodeID:  pgNodeID,
+			}, nil
+		},
+	}
+
+	rn := &mockRouteNotifier{}
+	svc := New(ms, nil)
+	svc.SetRouteNotifier(rn)
+
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "stop_sandbox", "success", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(rn.stoppedCalls) != 1 {
+		t.Fatalf("expected 1 OnSandboxStopped call, got %d", len(rn.stoppedCalls))
+	}
+	if rn.stoppedCalls[0] != "test-app" {
+		t.Errorf("appName = %q, want test-app", rn.stoppedCalls[0])
+	}
+}
+
+func TestLifecycle_Route_HandleEvent_ContainerExitedFromRunning_CallsOnSandboxStopped(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgSandboxID,
+				State:   "running",
+				AppName: "test-app",
+				NodeID:  pgNodeID,
+			}, nil
+		},
+	}
+
+	rn := &mockRouteNotifier{}
+	svc := New(ms, nil)
+	svc.SetRouteNotifier(rn)
+
+	err := svc.HandleEvent(context.Background(), nodeID, sandboxID, "container_exited",
+		json.RawMessage(`{"exit_code":137}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(rn.stoppedCalls) != 1 {
+		t.Fatalf("expected 1 OnSandboxStopped call, got %d", len(rn.stoppedCalls))
+	}
+	if rn.stoppedCalls[0] != "test-app" {
+		t.Errorf("appName = %q, want test-app", rn.stoppedCalls[0])
+	}
+}
+
+func TestLifecycle_Route_HandleEvent_ContainerStarted_DoesNotCallOnSandboxStopped(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgSandboxID,
+				State:   "starting",
+				AppName: "test-app",
+			}, nil
+		},
+	}
+
+	rn := &mockRouteNotifier{}
+	svc := New(ms, nil)
+	svc.SetRouteNotifier(rn)
+
+	err := svc.HandleEvent(context.Background(), nodeID, sandboxID, "container_started", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// container_started via HandleEvent should NOT trigger OnSandboxStopped
+	if len(rn.stoppedCalls) != 0 {
+		t.Fatalf("expected 0 OnSandboxStopped calls, got %d", len(rn.stoppedCalls))
+	}
+	// Also should NOT trigger OnSandboxRunning (only HandleAck triggers route adds)
+	if len(rn.runningCalls) != 0 {
+		t.Fatalf("expected 0 OnSandboxRunning calls, got %d", len(rn.runningCalls))
+	}
+}
+
+func TestLifecycle_Route_NilRouteNotifier_DoesNotPanic(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:       pgSandboxID,
+				State:    "starting",
+				AppName:  "test-app",
+				NodeID:   pgNodeID,
+				HostPort: pgtype.Int4{Int32: 8081, Valid: true},
+			}, nil
+		},
+	}
+
+	// No SetRouteNotifier call -- routeNotifier is nil
+	svc := New(ms, nil)
+
+	// Should not panic
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "start_sandbox", "success",
+		json.RawMessage(`{"container_id":"abc123","host_port":8081}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
