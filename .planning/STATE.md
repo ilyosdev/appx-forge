@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 02-06-PLAN.md (agent binary, command executor, systemd service)
-last_updated: "2026-04-15T21:44:53.427Z"
+status: executing
+stopped_at: Completed 03-01-PLAN.md (HTTP server scaffold, config, auth, healthz)
+last_updated: "2026-04-15T22:08:40.223Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 2
-  total_plans: 11
-  completed_plans: 11
-  percent: 100
+  total_plans: 17
+  completed_plans: 12
+  percent: 71
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
-**Current focus:** Phase 02 — Agent & Container Lifecycle
+**Current focus:** Phase 03 — Control Plane API
 
 ## Current Position
 
-Phase: 02 (Agent & Container Lifecycle) — EXECUTING
-Plan: 6 of 6
-Status: Phase complete — ready for verification
+Phase: 03 (Control Plane API) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
 Last activity: 2026-04-15
 
 Progress: [░░░░░░░░░░] 0%
@@ -63,6 +63,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02 P05 | 23min | 2 tasks | 6 files |
 | Phase 02 P03 | 2min | 2 tasks | 6 files |
 | Phase 02 P06 | 5min | 2 tasks | 6 files |
+| Phase 03 P01 | 6min | 2 tasks | 15 files |
 
 ## Accumulated Context
 
@@ -102,6 +103,9 @@ Recent decisions affecting current work:
 - [Phase 02]: Executor implements filepush.SandboxResolver directly via CodeDir method
 - [Phase 02]: Sequential command execution per agent-protocol.md -- no concurrent command handling
 - [Phase 02]: Resource collector returns placeholder (0,0) in v1 -- future reads /proc/meminfo
+- [Phase 03]: PoolPinger interface decouples health handler from pgxpool.Pool for testability
+- [Phase 03]: serverConfig struct allows nil config in tests -- only need public routes
+- [Phase 03]: Empty envconfig prefix with full FORGE_ names in struct tags -- matches Phase 02 convention
 
 ### Pending Todos
 
@@ -123,6 +127,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T21:44:53.424Z
-Stopped at: Completed 02-06-PLAN.md (agent binary, command executor, systemd service)
+Last session: 2026-04-15T22:08:40.220Z
+Stopped at: Completed 03-01-PLAN.md (HTTP server scaffold, config, auth, healthz)
 Resume file: None

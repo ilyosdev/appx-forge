@@ -25,7 +25,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Control Plane
 
-- [ ] **CTRL-01**: Go HTTP API serves all OpenAPI-defined endpoints via chi router
+- [x] **CTRL-01**: Go HTTP API serves all OpenAPI-defined endpoints via chi router
 - [ ] **CTRL-02**: Sandbox create endpoint accepts spec, writes PENDING row, triggers scheduling
 - [ ] **CTRL-03**: Bin-packing scheduler picks node with most free RAM, excludes draining/unhealthy nodes
 - [ ] **CTRL-04**: Command dispatch via long-poll: agent polls, control plane holds up to 30s, returns commands
@@ -38,9 +38,9 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [ ] **CTRL-11**: Routing drift detector: every 60s diff Caddy state vs Postgres, fix discrepancies (routes only, never containers)
 - [ ] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
 - [ ] **CTRL-13**: Auto-restart with backoff: on container crash, restart up to 3 times with exponential backoff, then mark FAILED
-- [ ] **CTRL-14**: Bearer token auth on all endpoints (except /healthz and /metrics)
+- [x] **CTRL-14**: Bearer token auth on all endpoints (except /healthz and /metrics)
 - [ ] **CTRL-15**: Prometheus metrics endpoint (/metrics): sandbox count by state, node utilization, request latency
-- [ ] **CTRL-16**: Health endpoint (/healthz): self-check + Postgres connectivity
+- [x] **CTRL-16**: Health endpoint (/healthz): self-check + Postgres connectivity
 
 ### Agent
 
@@ -199,7 +199,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | AGNT-10 | Phase 2 | Complete |
 | AGNT-11 | Phase 2 | Complete |
 | AGNT-12 | Phase 2 | Complete |
-| CTRL-01 | Phase 3 | Pending |
+| CTRL-01 | Phase 3 | Complete |
 | CTRL-02 | Phase 3 | Pending |
 | CTRL-03 | Phase 3 | Pending |
 | CTRL-04 | Phase 3 | Pending |
@@ -212,9 +212,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-11 | Phase 5 | Pending |
 | CTRL-12 | Phase 5 | Pending |
 | CTRL-13 | Phase 5 | Pending |
-| CTRL-14 | Phase 3 | Pending |
+| CTRL-14 | Phase 3 | Complete |
 | CTRL-15 | Phase 5 | Pending |
-| CTRL-16 | Phase 3 | Pending |
+| CTRL-16 | Phase 3 | Complete |
 | PRXY-01 | Phase 4 | Pending |
 | PRXY-02 | Phase 4 | Pending |
 | PRXY-03 | Phase 4 | Pending |

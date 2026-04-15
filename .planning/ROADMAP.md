@@ -74,7 +74,7 @@ Plans:
 **Plans:** 6 plans
 
 Plans:
-- [ ] 03-01-PLAN.md -- Server scaffold + config + auth middleware + healthz endpoint
+- [x] 03-01-PLAN.md -- Server scaffold + config + auth middleware + healthz endpoint
 - [ ] 03-02-PLAN.md -- Bin-packing scheduler TDD
 - [ ] 03-03-PLAN.md -- Node registration + heartbeat processing
 - [ ] 03-04-PLAN.md -- Sandbox lifecycle service + CRUD handlers + ack + events
