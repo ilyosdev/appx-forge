@@ -24,26 +24,35 @@ type serverConfig struct {
 
 // Server is the control plane HTTP server.
 type Server struct {
-	router    chi.Router
-	pinger    PoolPinger
-	config    *serverConfig
-	startTime time.Time
-	logger    *slog.Logger
+	router                   chi.Router
+	pinger                   PoolPinger
+	config                   *serverConfig
+	startTime                time.Time
+	logger                   *slog.Logger
+	nodeStore                NodeStore
+	heartbeatIntervalSeconds int
 }
 
 // NewServer creates a new Server with chi router, middleware, and route groups.
 // cfg may be nil for tests that only need public routes.
 // logger may be nil (a default logger will be used).
-func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger) *Server {
+// nodeStore may be nil if node handlers are not needed.
+// heartbeatIntervalSec defaults to 15 if 0.
+func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeStore NodeStore, heartbeatIntervalSec int) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if heartbeatIntervalSec == 0 {
+		heartbeatIntervalSec = 15
+	}
 
 	s := &Server{
-		pinger:    pinger,
-		config:    cfg,
-		startTime: time.Now(),
-		logger:    logger,
+		pinger:                   pinger,
+		config:                   cfg,
+		startTime:                time.Now(),
+		logger:                   logger,
+		nodeStore:                nodeStore,
+		heartbeatIntervalSeconds: heartbeatIntervalSec,
 	}
 
 	r := chi.NewRouter()
@@ -56,14 +65,16 @@ func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger) *Serve
 
 	// Public routes (no auth required)
 	r.Get("/v1/healthz", s.handleHealthz)
+	r.Post("/v1/nodes/register", s.handleRegisterNode)
 
 	// Authenticated routes
 	if cfg != nil && cfg.apiToken != "" {
 		r.Group(func(r chi.Router) {
 			r.Use(BearerAuth(cfg.apiToken))
 			r.Route("/v1", func(r chi.Router) {
+				r.Post("/nodes/{id}/heartbeat", s.handleHeartbeat)
+
 				// Placeholder: handler plans will mount their routes here.
-				// For now, a catchall returns 404 to confirm auth works.
 				r.Get("/sandboxes", func(w http.ResponseWriter, r *http.Request) {
 					NotFound(w, "not implemented")
 				})
