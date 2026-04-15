@@ -113,7 +113,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 ### Deployment & Ops
 
 - [ ] **OPS-01**: Ansible playbook bootstraps new node (Docker, Tailscale, agent systemd service)
-- [ ] **OPS-02**: docker-compose.dev.yml for local development (Postgres + control + 1 agent)
+- [x] **OPS-02**: docker-compose.dev.yml for local development (Postgres + control + 1 agent)
 - [ ] **OPS-03**: Runbook: add new node to fleet
 - [ ] **OPS-04**: Runbook: recover failed sandbox
 - [ ] **OPS-05**: Runbook: debug stuck container
@@ -249,7 +249,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SEC-05 | Phase 5 | Pending |
 | SEC-06 | Phase 5 | Pending |
 | OPS-01 | Phase 6 | Pending |
-| OPS-02 | Phase 3 | Pending |
+| OPS-02 | Phase 3 | Complete |
 | OPS-03 | Phase 6 | Pending |
 | OPS-04 | Phase 6 | Pending |
 | OPS-05 | Phase 6 | Pending |

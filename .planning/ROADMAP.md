@@ -79,7 +79,7 @@ Plans:
 - [x] 03-03-PLAN.md -- Node registration + heartbeat processing
 - [x] 03-04-PLAN.md -- Sandbox lifecycle service + CRUD handlers + ack + events
 - [x] 03-05-PLAN.md -- Long-poll command dispatch + file push redirect
-- [ ] 03-06-PLAN.md -- Binary wiring + docker-compose.dev.yml + integration tests
+- [x] 03-06-PLAN.md -- Binary wiring + docker-compose.dev.yml + integration tests
 
 ### Phase 4: Proxy, Routing & File Push
 **Goal**: Sandboxes are accessible via `{id}.myappx.live` URLs with WebSocket support, and route updates happen without dropping existing connections
