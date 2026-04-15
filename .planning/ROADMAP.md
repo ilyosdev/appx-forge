@@ -93,7 +93,7 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 04-01-PLAN.md -- Caddy Admin API client + route batcher TDD
+- [x] 04-01-PLAN.md -- Caddy Admin API client + route batcher TDD
 - [ ] 04-02-PLAN.md -- Lifecycle route integration + RouteManager wiring
 - [ ] 04-03-PLAN.md -- Caddy base config + docker-compose + DNS verification
 

@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 03-06-PLAN.md
-last_updated: "2026-04-15T23:04:00.539Z"
+status: executing
+stopped_at: Completed 04-01-PLAN.md
+last_updated: "2026-04-15T23:22:34.527Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 3
-  total_plans: 17
-  completed_plans: 17
-  percent: 100
+  total_plans: 20
+  completed_plans: 18
+  percent: 90
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
-**Current focus:** Phase 03 — Control Plane API
+**Current focus:** Phase 04 — Proxy, Routing & File Push
 
 ## Current Position
 
-Phase: 03 (Control Plane API) — EXECUTING
-Plan: 6 of 6
-Status: Phase complete — ready for verification
+Phase: 04 (Proxy, Routing & File Push) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
 Last activity: 2026-04-15
 
 Progress: [░░░░░░░░░░] 0%
@@ -69,6 +69,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 03 P04 | 8min | 2 tasks | 7 files |
 | Phase 03 P05 | 463s | 2 tasks | 4 files |
 | Phase 03 P06 | 968s | 2 tasks | 11 files |
+| Phase 04 P01 | 256s | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -125,6 +126,9 @@ Recent decisions affecting current work:
 - [Phase 03]: Separate filePushAdapter type resolves GetNode return type conflict (NodeRecord vs store.Node)
 - [Phase 03]: float64ToNumeric helper needed because pgtype.Numeric.Scan rejects float64 input
 - [Phase 03]: Migrations dir fallback: ./migrations (Docker) then control/migrations (go run from root)
+- [Phase 04]: Route JSON constructed from validated Route struct fields -- no raw user JSON (T-04-02 mitigation)
+- [Phase 04]: Batcher dedup uses last-write-wins per app_name in pending map
+- [Phase 04]: flushLocked releases mutex during Flusher.Apply to avoid holding lock during network I/O
 
 ### Pending Todos
 
@@ -146,6 +150,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T23:04:00.536Z
-Stopped at: Completed 03-06-PLAN.md
+Last session: 2026-04-15T23:22:34.524Z
+Stopped at: Completed 04-01-PLAN.md
 Resume file: None
