@@ -50,6 +50,7 @@ type Node struct {
 	LastSeenAt        pgtype.Timestamptz `json:"last_seen_at"`
 	RegisteredAt      pgtype.Timestamptz `json:"registered_at"`
 	Metadata          []byte             `json:"metadata"`
+	AgentToken        string             `json:"agent_token"`
 }
 
 type Sandbox struct {

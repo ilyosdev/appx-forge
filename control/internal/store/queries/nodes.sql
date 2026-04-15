@@ -17,3 +17,9 @@ UPDATE nodes SET used_mb = $2, running_containers = $3, last_seen_at = NOW() WHE
 
 -- name: UpdateNodeStatus :exec
 UPDATE nodes SET status = $2 WHERE id = $1;
+
+-- name: GetNodeByHostnameAndIP :one
+SELECT * FROM nodes WHERE hostname = $1 AND tailscale_ip = $2;
+
+-- name: UpdateNodeToken :exec
+UPDATE nodes SET agent_token = $1, agent_version = $2, last_seen_at = NOW() WHERE id = $3;

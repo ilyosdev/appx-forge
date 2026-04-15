@@ -15,7 +15,7 @@ import (
 const createNode = `-- name: CreateNode :one
 INSERT INTO nodes (id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, agent_version, metadata)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata
+RETURNING id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata, agent_token
 `
 
 type CreateNodeParams struct {
@@ -55,12 +55,13 @@ func (q *Queries) CreateNode(ctx context.Context, arg CreateNodeParams) (Node, e
 		&i.LastSeenAt,
 		&i.RegisteredAt,
 		&i.Metadata,
+		&i.AgentToken,
 	)
 	return i, err
 }
 
 const getNode = `-- name: GetNode :one
-SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata FROM nodes WHERE id = $1
+SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata, agent_token FROM nodes WHERE id = $1
 `
 
 func (q *Queries) GetNode(ctx context.Context, id pgtype.UUID) (Node, error) {
@@ -80,12 +81,44 @@ func (q *Queries) GetNode(ctx context.Context, id pgtype.UUID) (Node, error) {
 		&i.LastSeenAt,
 		&i.RegisteredAt,
 		&i.Metadata,
+		&i.AgentToken,
+	)
+	return i, err
+}
+
+const getNodeByHostnameAndIP = `-- name: GetNodeByHostnameAndIP :one
+SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata, agent_token FROM nodes WHERE hostname = $1 AND tailscale_ip = $2
+`
+
+type GetNodeByHostnameAndIPParams struct {
+	Hostname    string     `json:"hostname"`
+	TailscaleIp netip.Addr `json:"tailscale_ip"`
+}
+
+func (q *Queries) GetNodeByHostnameAndIP(ctx context.Context, arg GetNodeByHostnameAndIPParams) (Node, error) {
+	row := q.db.QueryRow(ctx, getNodeByHostnameAndIP, arg.Hostname, arg.TailscaleIp)
+	var i Node
+	err := row.Scan(
+		&i.ID,
+		&i.Hostname,
+		&i.TailscaleIp,
+		&i.AgentListenPort,
+		&i.CapacityMb,
+		&i.CapacityCpu,
+		&i.UsedMb,
+		&i.RunningContainers,
+		&i.Status,
+		&i.AgentVersion,
+		&i.LastSeenAt,
+		&i.RegisteredAt,
+		&i.Metadata,
+		&i.AgentToken,
 	)
 	return i, err
 }
 
 const listHealthyNodes = `-- name: ListHealthyNodes :many
-SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata FROM nodes WHERE status IN ('healthy') ORDER BY (capacity_mb - used_mb) DESC
+SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata, agent_token FROM nodes WHERE status IN ('healthy') ORDER BY (capacity_mb - used_mb) DESC
 `
 
 func (q *Queries) ListHealthyNodes(ctx context.Context) ([]Node, error) {
@@ -111,6 +144,7 @@ func (q *Queries) ListHealthyNodes(ctx context.Context) ([]Node, error) {
 			&i.LastSeenAt,
 			&i.RegisteredAt,
 			&i.Metadata,
+			&i.AgentToken,
 		); err != nil {
 			return nil, err
 		}
@@ -123,7 +157,7 @@ func (q *Queries) ListHealthyNodes(ctx context.Context) ([]Node, error) {
 }
 
 const listNodes = `-- name: ListNodes :many
-SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata FROM nodes ORDER BY registered_at DESC
+SELECT id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, used_mb, running_containers, status, agent_version, last_seen_at, registered_at, metadata, agent_token FROM nodes ORDER BY registered_at DESC
 `
 
 func (q *Queries) ListNodes(ctx context.Context) ([]Node, error) {
@@ -149,6 +183,7 @@ func (q *Queries) ListNodes(ctx context.Context) ([]Node, error) {
 			&i.LastSeenAt,
 			&i.RegisteredAt,
 			&i.Metadata,
+			&i.AgentToken,
 		); err != nil {
 			return nil, err
 		}
@@ -186,5 +221,20 @@ type UpdateNodeStatusParams struct {
 
 func (q *Queries) UpdateNodeStatus(ctx context.Context, arg UpdateNodeStatusParams) error {
 	_, err := q.db.Exec(ctx, updateNodeStatus, arg.ID, arg.Status)
+	return err
+}
+
+const updateNodeToken = `-- name: UpdateNodeToken :exec
+UPDATE nodes SET agent_token = $1, agent_version = $2, last_seen_at = NOW() WHERE id = $3
+`
+
+type UpdateNodeTokenParams struct {
+	AgentToken   string      `json:"agent_token"`
+	AgentVersion string      `json:"agent_version"`
+	ID           pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) UpdateNodeToken(ctx context.Context, arg UpdateNodeTokenParams) error {
+	_, err := q.db.Exec(ctx, updateNodeToken, arg.AgentToken, arg.AgentVersion, arg.ID)
 	return err
 }
