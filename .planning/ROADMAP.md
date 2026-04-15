@@ -51,7 +51,15 @@ Plans:
   3. Agent detects a container crash (die/OOM event) within 2s and reports it to the control plane
   4. Agent reconnects Docker event stream after disconnect without missing any events (timestamp-based replay)
   5. File push endpoint accepts a signed URL request and writes files to the correct bind-mount directory
-**Plans**: TBD
+**Plans:** 6 plans
+
+Plans:
+- [ ] 02-01-PLAN.md -- Agent module scaffold + config + port allocator TDD
+- [ ] 02-02-PLAN.md -- Docker SDK wrapper + container security settings TDD
+- [ ] 02-03-PLAN.md -- Docker events watcher + image pre-pull + log retrieval TDD
+- [ ] 02-04-PLAN.md -- Control plane HTTP client + heartbeat sender TDD
+- [ ] 02-05-PLAN.md -- File push HTTP handler with HMAC validation TDD
+- [ ] 02-06-PLAN.md -- Agent main binary + command executor + systemd service
 
 ### Phase 3: Control Plane API
 **Goal**: A running Go HTTP API that accepts sandbox requests, schedules them to nodes, dispatches commands to agents via long-poll, and transitions sandbox state based on agent reports
@@ -117,7 +125,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Infrastructure & Contracts | 5/5 | Complete | 2026-04-16 |
-| 2. Agent & Container Lifecycle | 0/0 | Not started | - |
+| 2. Agent & Container Lifecycle | 0/6 | Planning complete | - |
 | 3. Control Plane API | 0/0 | Not started | - |
 | 4. Proxy, Routing & File Push | 0/0 | Not started | - |
 | 5. Reliability & Security | 0/0 | Not started | - |
