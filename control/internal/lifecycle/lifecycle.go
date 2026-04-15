@@ -1,0 +1,497 @@
+// Package lifecycle orchestrates sandbox lifecycle operations: create, destroy,
+// restart, handle command acknowledgments, and process container events.
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/appx/forge/control/internal/scheduler"
+	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/shared-go/models"
+)
+
+// Sentinel errors for lifecycle operations.
+var (
+	// ErrConflict is returned when a sandbox with the same app_name already exists.
+	ErrConflict = errors.New("lifecycle: app_name already exists")
+
+	// ErrNoCapacity is returned when no node has sufficient resources.
+	ErrNoCapacity = errors.New("lifecycle: no node has sufficient capacity")
+
+	// ErrNotFound is returned when a sandbox is not found.
+	ErrNotFound = errors.New("lifecycle: sandbox not found")
+
+	// ErrInvalidTransition is returned when a state transition is not valid.
+	ErrInvalidTransition = errors.New("lifecycle: invalid state transition")
+
+	// ErrInvalidState is returned when a sandbox is not in the expected state.
+	ErrInvalidState = errors.New("lifecycle: sandbox not in expected state")
+)
+
+// Store abstracts the database operations needed by the lifecycle service.
+type Store interface {
+	CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
+	GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
+	GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error)
+	ListHealthyNodes(ctx context.Context) ([]store.Node, error)
+	AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
+	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
+	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
+	AckCommand(ctx context.Context, arg store.AckCommandParams) error
+	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+}
+
+// ── Request/Result Types ─────────────────────────────────────────────
+
+// CreateRequest contains the parameters for creating a new sandbox.
+type CreateRequest struct {
+	AppName            string
+	UserID             string
+	Image              string
+	Resources          Resources
+	Env                map[string]string
+	IdleTimeoutSeconds int32
+	Metadata           map[string]interface{}
+}
+
+// Resources specifies the resource limits for a sandbox.
+type Resources struct {
+	CPUCores float64 `json:"cpu_cores"`
+	MemoryMB int32   `json:"memory_mb"`
+}
+
+// SandboxResult contains the result of a sandbox operation.
+type SandboxResult struct {
+	ID        uuid.UUID  `json:"id"`
+	AppName   string     `json:"app_name"`
+	UserID    string     `json:"user_id"`
+	State     string     `json:"state"`
+	URL       string     `json:"url"`
+	NodeID    *uuid.UUID `json:"node_id,omitempty"`
+	Image     string     `json:"image"`
+	CreatedAt string     `json:"created_at,omitempty"`
+}
+
+// ── Service ──────────────────────────────────────────────────────────
+
+// LifecycleService orchestrates sandbox lifecycle operations.
+type LifecycleService struct {
+	store  Store
+	logger *slog.Logger
+}
+
+// New creates a new LifecycleService.
+func New(s Store, logger *slog.Logger) *LifecycleService {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &LifecycleService{store: s, logger: logger}
+}
+
+// ── CreateSandbox ────────────────────────────────────────────────────
+
+// CreateSandbox creates a new sandbox, schedules it to a node, and dispatches
+// a start_sandbox command. It returns the sandbox result with a computed URL.
+func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest) (*SandboxResult, error) {
+	// Generate sandbox UUID
+	sandboxUUID := uuid.New()
+	pgID := pgtype.UUID{Bytes: sandboxUUID, Valid: true}
+
+	// Marshal resources and env to JSON
+	resourcesJSON, err := json.Marshal(req.Resources)
+	if err != nil {
+		return nil, fmt.Errorf("marshal resources: %w", err)
+	}
+
+	envJSON, err := json.Marshal(req.Env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal env: %w", err)
+	}
+
+	var metadataJSON []byte
+	if req.Metadata != nil {
+		metadataJSON, err = json.Marshal(req.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("marshal metadata: %w", err)
+		}
+	}
+
+	idleTimeout := req.IdleTimeoutSeconds
+	if idleTimeout == 0 {
+		idleTimeout = 1800
+	}
+
+	// Create PENDING sandbox row
+	_, err = ls.store.CreateSandbox(ctx, store.CreateSandboxParams{
+		ID:                 pgID,
+		AppName:            req.AppName,
+		UserID:             req.UserID,
+		Image:              req.Image,
+		Resources:          resourcesJSON,
+		Env:                envJSON,
+		IdleTimeoutSeconds: idleTimeout,
+		Metadata:           metadataJSON,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+			return nil, ErrConflict
+		}
+		return nil, fmt.Errorf("create sandbox: %w", err)
+	}
+
+	// List healthy nodes for scheduling
+	nodes, err := ls.store.ListHealthyNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list healthy nodes: %w", err)
+	}
+
+	// Convert to scheduler candidates
+	candidates := make([]scheduler.NodeCandidate, len(nodes))
+	for i, n := range nodes {
+		candidates[i] = scheduler.NodeCandidate{
+			ID:         uuid.UUID(n.ID.Bytes),
+			CapacityMB: n.CapacityMb,
+			UsedMB:     n.UsedMb,
+			Status:     n.Status,
+		}
+	}
+
+	requiredMB := req.Resources.MemoryMB
+	if requiredMB == 0 {
+		requiredMB = 512
+	}
+
+	selectedNodeID, err := scheduler.Schedule(candidates, requiredMB)
+	if err != nil {
+		return nil, ErrNoCapacity
+	}
+
+	pgNodeID := pgtype.UUID{Bytes: selectedNodeID, Valid: true}
+
+	// Assign sandbox to node (transitions pending -> starting)
+	assigned, err := ls.store.AssignSandboxToNode(ctx, store.AssignSandboxToNodeParams{
+		NodeID: pgNodeID,
+		ID:     pgID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("assign sandbox to node: %w", err)
+	}
+
+	// Create start_sandbox command
+	cmdPayload, err := json.Marshal(map[string]interface{}{
+		"app_name":  req.AppName,
+		"image":     req.Image,
+		"resources": req.Resources,
+		"env":       req.Env,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal command payload: %w", err)
+	}
+
+	cmdID := uuid.New()
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         pgNodeID,
+		SandboxID:      pgID,
+		CommandType:    string(models.CmdStartSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create start command: %w", err)
+	}
+
+	// Record scheduled event
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgID,
+		NodeID:    pgNodeID,
+		EventType: string(models.EventScheduled),
+		Actor:     "control-plane",
+		PrevState: pgtype.Text{String: string(models.StatePending), Valid: true},
+		NextState: pgtype.Text{String: string(models.StateStarting), Valid: true},
+		Payload:   cmdPayload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record scheduled event", "error", err, "sandbox_id", sandboxUUID)
+	}
+
+	nodeIDVal := selectedNodeID
+	return &SandboxResult{
+		ID:      sandboxUUID,
+		AppName: assigned.AppName,
+		UserID:  assigned.UserID,
+		State:   assigned.State,
+		URL:     fmt.Sprintf("https://%s.myappx.live", req.AppName),
+		NodeID:  &nodeIDVal,
+		Image:   req.Image,
+	}, nil
+}
+
+// ── HandleAck ────────────────────────────────────────────────────────
+
+// HandleAck processes a command acknowledgment from an agent.
+// It transitions the sandbox state based on the command type and ack status.
+func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sandboxID uuid.UUID, cmdType string, status string, ackResult json.RawMessage) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	pgCmdID := pgtype.UUID{Bytes: cmdID, Valid: true}
+
+	// Get current sandbox state
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Map (cmdType, status) to state machine event
+	var event models.SandboxEvent
+	needsTransition := true
+
+	switch {
+	case cmdType == string(models.CmdStartSandbox) && status == "success":
+		event = models.EventStarted
+	case cmdType == string(models.CmdStartSandbox) && status == "failure":
+		event = models.EventStartFailed
+	case cmdType == string(models.CmdStopSandbox) && status == "success":
+		event = models.EventDestroyed
+	case cmdType == string(models.CmdRestartSandbox) && status == "success":
+		// Restart success: no state change, container restarted at Docker level
+		needsTransition = false
+	default:
+		ls.logger.Warn("unhandled ack combination", "cmd_type", cmdType, "status", status)
+		needsTransition = false
+	}
+
+	if needsTransition {
+		currentState := models.SandboxState(sandbox.State)
+		nextState, valid := models.NextState(currentState, event)
+		if !valid {
+			return fmt.Errorf("%w: %s + %s from %s", ErrInvalidTransition, cmdType, status, sandbox.State)
+		}
+
+		_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+			State:   string(nextState),
+			ID:      pgSandboxID,
+			State_2: sandbox.State,
+		})
+		if err != nil {
+			return fmt.Errorf("transition state: %w", err)
+		}
+
+		// Record event
+		_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+			SandboxID: pgSandboxID,
+			NodeID:    sandbox.NodeID,
+			EventType: string(event),
+			Actor:     "agent",
+			PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+			NextState: pgtype.Text{String: string(nextState), Valid: true},
+			Payload:   ackResult,
+		})
+		if err != nil {
+			ls.logger.Warn("failed to record ack event", "error", err, "sandbox_id", sandboxID)
+		}
+	}
+
+	// Ack the command
+	ackStatus := "completed"
+	if status == "failure" {
+		ackStatus = "failed"
+	}
+	err = ls.store.AckCommand(ctx, store.AckCommandParams{
+		ID:     pgCmdID,
+		Status: ackStatus,
+		Result: ackResult,
+	})
+	if err != nil {
+		return fmt.Errorf("ack command: %w", err)
+	}
+
+	return nil
+}
+
+// ── HandleEvent ──────────────────────────────────────────────────────
+
+// HandleEvent processes a container event reported by an agent.
+// It maps the agent event type to a state machine event and transitions accordingly.
+func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, sandboxID uuid.UUID, eventType string, payload json.RawMessage) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	pgNodeID := pgtype.UUID{Bytes: nodeID, Valid: true}
+
+	// Get current sandbox state
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Map agent event_type to state machine event
+	var event models.SandboxEvent
+	switch eventType {
+	case "container_started":
+		event = models.EventStarted
+	case "container_exited":
+		event = models.EventContainerExited
+	case "container_oom":
+		event = models.EventContainerExited // Same transition as exit
+	default:
+		ls.logger.Warn("unhandled event type", "event_type", eventType, "sandbox_id", sandboxID)
+		return nil
+	}
+
+	// Validate transition via state machine
+	currentState := models.SandboxState(sandbox.State)
+	nextState, valid := models.NextState(currentState, event)
+	if !valid {
+		ls.logger.Warn("invalid state transition for event",
+			"sandbox_id", sandboxID,
+			"current_state", sandbox.State,
+			"event", event,
+		)
+		return nil // Not an error -- just ignore invalid transitions
+	}
+
+	// Transition state
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(nextState),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Record event
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    pgNodeID,
+		EventType: eventType,
+		Actor:     "agent",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: string(nextState), Valid: true},
+		Payload:   payload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	return nil
+}
+
+// ── DestroySandbox ───────────────────────────────────────────────────
+
+// DestroySandbox transitions a sandbox to DESTROYING and dispatches a stop_sandbox command.
+func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Validate transition via state machine
+	currentState := models.SandboxState(sandbox.State)
+	nextState, valid := models.NextState(currentState, models.EventDestroyRequest)
+	if !valid {
+		return fmt.Errorf("%w: cannot destroy sandbox in state %s", ErrInvalidTransition, sandbox.State)
+	}
+
+	// Transition to destroying
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(nextState),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Create stop_sandbox command targeted at sandbox's node
+	cmdID := uuid.New()
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"container_id": sandbox.ContainerID.String,
+	})
+
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sandbox.NodeID,
+		SandboxID:      pgSandboxID,
+		CommandType:    string(models.CmdStopSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return fmt.Errorf("create stop command: %w", err)
+	}
+
+	// Record event
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: string(models.EventDestroyRequest),
+		Actor:     "control-plane",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: string(nextState), Valid: true},
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record destroy event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	return nil
+}
+
+// ── RestartSandbox ───────────────────────────────────────────────────
+
+// RestartSandbox creates a restart_sandbox command for a running sandbox.
+// No state transition occurs -- the restart is handled at the Docker level.
+func (ls *LifecycleService) RestartSandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Must be in running state
+	if sandbox.State != string(models.StateRunning) {
+		return fmt.Errorf("%w: sandbox must be running to restart, current state: %s", ErrInvalidState, sandbox.State)
+	}
+
+	// Create restart_sandbox command
+	cmdID := uuid.New()
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"container_id": sandbox.ContainerID.String,
+	})
+
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sandbox.NodeID,
+		SandboxID:      pgSandboxID,
+		CommandType:    string(models.CmdRestartSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return fmt.Errorf("create restart command: %w", err)
+	}
+
+	// Record event (informational, no state change)
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: "restart_requested",
+		Actor:     "control-plane",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: sandbox.State, Valid: true},
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record restart event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	return nil
+}
