@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-05-PLAN.md (file push endpoint)
-last_updated: "2026-04-15T21:27:42.429Z"
+stopped_at: Completed 02-03-PLAN.md (events watcher, image pull, log retrieval)
+last_updated: "2026-04-15T21:35:42.946Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 11
-  completed_plans: 9
-  percent: 82
+  completed_plans: 10
+  percent: 91
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 02 (Agent & Container Lifecycle) — EXECUTING
-Plan: 5 of 6
+Plan: 6 of 6
 Status: Ready to execute
 Last activity: 2026-04-15
 
@@ -61,6 +61,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02 P02 | 18min | 2 tasks | 7 files |
 | Phase 02 P04 | 5min | 2 tasks | 5 files |
 | Phase 02 P05 | 23min | 2 tasks | 6 files |
+| Phase 02 P03 | 2min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -94,6 +95,9 @@ Recent decisions affecting current work:
 - [Phase 02]: Agent token stored in memory only, protected by RWMutex, never logged (T-02-13 mitigation)
 - [Phase 02]: SandboxResolver interface decouples handler from sandbox storage implementation
 - [Phase 02]: Partial failures return 200 with failed array rather than 500, per protocol spec
+- [Phase 02]: EventSource interface decouples Watcher from Docker client for testability
+- [Phase 02]: Narrow single-method interfaces (ImagePullClient, LogClient) for focused mocking per interface segregation
+- [Phase 02]: Watcher tracks lastEventTime and passes as Since on reconnect -- prevents missed events
 
 ### Pending Todos
 
@@ -115,6 +119,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T21:27:42.426Z
-Stopped at: Completed 02-05-PLAN.md (file push endpoint)
+Last session: 2026-04-15T21:35:42.944Z
+Stopped at: Completed 02-03-PLAN.md (events watcher, image pull, log retrieval)
 Resume file: None
