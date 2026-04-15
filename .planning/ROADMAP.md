@@ -107,7 +107,12 @@ Plans:
   3. Routing drift detector identifies and fixes discrepancies between Caddy state and Postgres within 60s
   4. All sandbox containers run with seccomp profile, dropped capabilities, no-new-privileges, and PID limit
   5. `/metrics` returns Prometheus-format sandbox counts by state, node utilization, and request latency
-**Plans**: TBD
+**Plans:** 3 plans
+
+Plans:
+- [ ] 05-01-PLAN.md -- Auto-restart with exponential backoff TDD
+- [ ] 05-02-PLAN.md -- Idle reaper + routing drift detector TDD
+- [ ] 05-03-PLAN.md -- Prometheus /metrics + seccomp profile + binary wiring
 
 ### Phase 6: CLI, SDK & appx-api Integration
 **Goal**: Ops can manage the fleet via CLI, appx-api creates sandboxes via the TypeScript SDK, and Railover is fully replaced
@@ -141,6 +146,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 2. Agent & Container Lifecycle | 0/6 | Planning complete | - |
 | 3. Control Plane API | 0/6 | Planning complete | - |
 | 4. Proxy, Routing & File Push | 0/3 | Planning complete | - |
-| 5. Reliability & Security | 0/0 | Not started | - |
+| 5. Reliability & Security | 0/3 | Planning complete | - |
 | 6. CLI, SDK & appx-api Integration | 0/0 | Not started | - |
 | 7. Multi-Node & Failover | 0/0 | Not started | - |
