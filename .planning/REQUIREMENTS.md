@@ -21,7 +21,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [ ] **CNTR-03**: File push protocol documented (control plane redirect, signed URL, agent direct endpoint)
 - [ ] **CNTR-04**: Proxy routing protocol documented (Caddy Admin API shape, drift detection)
 - [ ] **CNTR-05**: Postgres schema with migrations (nodes, sandboxes, events, commands tables)
-- [ ] **CNTR-06**: Sandbox state machine implemented with compare-and-swap (`UPDATE WHERE state = $expected`)
+- [x] **CNTR-06**: Sandbox state machine implemented with compare-and-swap (`UPDATE WHERE state = $expected`)
 
 ### Control Plane
 
@@ -181,7 +181,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CNTR-03 | Phase 1 | Pending |
 | CNTR-04 | Phase 1 | Pending |
 | CNTR-05 | Phase 1 | Pending |
-| CNTR-06 | Phase 1 | Pending |
+| CNTR-06 | Phase 1 | Complete |
 | IMG-01 | Phase 1 | Pending |
 | IMG-02 | Phase 1 | Pending |
 | IMG-03 | Phase 1 | Pending |

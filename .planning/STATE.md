@@ -1,3 +1,19 @@
+---
+gsd_state_version: 1.0
+milestone: v1.0
+milestone_name: milestone
+status: executing
+stopped_at: Completed 01-01-PLAN.md (shared Go types, state machine, HMAC)
+last_updated: "2026-04-15T19:23:20.503Z"
+last_activity: 2026-04-15
+progress:
+  total_phases: 7
+  completed_phases: 0
+  total_plans: 5
+  completed_plans: 1
+  percent: 20
+---
+
 # Project State
 
 ## Project Reference
@@ -5,20 +21,21 @@
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
-**Current focus:** Phase 1: Infrastructure & Contracts
+**Current focus:** Phase 01 — Infrastructure & Contracts
 
 ## Current Position
 
-Phase: 1 of 7 (Infrastructure & Contracts)
-Plan: 0 of 0 in current phase
-Status: Ready to plan
-Last activity: 2026-04-15 -- Roadmap created, 88 requirements mapped across 7 phases
+Phase: 01 (Infrastructure & Contracts) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
+Last activity: 2026-04-15
 
 Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
 **Velocity:**
+
 - Total plans completed: 0
 - Average duration: --
 - Total execution time: 0 hours
@@ -30,10 +47,12 @@ Progress: [░░░░░░░░░░] 0%
 | - | - | - | - |
 
 **Recent Trend:**
+
 - Last 5 plans: --
 - Trend: --
 
 *Updated after each plan completion*
+| Phase 01 P01 | 7min | 2 tasks | 11 files |
 
 ## Accumulated Context
 
@@ -46,6 +65,8 @@ Recent decisions affecting current work:
 - [Roadmap]: Agent before control plane (Docker SDK has most gotchas)
 - [Roadmap]: Single-node proven before multi-node attempted
 - [Roadmap]: appx-api integration is the final phase before multi-node
+- [Phase 01]: Go 1.26.2 installed (Homebrew latest) with go 1.25.0 workspace directive for compatibility
+- [Phase 01]: HMAC URL signing uses full URL path+query rather than sandboxID-based approach for stronger security
 
 ### Pending Todos
 
@@ -67,6 +88,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15
-Stopped at: Roadmap created with 7 phases covering 88 requirements
+Last session: 2026-04-15T19:23:20.500Z
+Stopped at: Completed 01-01-PLAN.md (shared Go types, state machine, HMAC)
 Resume file: None
