@@ -77,7 +77,7 @@ Plans:
 - [x] 03-01-PLAN.md -- Server scaffold + config + auth middleware + healthz endpoint
 - [x] 03-02-PLAN.md -- Bin-packing scheduler TDD
 - [x] 03-03-PLAN.md -- Node registration + heartbeat processing
-- [ ] 03-04-PLAN.md -- Sandbox lifecycle service + CRUD handlers + ack + events
+- [x] 03-04-PLAN.md -- Sandbox lifecycle service + CRUD handlers + ack + events
 - [ ] 03-05-PLAN.md -- Long-poll command dispatch + file push redirect
 - [ ] 03-06-PLAN.md -- Binary wiring + docker-compose.dev.yml + integration tests
 
