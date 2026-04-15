@@ -19,7 +19,8 @@ type PoolPinger interface {
 // serverConfig holds configuration needed by the server. In production this
 // is populated from config.Config; in tests it can be a minimal struct.
 type serverConfig struct {
-	apiToken string
+	apiToken   string
+	hmacSecret string
 }
 
 // Server is the control plane HTTP server.
@@ -32,6 +33,8 @@ type Server struct {
 	nodeStore                NodeStore
 	lifecycle                SandboxLifecycle
 	sandboxReader            SandboxReader
+	agentStore               AgentStore
+	agentLifecycle           AgentLifecycle
 	heartbeatIntervalSeconds int
 }
 
@@ -85,6 +88,11 @@ func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeSt
 				r.Get("/sandboxes/{id}", s.handleGetSandbox)
 				r.Delete("/sandboxes/{id}", s.handleDestroySandbox)
 				r.Post("/sandboxes/{id}/restart", s.handleRestartSandbox)
+
+				// Agent endpoints
+				r.Get("/agents/{id}/commands", s.handlePollCommands)
+				r.Post("/agents/{id}/commands/{cmd_id}/ack", s.handleAckCommand)
+				r.Post("/agents/{id}/events", s.handleReportEvent)
 			})
 		})
 	}
