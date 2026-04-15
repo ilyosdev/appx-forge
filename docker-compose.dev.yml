@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: forge
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: forge_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - forge_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forge"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  forge-control:
+    build:
+      context: .
+      dockerfile: control/Dockerfile
+    environment:
+      FORGE_LISTEN_ADDR: ":8080"
+      FORGE_DATABASE_URL: "postgres://forge:forge_dev@postgres:5432/forge?sslmode=disable"
+      FORGE_API_TOKEN: "dev-token-change-me"
+      FORGE_HMAC_SECRET: "dev-hmac-secret-change-me"
+      FORGE_LOG_LEVEL: "debug"
+      FORGE_HEARTBEAT_INTERVAL_SECONDS: "15"
+      FORGE_HEARTBEAT_MISS_THRESHOLD: "3"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Agent is optional for local dev -- uncomment when needed
+  # forge-agent:
+  #   build:
+  #     context: .
+  #     dockerfile: agent/Dockerfile
+  #   environment:
+  #     FORGE_CONTROL_URL: "http://forge-control:8080"
+  #     FORGE_HOSTNAME: "dev-node-1"
+  #     FORGE_TAILSCALE_IP: "100.64.0.1"
+  #     FORGE_CAPACITY_MB: "8000"
+  #   depends_on:
+  #     forge-control:
+  #       condition: service_started
+
+volumes:
+  forge_pgdata:

@@ -157,7 +157,7 @@ func (s *Server) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		listenPort = 8090 // default per agent-protocol.md
 	}
 
-	var metadata []byte
+	metadata := []byte(`{}`)
 	if req.Metadata != nil {
 		metadata = []byte(*req.Metadata)
 	}

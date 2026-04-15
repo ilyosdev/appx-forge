@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"errors"
 	"log/slog"
+	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
@@ -245,6 +246,19 @@ func formatNodeID(u pgtype.UUID) string {
 	return uuid.UUID(u.Bytes).String()
 }
 
+// float64ToNumeric converts a float64 to pgtype.Numeric.
+// pgtype.Numeric.Scan does not accept float64, so we convert via
+// big.Int with integer and fractional parts.
+func float64ToNumeric(f float64) pgtype.Numeric {
+	// Multiply by 1000 to preserve 3 decimal places, store with Exp=-3
+	scaled := int64(f * 1000)
+	return pgtype.Numeric{
+		Int:   big.NewInt(scaled),
+		Exp:   -3,
+		Valid: true,
+	}
+}
+
 // ── Store Adapter ──────────────────────────────────────────────────────
 
 // storeAdapter bridges the sqlc-generated store.Queries to the interface types
@@ -272,8 +286,7 @@ func (a *storeAdapter) GetNodeByHostnameAndIP(ctx context.Context, hostname stri
 }
 
 func (a *storeAdapter) CreateNode(ctx context.Context, arg api.CreateNodeArgs) (api.NodeRecord, error) {
-	cpuNum := pgtype.Numeric{}
-	_ = cpuNum.Scan(arg.CapacityCPU)
+	cpuNum := float64ToNumeric(arg.CapacityCPU)
 
 	n, err := a.q.CreateNode(ctx, store.CreateNodeParams{
 		ID:              arg.ID,

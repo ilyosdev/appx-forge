@@ -116,7 +116,7 @@ func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest
 		return nil, fmt.Errorf("marshal env: %w", err)
 	}
 
-	var metadataJSON []byte
+	metadataJSON := []byte(`{}`)
 	if req.Metadata != nil {
 		metadataJSON, err = json.Marshal(req.Metadata)
 		if err != nil {
