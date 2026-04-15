@@ -27,7 +27,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 - [x] **CTRL-01**: Go HTTP API serves all OpenAPI-defined endpoints via chi router
 - [ ] **CTRL-02**: Sandbox create endpoint accepts spec, writes PENDING row, triggers scheduling
-- [ ] **CTRL-03**: Bin-packing scheduler picks node with most free RAM, excludes draining/unhealthy nodes
+- [x] **CTRL-03**: Bin-packing scheduler picks node with most free RAM, excludes draining/unhealthy nodes
 - [ ] **CTRL-04**: Command dispatch via long-poll: agent polls, control plane holds up to 30s, returns commands
 - [ ] **CTRL-05**: Command acknowledgment: agent reports success/failure, control plane updates sandbox state
 - [ ] **CTRL-06**: Node registration: agent registers on boot, receives agent_token and heartbeat interval
@@ -201,7 +201,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | AGNT-12 | Phase 2 | Complete |
 | CTRL-01 | Phase 3 | Complete |
 | CTRL-02 | Phase 3 | Pending |
-| CTRL-03 | Phase 3 | Pending |
+| CTRL-03 | Phase 3 | Complete |
 | CTRL-04 | Phase 3 | Pending |
 | CTRL-05 | Phase 3 | Pending |
 | CTRL-06 | Phase 3 | Pending |
