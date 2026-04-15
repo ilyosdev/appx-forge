@@ -90,7 +90,12 @@ Plans:
   2. Control plane adds/removes Caddy routes via Admin API when sandbox state changes
   3. WebSocket connections (Metro HMR) survive route updates for other sandboxes (500ms debounce batching verified)
   4. A full end-to-end flow works: create sandbox, push files, access via browser, see Metro output
-**Plans**: TBD
+**Plans:** 3 plans
+
+Plans:
+- [ ] 04-01-PLAN.md -- Caddy Admin API client + route batcher TDD
+- [ ] 04-02-PLAN.md -- Lifecycle route integration + RouteManager wiring
+- [ ] 04-03-PLAN.md -- Caddy base config + docker-compose + DNS verification
 
 ### Phase 5: Reliability & Security
 **Goal**: Sandboxes self-heal from crashes, idle resources are reclaimed, containers are hardened with seccomp/capabilities, and the system exposes health and metrics endpoints
@@ -135,7 +140,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 1. Infrastructure & Contracts | 5/5 | Complete | 2026-04-16 |
 | 2. Agent & Container Lifecycle | 0/6 | Planning complete | - |
 | 3. Control Plane API | 0/6 | Planning complete | - |
-| 4. Proxy, Routing & File Push | 0/0 | Not started | - |
+| 4. Proxy, Routing & File Push | 0/3 | Planning complete | - |
 | 5. Reliability & Security | 0/0 | Not started | - |
 | 6. CLI, SDK & appx-api Integration | 0/0 | Not started | - |
 | 7. Multi-Node & Failover | 0/0 | Not started | - |
