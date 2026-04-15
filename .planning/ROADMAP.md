@@ -32,7 +32,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Cloudflare wildcard DNS resolves `*.myappx.live` to the proxy node IP
   4. OpenAPI 3.1 spec exists defining all v1 endpoints, and agent/file-push/proxy protocols are documented
   5. Postgres schema with migrations runs cleanly, and sandbox state machine transitions pass compare-and-swap tests
-**Plans**: TBD
+**Plans:** 5 plans
+
+Plans:
+- [ ] 01-01-PLAN.md -- Go workspace + shared models + state machine TDD + HMAC utilities
+- [ ] 01-02-PLAN.md -- Postgres schema + migrations + sqlc + CAS integration tests TDD
+- [ ] 01-03-PLAN.md -- Contract documents (OpenAPI, agent protocol, file push, proxy routing)
+- [ ] 01-04-PLAN.md -- Infrastructure verification scripts (Tailscale, Docker, inotify, DNS)
+- [ ] 01-05-PLAN.md -- Sandbox Docker image + smoke test
 
 ### Phase 2: Agent & Container Lifecycle
 **Goal**: A Go agent binary runs as a systemd service on a node, creates Docker containers with proper security settings, and reliably reports container events
@@ -109,7 +116,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Infrastructure & Contracts | 0/0 | Not started | - |
+| 1. Infrastructure & Contracts | 0/5 | Planning complete | - |
 | 2. Agent & Container Lifecycle | 0/0 | Not started | - |
 | 3. Control Plane API | 0/0 | Not started | - |
 | 4. Proxy, Routing & File Push | 0/0 | Not started | - |
