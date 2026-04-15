@@ -54,7 +54,7 @@ Plans:
 **Plans:** 6 plans
 
 Plans:
-- [ ] 02-01-PLAN.md -- Agent module scaffold + config + port allocator TDD
+- [x] 02-01-PLAN.md -- Agent module scaffold + config + port allocator TDD
 - [ ] 02-02-PLAN.md -- Docker SDK wrapper + container security settings TDD
 - [ ] 02-03-PLAN.md -- Docker events watcher + image pre-pull + log retrieval TDD
 - [ ] 02-04-PLAN.md -- Control plane HTTP client + heartbeat sender TDD

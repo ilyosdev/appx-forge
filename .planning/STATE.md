@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 01-02-PLAN.md (Postgres schema + migrations + CAS tests)
-last_updated: "2026-04-15T19:58:33.149Z"
+status: executing
+stopped_at: Completed 02-01-PLAN.md (Agent module scaffold + config + port allocator)
+last_updated: "2026-04-15T20:29:16.326Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 1
-  total_plans: 5
-  completed_plans: 5
-  percent: 100
+  total_plans: 11
+  completed_plans: 6
+  percent: 55
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
-**Current focus:** Phase 01 — Infrastructure & Contracts
+**Current focus:** Phase 02 — Agent & Container Lifecycle
 
 ## Current Position
 
-Phase: 01 (Infrastructure & Contracts) — EXECUTING
-Plan: 5 of 5
-Status: Phase complete — ready for verification
+Phase: 02 (Agent & Container Lifecycle) — EXECUTING
+Plan: 2 of 6
+Status: Ready to execute
 Last activity: 2026-04-15
 
 Progress: [░░░░░░░░░░] 0%
@@ -57,6 +57,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P04 | 3min | 2 tasks | 4 files |
 | Phase 01 P05 | 3min | 2 tasks | 9 files |
 | Phase 01 P02 | 12min | 2 tasks | 20 files |
+| Phase 02 P01 | 4min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -80,6 +81,8 @@ Recent decisions affecting current work:
 - [Phase 01]: Used runtime.Caller for migration path resolution instead of go:embed (embed cannot traverse parent dirs)
 - [Phase 01]: CAS pattern: UPDATE WHERE state=$expected returns pgx.ErrNoRows on rejection -- proven with integration tests
 - [Phase 01]: Close database/sql connection before testcontainers Snapshot to avoid template DB lock
+- [Phase 02]: Empty prefix for envconfig.Process since struct tags contain full FORGE_ names
+- [Phase 02]: Port allocator uses map[int]bool for O(1) allocation/release operations
 
 ### Pending Todos
 
@@ -101,6 +104,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T19:58:33.146Z
-Stopped at: Completed 01-02-PLAN.md (Postgres schema + migrations + CAS tests)
+Last session: 2026-04-15T20:29:16.323Z
+Stopped at: Completed 02-01-PLAN.md (Agent module scaffold + config + port allocator)
 Resume file: None
