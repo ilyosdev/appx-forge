@@ -95,11 +95,11 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Sandbox Image
 
-- [ ] **IMG-01**: Dockerfile produces <500MB image with Metro/Expo pre-installed
-- [ ] **IMG-02**: Runs on port 8081, accepts code via bind-mount at /app/code
-- [ ] **IMG-03**: Pre-installed node_modules for common Expo dependencies
-- [ ] **IMG-04**: Documents required env vars (APP_NAME, PORT)
-- [ ] **IMG-05**: Cold start to Metro responding in <10s
+- [x] **IMG-01**: Dockerfile produces <500MB image with Metro/Expo pre-installed
+- [x] **IMG-02**: Runs on port 8081, accepts code via bind-mount at /app/code
+- [x] **IMG-03**: Pre-installed node_modules for common Expo dependencies
+- [x] **IMG-04**: Documents required env vars (APP_NAME, PORT)
+- [x] **IMG-05**: Cold start to Metro responding in <10s
 
 ### Security
 
@@ -182,11 +182,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CNTR-04 | Phase 1 | Complete |
 | CNTR-05 | Phase 1 | Pending |
 | CNTR-06 | Phase 1 | Complete |
-| IMG-01 | Phase 1 | Pending |
-| IMG-02 | Phase 1 | Pending |
-| IMG-03 | Phase 1 | Pending |
-| IMG-04 | Phase 1 | Pending |
-| IMG-05 | Phase 1 | Pending |
+| IMG-01 | Phase 1 | Complete |
+| IMG-02 | Phase 1 | Complete |
+| IMG-03 | Phase 1 | Complete |
+| IMG-04 | Phase 1 | Complete |
+| IMG-05 | Phase 1 | Complete |
 | AGNT-01 | Phase 2 | Pending |
 | AGNT-02 | Phase 2 | Pending |
 | AGNT-03 | Phase 2 | Pending |
