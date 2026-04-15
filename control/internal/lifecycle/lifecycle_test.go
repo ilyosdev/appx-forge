@@ -25,7 +25,7 @@ type mockStore struct {
 	createCommandFn       func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	ackCommandFn          func(ctx context.Context, arg store.AckCommandParams) error
 	recordEventFn         func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
-	getNodeFn             func(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	getNodeByIDFn         func(ctx context.Context, id pgtype.UUID) (store.Node, error)
 }
 
 func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
@@ -91,9 +91,9 @@ func (m *mockStore) RecordEvent(ctx context.Context, arg store.RecordEventParams
 	return store.Event{}, nil
 }
 
-func (m *mockStore) GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error) {
-	if m.getNodeFn != nil {
-		return m.getNodeFn(ctx, id)
+func (m *mockStore) GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	if m.getNodeByIDFn != nil {
+		return m.getNodeByIDFn(ctx, id)
 	}
 	return store.Node{}, errors.New("not found")
 }
@@ -565,7 +565,7 @@ func TestLifecycle_Route_HandleAck_StartSandboxSuccess_CallsOnSandboxRunning(t *
 				HostPort: pgtype.Int4{Int32: 8081, Valid: true},
 			}, nil
 		},
-		getNodeFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+		getNodeByIDFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
 			return store.Node{
 				ID:          pgNodeID,
 				TailscaleIp: netip.MustParseAddr("100.64.0.1"),

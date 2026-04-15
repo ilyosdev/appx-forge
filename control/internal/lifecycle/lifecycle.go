@@ -41,12 +41,21 @@ type Store interface {
 	CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
 	GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
 	GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error)
+	GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error)
 	ListHealthyNodes(ctx context.Context) ([]store.Node, error)
 	AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
 	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	AckCommand(ctx context.Context, arg store.AckCommandParams) error
 	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+}
+
+// RouteNotifier is called by the lifecycle service when sandbox state changes
+// require proxy route updates. Errors are logged as warnings and never propagated
+// -- routing is best-effort, corrected by the drift detector.
+type RouteNotifier interface {
+	OnSandboxRunning(ctx context.Context, appName string, sandboxID string, upstream string) error
+	OnSandboxStopped(ctx context.Context, appName string) error
 }
 
 // ── Request/Result Types ─────────────────────────────────────────────
@@ -84,8 +93,9 @@ type SandboxResult struct {
 
 // LifecycleService orchestrates sandbox lifecycle operations.
 type LifecycleService struct {
-	store  Store
-	logger *slog.Logger
+	store         Store
+	logger        *slog.Logger
+	routeNotifier RouteNotifier
 }
 
 // New creates a new LifecycleService.
@@ -94,6 +104,12 @@ func New(s Store, logger *slog.Logger) *LifecycleService {
 		logger = slog.Default()
 	}
 	return &LifecycleService{store: s, logger: logger}
+}
+
+// SetRouteNotifier injects the route notifier after construction.
+// This avoids widening the New() signature for optional dependencies.
+func (ls *LifecycleService) SetRouteNotifier(rn RouteNotifier) {
+	ls.routeNotifier = rn
 }
 
 // ── CreateSandbox ────────────────────────────────────────────────────
@@ -297,6 +313,16 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 		if err != nil {
 			ls.logger.Warn("failed to record ack event", "error", err, "sandbox_id", sandboxID)
 		}
+
+		// Notify route manager of state changes (best-effort, errors logged)
+		if ls.routeNotifier != nil {
+			switch nextState {
+			case models.StateRunning:
+				ls.notifyRouteAdd(ctx, sandbox, sandboxID)
+			case models.StateDestroyed:
+				ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+			}
+		}
 	}
 
 	// Ack the command
@@ -378,6 +404,16 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 	})
 	if err != nil {
 		ls.logger.Warn("failed to record event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	// Notify route manager when sandbox leaves running state (best-effort).
+	// Only container_exited triggers route removal here -- container_started
+	// does NOT trigger route add (only HandleAck for start_sandbox does).
+	if ls.routeNotifier != nil && currentState == models.StateRunning {
+		switch nextState {
+		case models.StateRestarting, models.StateStopped, models.StateFailed:
+			ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+		}
 	}
 
 	return nil
@@ -494,4 +530,50 @@ func (ls *LifecycleService) RestartSandbox(ctx context.Context, sandboxID uuid.U
 	}
 
 	return nil
+}
+
+// ── Route Notification Helpers ──────────────────────────────────────
+
+// notifyRouteAdd builds the upstream address from node + sandbox data and
+// calls OnSandboxRunning. Errors are logged as warnings, never propagated.
+func (ls *LifecycleService) notifyRouteAdd(ctx context.Context, sandbox store.Sandbox, sandboxID uuid.UUID) {
+	if !sandbox.NodeID.Valid || !sandbox.HostPort.Valid {
+		ls.logger.Warn("cannot notify route add: missing node_id or host_port",
+			"sandbox_id", sandboxID,
+			"node_id_valid", sandbox.NodeID.Valid,
+			"host_port_valid", sandbox.HostPort.Valid,
+		)
+		return
+	}
+
+	node, err := ls.store.GetNodeByID(ctx, sandbox.NodeID)
+	if err != nil {
+		ls.logger.Warn("failed to get node for route notification",
+			"error", err,
+			"sandbox_id", sandboxID,
+			"node_id", uuid.UUID(sandbox.NodeID.Bytes).String(),
+		)
+		return
+	}
+
+	upstream := fmt.Sprintf("%s:%d", node.TailscaleIp.String(), sandbox.HostPort.Int32)
+	if err := ls.routeNotifier.OnSandboxRunning(ctx, sandbox.AppName, sandboxID.String(), upstream); err != nil {
+		ls.logger.Warn("route add notification failed",
+			"error", err,
+			"app_name", sandbox.AppName,
+			"sandbox_id", sandboxID,
+			"upstream", upstream,
+		)
+	}
+}
+
+// notifyRouteRemove calls OnSandboxStopped. Errors are logged, never propagated.
+func (ls *LifecycleService) notifyRouteRemove(ctx context.Context, appName string, sandboxID uuid.UUID) {
+	if err := ls.routeNotifier.OnSandboxStopped(ctx, appName); err != nil {
+		ls.logger.Warn("route remove notification failed",
+			"error", err,
+			"app_name", appName,
+			"sandbox_id", sandboxID,
+		)
+	}
 }
