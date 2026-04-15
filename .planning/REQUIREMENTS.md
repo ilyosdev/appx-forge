@@ -1,7 +1,7 @@
 # Requirements: AppX Forge
 
 **Defined:** 2026-04-15
-**Core Value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts — reliable container orchestration simple enough to explain on one whiteboard
+**Core Value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
 
 ## v1 Requirements
 
@@ -67,30 +67,30 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### CLI
 
-- [ ] **CLI-01**: `forge node list` — show all nodes with status, capacity, sandbox count
-- [ ] **CLI-02**: `forge node add` — register a new node
-- [ ] **CLI-03**: `forge node drain` — stop scheduling, let existing sandboxes idle-reap
-- [ ] **CLI-04**: `forge node remove` — remove node (only if sandbox count is 0)
-- [ ] **CLI-05**: `forge sandbox list` — filter by app, node, state
-- [ ] **CLI-06**: `forge sandbox inspect` — full sandbox details
-- [ ] **CLI-07**: `forge sandbox logs` — with --follow and --tail
-- [ ] **CLI-08**: `forge sandbox restart` — force restart
-- [ ] **CLI-09**: `forge sandbox destroy` — destroy sandbox
-- [ ] **CLI-10**: `forge routes list` — show active routes
-- [ ] **CLI-11**: `forge routes verify` — diff Caddy vs Postgres
-- [ ] **CLI-12**: `forge events` — filter by sandbox, since
-- [ ] **CLI-13**: `forge healthcheck` — control plane health
+- [ ] **CLI-01**: `forge node list` -- show all nodes with status, capacity, sandbox count
+- [ ] **CLI-02**: `forge node add` -- register a new node
+- [ ] **CLI-03**: `forge node drain` -- stop scheduling, let existing sandboxes idle-reap
+- [ ] **CLI-04**: `forge node remove` -- remove node (only if sandbox count is 0)
+- [ ] **CLI-05**: `forge sandbox list` -- filter by app, node, state
+- [ ] **CLI-06**: `forge sandbox inspect` -- full sandbox details
+- [ ] **CLI-07**: `forge sandbox logs` -- with --follow and --tail
+- [ ] **CLI-08**: `forge sandbox restart` -- force restart
+- [ ] **CLI-09**: `forge sandbox destroy` -- destroy sandbox
+- [ ] **CLI-10**: `forge routes list` -- show active routes
+- [ ] **CLI-11**: `forge routes verify` -- diff Caddy vs Postgres
+- [ ] **CLI-12**: `forge events` -- filter by sandbox, since
+- [ ] **CLI-13**: `forge healthcheck` -- control plane health
 
 ### TypeScript SDK
 
 - [ ] **SDK-01**: ForgeClient class with baseUrl + apiKey config
-- [ ] **SDK-02**: `sandboxes.create()` — create sandbox, return Sandbox object with URL
-- [ ] **SDK-03**: `sandboxes.get()` — get sandbox by ID or app:name
-- [ ] **SDK-04**: `sandboxes.list()` — filter by user, state, app_name
-- [ ] **SDK-05**: `sandboxes.destroy()` — destroy sandbox
-- [ ] **SDK-06**: `sandboxes.restart()` — force restart
-- [ ] **SDK-07**: `sandboxes.pushFiles()` — push files (follows 307 redirect to agent)
-- [ ] **SDK-08**: `sandboxes.logs()` — get logs
+- [ ] **SDK-02**: `sandboxes.create()` -- create sandbox, return Sandbox object with URL
+- [ ] **SDK-03**: `sandboxes.get()` -- get sandbox by ID or app:name
+- [ ] **SDK-04**: `sandboxes.list()` -- filter by user, state, app_name
+- [ ] **SDK-05**: `sandboxes.destroy()` -- destroy sandbox
+- [ ] **SDK-06**: `sandboxes.restart()` -- force restart
+- [ ] **SDK-07**: `sandboxes.pushFiles()` -- push files (follows 307 redirect to agent)
+- [ ] **SDK-08**: `sandboxes.logs()` -- get logs
 - [ ] **SDK-09**: Types generated from OpenAPI spec via openapi-typescript-codegen
 
 ### Sandbox Image
@@ -137,7 +137,7 @@ Deferred to future release. Tracked but not in current roadmap.
 
 ### Performance
 
-- **PERF-01**: Warm container pool — pre-initialized Metro containers for sub-second claim
+- **PERF-01**: Warm container pool -- pre-initialized Metro containers for sub-second claim
 - **PERF-02**: Metro cold start optimization via snapshot pool
 - **PERF-03**: Docker checkpoint/restore (CRIU) for sandbox suspend/resume
 
@@ -157,12 +157,12 @@ Deferred to future release. Tracked but not in current roadmap.
 
 | Feature | Reason |
 |---------|--------|
-| Kubernetes / Docker Swarm | Entire reason for this project — replacing Swarm |
+| Kubernetes / Docker Swarm | Entire reason for this project -- replacing Swarm |
 | Firecracker / microVM | Threat model doesn't require VM isolation; sandboxes run trusted AI-generated code |
-| Continuous reconciliation loop | Root cause of Railover 60s restart bug — event-driven only |
+| Continuous reconciliation loop | Root cause of Railover 60s restart bug -- event-driven only |
 | GPU support | Metro/RN bundling is CPU-bound, Contabo nodes have no GPUs |
 | Custom container networking (VPC/overlay) | Sandboxes only need one HTTP port, host port mapping is sufficient |
-| Web UI for Forge | CLI for ops, appx-api dashboard for users — Forge is infrastructure |
+| Web UI for Forge | CLI for ops, appx-api dashboard for users -- Forge is infrastructure |
 | Per-sandbox custom DNS | Single wildcard domain is sufficient |
 | Sandbox-to-sandbox networking | Sandboxes are isolated by design, no inter-sandbox communication needed |
 
@@ -182,13 +182,90 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CNTR-04 | Phase 1 | Pending |
 | CNTR-05 | Phase 1 | Pending |
 | CNTR-06 | Phase 1 | Pending |
-| (remaining mapped during roadmap creation) | | |
+| IMG-01 | Phase 1 | Pending |
+| IMG-02 | Phase 1 | Pending |
+| IMG-03 | Phase 1 | Pending |
+| IMG-04 | Phase 1 | Pending |
+| IMG-05 | Phase 1 | Pending |
+| AGNT-01 | Phase 2 | Pending |
+| AGNT-02 | Phase 2 | Pending |
+| AGNT-03 | Phase 2 | Pending |
+| AGNT-04 | Phase 2 | Pending |
+| AGNT-05 | Phase 2 | Pending |
+| AGNT-06 | Phase 2 | Pending |
+| AGNT-07 | Phase 2 | Pending |
+| AGNT-08 | Phase 2 | Pending |
+| AGNT-09 | Phase 2 | Pending |
+| AGNT-10 | Phase 2 | Pending |
+| AGNT-11 | Phase 2 | Pending |
+| AGNT-12 | Phase 2 | Pending |
+| CTRL-01 | Phase 3 | Pending |
+| CTRL-02 | Phase 3 | Pending |
+| CTRL-03 | Phase 3 | Pending |
+| CTRL-04 | Phase 3 | Pending |
+| CTRL-05 | Phase 3 | Pending |
+| CTRL-06 | Phase 3 | Pending |
+| CTRL-07 | Phase 3 | Pending |
+| CTRL-08 | Phase 3 | Pending |
+| CTRL-09 | Phase 3 | Pending |
+| CTRL-10 | Phase 4 | Pending |
+| CTRL-11 | Phase 5 | Pending |
+| CTRL-12 | Phase 5 | Pending |
+| CTRL-13 | Phase 5 | Pending |
+| CTRL-14 | Phase 3 | Pending |
+| CTRL-15 | Phase 5 | Pending |
+| CTRL-16 | Phase 3 | Pending |
+| PRXY-01 | Phase 4 | Pending |
+| PRXY-02 | Phase 4 | Pending |
+| PRXY-03 | Phase 4 | Pending |
+| PRXY-04 | Phase 4 | Pending |
+| PRXY-05 | Phase 4 | Pending |
+| CLI-01 | Phase 6 | Pending |
+| CLI-02 | Phase 6 | Pending |
+| CLI-03 | Phase 6 | Pending |
+| CLI-04 | Phase 6 | Pending |
+| CLI-05 | Phase 6 | Pending |
+| CLI-06 | Phase 6 | Pending |
+| CLI-07 | Phase 6 | Pending |
+| CLI-08 | Phase 6 | Pending |
+| CLI-09 | Phase 6 | Pending |
+| CLI-10 | Phase 6 | Pending |
+| CLI-11 | Phase 6 | Pending |
+| CLI-12 | Phase 6 | Pending |
+| CLI-13 | Phase 6 | Pending |
+| SDK-01 | Phase 6 | Pending |
+| SDK-02 | Phase 6 | Pending |
+| SDK-03 | Phase 6 | Pending |
+| SDK-04 | Phase 6 | Pending |
+| SDK-05 | Phase 6 | Pending |
+| SDK-06 | Phase 6 | Pending |
+| SDK-07 | Phase 6 | Pending |
+| SDK-08 | Phase 6 | Pending |
+| SDK-09 | Phase 6 | Pending |
+| SEC-01 | Phase 5 | Pending |
+| SEC-02 | Phase 5 | Pending |
+| SEC-03 | Phase 5 | Pending |
+| SEC-04 | Phase 5 | Pending |
+| SEC-05 | Phase 5 | Pending |
+| SEC-06 | Phase 5 | Pending |
+| OPS-01 | Phase 6 | Pending |
+| OPS-02 | Phase 3 | Pending |
+| OPS-03 | Phase 6 | Pending |
+| OPS-04 | Phase 6 | Pending |
+| OPS-05 | Phase 6 | Pending |
+| INT-01 | Phase 6 | Pending |
+| INT-02 | Phase 6 | Pending |
+| INT-03 | Phase 6 | Pending |
+| INT-04 | Phase 6 | Pending |
+| MULTI-01 | Phase 7 | Pending |
+| MULTI-02 | Phase 7 | Pending |
+| MULTI-03 | Phase 7 | Pending |
 
 **Coverage:**
-- v1 requirements: 67 total
-- Mapped to phases: (pending roadmap)
-- Unmapped: (pending roadmap)
+- v1 requirements: 88 total
+- Mapped to phases: 88
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-04-15*
-*Last updated: 2026-04-15 after initial definition*
+*Last updated: 2026-04-15 after roadmap creation*
