@@ -30,8 +30,8 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [x] **CTRL-03**: Bin-packing scheduler picks node with most free RAM, excludes draining/unhealthy nodes
 - [ ] **CTRL-04**: Command dispatch via long-poll: agent polls, control plane holds up to 30s, returns commands
 - [ ] **CTRL-05**: Command acknowledgment: agent reports success/failure, control plane updates sandbox state
-- [ ] **CTRL-06**: Node registration: agent registers on boot, receives agent_token and heartbeat interval
-- [ ] **CTRL-07**: Heartbeat processing: update node last_seen_at, mark unhealthy after 3 missed (45s)
+- [x] **CTRL-06**: Node registration: agent registers on boot, receives agent_token and heartbeat interval
+- [x] **CTRL-07**: Heartbeat processing: update node last_seen_at, mark unhealthy after 3 missed (45s)
 - [ ] **CTRL-08**: Event ingestion: agent reports container events (started, exited, OOM), control plane transitions state
 - [ ] **CTRL-09**: File push redirect: returns 307 to agent's direct endpoint with HMAC-signed URL (60s expiry)
 - [ ] **CTRL-10**: Route management: add/remove Caddy routes via Admin API on sandbox state changes
@@ -204,8 +204,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-03 | Phase 3 | Complete |
 | CTRL-04 | Phase 3 | Pending |
 | CTRL-05 | Phase 3 | Pending |
-| CTRL-06 | Phase 3 | Pending |
-| CTRL-07 | Phase 3 | Pending |
+| CTRL-06 | Phase 3 | Complete |
+| CTRL-07 | Phase 3 | Complete |
 | CTRL-08 | Phase 3 | Pending |
 | CTRL-09 | Phase 3 | Pending |
 | CTRL-10 | Phase 4 | Pending |

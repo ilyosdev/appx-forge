@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-02-PLAN.md (bin-packing scheduler)
-last_updated: "2026-04-15T22:13:09.386Z"
+stopped_at: Completed 03-03-PLAN.md
+last_updated: "2026-04-15T22:22:51.779Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 2
   total_plans: 17
-  completed_plans: 13
-  percent: 76
+  completed_plans: 14
+  percent: 82
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 03 (Control Plane API) — EXECUTING
-Plan: 3 of 6
+Plan: 4 of 6
 Status: Ready to execute
 Last activity: 2026-04-15
 
@@ -65,6 +65,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 02 P06 | 5min | 2 tasks | 6 files |
 | Phase 03 P01 | 6min | 2 tasks | 15 files |
 | Phase 03 P02 | 2min | 2 tasks | 2 files |
+| Phase 03 P03 | 6min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -109,6 +110,8 @@ Recent decisions affecting current work:
 - [Phase 03]: Empty envconfig prefix with full FORGE_ names in struct tags -- matches Phase 02 convention
 - [Phase 03]: Single-pass O(n) scan for scheduler instead of sort -- simpler for max-find
 - [Phase 03]: Deterministic tiebreak by input order (first wins) for scheduler node selection
+- [Phase 03]: NodeStore interface decouples handlers from sqlc-generated store.Queries for mock-based unit testing
+- [Phase 03]: Heartbeat checks node existence via GetNode before UpdateNodeHeartbeat since sqlc :exec discards affected row count
 
 ### Pending Todos
 
@@ -130,6 +133,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T22:13:09.383Z
-Stopped at: Completed 03-02-PLAN.md (bin-packing scheduler)
+Last session: 2026-04-15T22:22:51.776Z
+Stopped at: Completed 03-03-PLAN.md
 Resume file: None
