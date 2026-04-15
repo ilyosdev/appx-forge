@@ -71,7 +71,15 @@ Plans:
   3. Node registration and heartbeat processing work: new agent registers, heartbeats update last_seen_at, 3 missed heartbeats mark node unhealthy
   4. File push request returns 307 redirect to the agent with a valid HMAC-signed URL
   5. docker-compose.dev.yml starts Postgres + control plane + 1 agent for local development
-**Plans**: TBD
+**Plans:** 6 plans
+
+Plans:
+- [ ] 03-01-PLAN.md -- Server scaffold + config + auth middleware + healthz endpoint
+- [ ] 03-02-PLAN.md -- Bin-packing scheduler TDD
+- [ ] 03-03-PLAN.md -- Node registration + heartbeat processing
+- [ ] 03-04-PLAN.md -- Sandbox lifecycle service + CRUD handlers + ack + events
+- [ ] 03-05-PLAN.md -- Long-poll command dispatch + file push redirect
+- [ ] 03-06-PLAN.md -- Binary wiring + docker-compose.dev.yml + integration tests
 
 ### Phase 4: Proxy, Routing & File Push
 **Goal**: Sandboxes are accessible via `{id}.myappx.live` URLs with WebSocket support, and route updates happen without dropping existing connections
@@ -126,7 +134,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 |-------|----------------|--------|-----------|
 | 1. Infrastructure & Contracts | 5/5 | Complete | 2026-04-16 |
 | 2. Agent & Container Lifecycle | 0/6 | Planning complete | - |
-| 3. Control Plane API | 0/0 | Not started | - |
+| 3. Control Plane API | 0/6 | Planning complete | - |
 | 4. Proxy, Routing & File Push | 0/0 | Not started | - |
 | 5. Reliability & Security | 0/0 | Not started | - |
 | 6. CLI, SDK & appx-api Integration | 0/0 | Not started | - |
