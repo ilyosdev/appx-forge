@@ -48,14 +48,14 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [ ] **AGNT-02**: Registers with control plane on boot, receives agent_token
 - [ ] **AGNT-03**: Sends heartbeat every 15s with used_mb and running container count
 - [ ] **AGNT-04**: Long-polls control plane for commands (start_sandbox, stop_sandbox, restart_sandbox, get_logs, prune)
-- [ ] **AGNT-05**: Creates Docker containers via Docker SDK: port binding, bind mount for code, resource limits, seccomp, capability dropping
+- [x] **AGNT-05**: Creates Docker containers via Docker SDK: port binding, bind mount for code, resource limits, seccomp, capability dropping
 - [ ] **AGNT-06**: Watches Docker events stream for die/oom events, reports to control plane immediately
 - [ ] **AGNT-07**: Reconnects Docker event stream with `Since` timestamp on disconnect (no missed events)
 - [ ] **AGNT-08**: File push HTTP endpoint: validates signed URL, writes files to bind-mount directory
 - [x] **AGNT-09**: Port allocator: assigns host ports from range 40000-50000, avoids conflicts
 - [ ] **AGNT-10**: Pre-pulls sandbox image on registration and periodically checks for new versions
 - [ ] **AGNT-11**: Log retrieval: wraps docker logs API, supports tail and follow modes
-- [ ] **AGNT-12**: Container directory setup with correct UID/GID for bind mounts
+- [x] **AGNT-12**: Container directory setup with correct UID/GID for bind mounts
 
 ### Proxy & Routing
 
@@ -191,14 +191,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | AGNT-02 | Phase 2 | Pending |
 | AGNT-03 | Phase 2 | Pending |
 | AGNT-04 | Phase 2 | Pending |
-| AGNT-05 | Phase 2 | Pending |
+| AGNT-05 | Phase 2 | Complete |
 | AGNT-06 | Phase 2 | Pending |
 | AGNT-07 | Phase 2 | Pending |
 | AGNT-08 | Phase 2 | Pending |
 | AGNT-09 | Phase 2 | Complete |
 | AGNT-10 | Phase 2 | Pending |
 | AGNT-11 | Phase 2 | Pending |
-| AGNT-12 | Phase 2 | Pending |
+| AGNT-12 | Phase 2 | Complete |
 | CTRL-01 | Phase 3 | Pending |
 | CTRL-02 | Phase 3 | Pending |
 | CTRL-03 | Phase 3 | Pending |

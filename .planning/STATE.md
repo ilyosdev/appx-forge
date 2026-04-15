@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 02-01-PLAN.md (Agent module scaffold + config + port allocator)
-last_updated: "2026-04-15T20:29:16.326Z"
+stopped_at: Completed 02-02-PLAN.md (Docker SDK wrapper + sandbox lifecycle)
+last_updated: "2026-04-15T20:50:57.677Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 11
-  completed_plans: 6
-  percent: 55
+  completed_plans: 7
+  percent: 64
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 02 (Agent & Container Lifecycle) — EXECUTING
-Plan: 2 of 6
+Plan: 3 of 6
 Status: Ready to execute
 Last activity: 2026-04-15
 
@@ -58,6 +58,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 01 P05 | 3min | 2 tasks | 9 files |
 | Phase 01 P02 | 12min | 2 tasks | 20 files |
 | Phase 02 P01 | 4min | 2 tasks | 6 files |
+| Phase 02 P02 | 18min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,9 @@ Recent decisions affecting current work:
 - [Phase 01]: Close database/sql connection before testcontainers Snapshot to avoid template DB lock
 - [Phase 02]: Empty prefix for envconfig.Process since struct tags contain full FORGE_ names
 - [Phase 02]: Port allocator uses map[int]bool for O(1) allocation/release operations
+- [Phase 02]: rawDockerClient interface enables mock injection for testing container creation params without Docker daemon
+- [Phase 02]: Docker SDK v0.4.0 uses new modular import path github.com/moby/moby/client (not docker/docker)
+- [Phase 02]: chownFunc package-level var allows test override since os.Chown to UID 1000 requires root
 
 ### Pending Todos
 
@@ -104,6 +108,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T20:29:16.323Z
-Stopped at: Completed 02-01-PLAN.md (Agent module scaffold + config + port allocator)
+Last session: 2026-04-15T20:50:57.673Z
+Stopped at: Completed 02-02-PLAN.md (Docker SDK wrapper + sandbox lifecycle)
 Resume file: None
