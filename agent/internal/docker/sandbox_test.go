@@ -14,6 +14,12 @@ import (
 	dockerclient "github.com/moby/moby/client"
 )
 
+func init() {
+	// Override chownFunc for tests: chown to UID 1000 requires root on macOS.
+	// The production agent runs as root on Linux where this works.
+	chownFunc = func(_ string, _, _ int) error { return nil }
+}
+
 // capturedCreate holds the arguments captured from a ContainerCreate call.
 type capturedCreate struct {
 	opts dockerclient.ContainerCreateOptions
@@ -37,6 +43,28 @@ func (m *mockDockerSDK) ContainerStart(_ context.Context, _ string, _ dockerclie
 	m.startCalled = true
 	return dockerclient.ContainerStartResult{}, nil
 }
+func (m *mockDockerSDK) ContainerStop(_ context.Context, _ string, _ dockerclient.ContainerStopOptions) (dockerclient.ContainerStopResult, error) {
+	return dockerclient.ContainerStopResult{}, nil
+}
+func (m *mockDockerSDK) ContainerRemove(_ context.Context, _ string, _ dockerclient.ContainerRemoveOptions) (dockerclient.ContainerRemoveResult, error) {
+	return dockerclient.ContainerRemoveResult{}, nil
+}
+func (m *mockDockerSDK) ContainerRestart(_ context.Context, _ string, _ dockerclient.ContainerRestartOptions) (dockerclient.ContainerRestartResult, error) {
+	return dockerclient.ContainerRestartResult{}, nil
+}
+func (m *mockDockerSDK) ContainerInspect(_ context.Context, _ string, _ dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error) {
+	return dockerclient.ContainerInspectResult{}, nil
+}
+func (m *mockDockerSDK) ContainerLogs(_ context.Context, _ string, _ dockerclient.ContainerLogsOptions) (dockerclient.ContainerLogsResult, error) {
+	return nil, nil
+}
+func (m *mockDockerSDK) ImagePull(_ context.Context, _ string, _ dockerclient.ImagePullOptions) (dockerclient.ImagePullResponse, error) {
+	return nil, nil
+}
+func (m *mockDockerSDK) Events(_ context.Context, _ dockerclient.EventsListOptions) dockerclient.EventsResult {
+	return dockerclient.EventsResult{}
+}
+func (m *mockDockerSDK) Close() error { return nil }
 
 // newTestClient creates a dockerClient with a mock SDK client for testing.
 func newTestClient(mock *mockDockerSDK) *dockerClient {

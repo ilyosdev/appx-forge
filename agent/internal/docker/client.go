@@ -105,9 +105,35 @@ type ContainerEvent struct {
 
 // ── Docker Client Implementation ─────────────────────────────────────────
 
+// rawDockerClient is the subset of the Docker SDK client used by dockerClient.
+// It enables mock injection for testing container creation parameters without
+// a running Docker daemon.
+type rawDockerClient interface {
+	ContainerCreate(ctx context.Context, opts dockerclient.ContainerCreateOptions) (dockerclient.ContainerCreateResult, error)
+	ContainerStart(ctx context.Context, containerID string, opts dockerclient.ContainerStartOptions) (dockerclient.ContainerStartResult, error)
+	ContainerStop(ctx context.Context, containerID string, opts dockerclient.ContainerStopOptions) (dockerclient.ContainerStopResult, error)
+	ContainerRemove(ctx context.Context, containerID string, opts dockerclient.ContainerRemoveOptions) (dockerclient.ContainerRemoveResult, error)
+	ContainerRestart(ctx context.Context, containerID string, opts dockerclient.ContainerRestartOptions) (dockerclient.ContainerRestartResult, error)
+	ContainerInspect(ctx context.Context, containerID string, opts dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error)
+	ContainerLogs(ctx context.Context, containerID string, opts dockerclient.ContainerLogsOptions) (dockerclient.ContainerLogsResult, error)
+	ImagePull(ctx context.Context, ref string, opts dockerclient.ImagePullOptions) (dockerclient.ImagePullResponse, error)
+	Events(ctx context.Context, opts dockerclient.EventsListOptions) dockerclient.EventsResult
+	Close() error
+}
+
 // dockerClient wraps the Docker Engine SDK client.
+// The rawClient field enables mock injection for testing.
 type dockerClient struct {
-	cli *dockerclient.Client
+	cli       *dockerclient.Client // nil when using rawClient directly
+	rawClient rawDockerClient
+}
+
+// raw returns the underlying Docker SDK client, preferring rawClient if set.
+func (d *dockerClient) raw() rawDockerClient {
+	if d.rawClient != nil {
+		return d.rawClient
+	}
+	return d.cli
 }
 
 // NewDockerClient creates a new Docker client using environment defaults.
@@ -120,12 +146,12 @@ func NewDockerClient() (*dockerClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker: create client: %w", err)
 	}
-	return &dockerClient{cli: cli}, nil
+	return &dockerClient{cli: cli, rawClient: cli}, nil
 }
 
 // StartContainer starts a previously created container.
 func (d *dockerClient) StartContainer(ctx context.Context, containerID string) error {
-	_, err := d.cli.ContainerStart(ctx, containerID, dockerclient.ContainerStartOptions{})
+	_, err := d.raw().ContainerStart(ctx, containerID, dockerclient.ContainerStartOptions{})
 	if err != nil {
 		return fmt.Errorf("docker: start container %s: %w", containerID, err)
 	}
@@ -135,7 +161,7 @@ func (d *dockerClient) StartContainer(ctx context.Context, containerID string) e
 // StopContainer gracefully stops a container with the given timeout.
 func (d *dockerClient) StopContainer(ctx context.Context, containerID string, timeout time.Duration) error {
 	timeoutSec := int(timeout.Seconds())
-	_, err := d.cli.ContainerStop(ctx, containerID, dockerclient.ContainerStopOptions{
+	_, err := d.raw().ContainerStop(ctx, containerID, dockerclient.ContainerStopOptions{
 		Timeout: &timeoutSec,
 	})
 	if err != nil {
@@ -146,7 +172,7 @@ func (d *dockerClient) StopContainer(ctx context.Context, containerID string, ti
 
 // RemoveContainer removes a container. Force=true to remove running containers.
 func (d *dockerClient) RemoveContainer(ctx context.Context, containerID string) error {
-	_, err := d.cli.ContainerRemove(ctx, containerID, dockerclient.ContainerRemoveOptions{
+	_, err := d.raw().ContainerRemove(ctx, containerID, dockerclient.ContainerRemoveOptions{
 		Force: true,
 	})
 	if err != nil {
@@ -158,7 +184,7 @@ func (d *dockerClient) RemoveContainer(ctx context.Context, containerID string) 
 // RestartContainer restarts a running container with the given timeout.
 func (d *dockerClient) RestartContainer(ctx context.Context, containerID string, timeout time.Duration) error {
 	timeoutSec := int(timeout.Seconds())
-	_, err := d.cli.ContainerRestart(ctx, containerID, dockerclient.ContainerRestartOptions{
+	_, err := d.raw().ContainerRestart(ctx, containerID, dockerclient.ContainerRestartOptions{
 		Timeout: &timeoutSec,
 	})
 	if err != nil {
@@ -169,7 +195,7 @@ func (d *dockerClient) RestartContainer(ctx context.Context, containerID string,
 
 // InspectContainer returns information about a container.
 func (d *dockerClient) InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error) {
-	result, err := d.cli.ContainerInspect(ctx, containerID, dockerclient.ContainerInspectOptions{})
+	result, err := d.raw().ContainerInspect(ctx, containerID, dockerclient.ContainerInspectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("docker: inspect container %s: %w", containerID, err)
 	}
@@ -198,7 +224,7 @@ func (d *dockerClient) GetLogs(ctx context.Context, containerID string, tail int
 		tailStr = strconv.Itoa(tail)
 	}
 
-	result, err := d.cli.ContainerLogs(ctx, containerID, dockerclient.ContainerLogsOptions{
+	result, err := d.raw().ContainerLogs(ctx, containerID, dockerclient.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     follow,
@@ -212,7 +238,7 @@ func (d *dockerClient) GetLogs(ctx context.Context, containerID string, tail int
 
 // PullImage pulls a Docker image from a registry.
 func (d *dockerClient) PullImage(ctx context.Context, imageRef string) error {
-	resp, err := d.cli.ImagePull(ctx, imageRef, dockerclient.ImagePullOptions{})
+	resp, err := d.raw().ImagePull(ctx, imageRef, dockerclient.ImagePullOptions{})
 	if err != nil {
 		return fmt.Errorf("docker: pull image %s: %w", imageRef, err)
 	}
@@ -230,7 +256,7 @@ func (d *dockerClient) EventsStream(ctx context.Context, since time.Time) (<-cha
 	eventCh := make(chan ContainerEvent)
 	errCh := make(chan error, 1)
 
-	result := d.cli.Events(ctx, dockerclient.EventsListOptions{
+	result := d.raw().Events(ctx, dockerclient.EventsListOptions{
 		Since: since.Format(time.RFC3339Nano),
 		Filters: dockerclient.Filters{
 			"type":  {"container": true},
@@ -272,7 +298,7 @@ func (d *dockerClient) EventsStream(ctx context.Context, since time.Time) (<-cha
 
 // Close releases the underlying Docker client resources.
 func (d *dockerClient) Close() error {
-	return d.cli.Close()
+	return d.raw().Close()
 }
 
 // ── Container Port Constants ─────────────────────────────────────────────
