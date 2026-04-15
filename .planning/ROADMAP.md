@@ -95,7 +95,7 @@ Plans:
 Plans:
 - [x] 04-01-PLAN.md -- Caddy Admin API client + route batcher TDD
 - [x] 04-02-PLAN.md -- Lifecycle route integration + RouteManager wiring
-- [ ] 04-03-PLAN.md -- Caddy base config + docker-compose + DNS verification
+- [x] 04-03-PLAN.md -- Caddy base config + docker-compose + DNS verification
 
 ### Phase 5: Reliability & Security
 **Goal**: Sandboxes self-heal from crashes, idle resources are reclaimed, containers are hardened with seccomp/capabilities, and the system exposes health and metrics endpoints

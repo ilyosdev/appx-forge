@@ -59,11 +59,11 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Proxy & Routing
 
-- [ ] **PRXY-01**: Caddy runs with base config, Cloudflare Origin CA cert for TLS termination
+- [x] **PRXY-01**: Caddy runs with base config, Cloudflare Origin CA cert for TLS termination
 - [x] **PRXY-02**: Control plane adds/removes routes via Caddy Admin API (host matcher + reverse proxy upstream)
 - [x] **PRXY-03**: WebSocket upgrade works through Caddy (HMR for Metro)
 - [x] **PRXY-04**: Route updates batched with 500ms debounce to minimize Caddy config reloads (WebSocket drop mitigation)
-- [ ] **PRXY-05**: Cloudflare DNS wildcard `*.myappx.live` points at Caddy public IP(s)
+- [x] **PRXY-05**: Cloudflare DNS wildcard `*.myappx.live` points at Caddy public IP(s)
 
 ### CLI
 
@@ -215,11 +215,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-14 | Phase 3 | Complete |
 | CTRL-15 | Phase 5 | Pending |
 | CTRL-16 | Phase 3 | Complete |
-| PRXY-01 | Phase 4 | Pending |
+| PRXY-01 | Phase 4 | Complete |
 | PRXY-02 | Phase 4 | Complete |
 | PRXY-03 | Phase 4 | Complete |
 | PRXY-04 | Phase 4 | Complete |
-| PRXY-05 | Phase 4 | Pending |
+| PRXY-05 | Phase 4 | Complete |
 | CLI-01 | Phase 6 | Pending |
 | CLI-02 | Phase 6 | Pending |
 | CLI-03 | Phase 6 | Pending |
