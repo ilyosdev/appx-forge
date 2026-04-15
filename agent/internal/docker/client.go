@@ -1,0 +1,288 @@
+// Package docker wraps the Docker Engine SDK with an interface-based design
+// for testability. The Client interface enables mock-based testing in all
+// packages that need to interact with Docker containers.
+package docker
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"strconv"
+	"time"
+
+	"github.com/moby/moby/api/types/network"
+	dockerclient "github.com/moby/moby/client"
+)
+
+// Client defines the interface for Docker container operations.
+// All methods are context-aware and return errors on failure.
+type Client interface {
+	// CreateContainer creates and starts a sandbox container with the given spec.
+	// Returns the Docker container ID on success.
+	CreateContainer(ctx context.Context, spec *SandboxSpec) (string, error)
+
+	// StartContainer starts a previously created container.
+	StartContainer(ctx context.Context, containerID string) error
+
+	// StopContainer gracefully stops a container with the given timeout.
+	StopContainer(ctx context.Context, containerID string, timeout time.Duration) error
+
+	// RemoveContainer removes a container. It does not stop it first.
+	RemoveContainer(ctx context.Context, containerID string) error
+
+	// RestartContainer restarts a running container with the given timeout.
+	RestartContainer(ctx context.Context, containerID string, timeout time.Duration) error
+
+	// InspectContainer returns information about a container.
+	InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error)
+
+	// GetLogs returns a reader for container logs.
+	// tail specifies the number of lines from the end; 0 means all.
+	// follow=true streams new log output.
+	GetLogs(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
+
+	// PullImage pulls a Docker image from a registry.
+	PullImage(ctx context.Context, imageRef string) error
+
+	// EventsStream returns channels for Docker container events and errors.
+	// Events are filtered to container-type events starting from the given time.
+	EventsStream(ctx context.Context, since time.Time) (<-chan ContainerEvent, <-chan error)
+
+	// Close releases the underlying Docker client resources.
+	Close() error
+}
+
+// SandboxSpec defines the parameters for creating a sandbox container.
+type SandboxSpec struct {
+	// SandboxID is the unique identifier assigned by the control plane.
+	SandboxID string
+
+	// AppName is the application name, used for container naming and bind mount paths.
+	AppName string
+
+	// Image is the Docker image to run (e.g., "appx/sandbox:v1").
+	Image string
+
+	// HostPort is the host port to bind the container's internal port 8081 to.
+	HostPort int
+
+	// CPUCores is the CPU limit in cores (e.g., 0.5 = half a core).
+	CPUCores float64
+
+	// MemoryMB is the memory limit in megabytes.
+	MemoryMB int64
+
+	// Env is a map of environment variables to set in the container.
+	Env map[string]string
+
+	// SandboxDir is the base directory for sandbox bind mounts
+	// (e.g., "/var/lib/forge/sandboxes").
+	SandboxDir string
+
+	// SeccompPath is the path to the seccomp profile JSON file
+	// (e.g., "/etc/forge/seccomp-default.json").
+	SeccompPath string
+}
+
+// ContainerInfo holds information about a running or stopped container.
+type ContainerInfo struct {
+	ID        string
+	Name      string
+	State     string // "running", "exited", "created", etc.
+	Running   bool
+	ExitCode  int
+	StartedAt time.Time
+}
+
+// ContainerEvent represents a Docker container lifecycle event.
+type ContainerEvent struct {
+	ContainerID   string
+	ContainerName string
+	Action        string // "die", "oom", "start", "health_status"
+	ExitCode      string
+	Time          time.Time
+}
+
+// ── Docker Client Implementation ─────────────────────────────────────────
+
+// dockerClient wraps the Docker Engine SDK client.
+type dockerClient struct {
+	cli *dockerclient.Client
+}
+
+// NewDockerClient creates a new Docker client using environment defaults.
+// It negotiates the API version with the Docker daemon automatically.
+func NewDockerClient() (*dockerClient, error) {
+	cli, err := dockerclient.NewClientWithOpts(
+		dockerclient.FromEnv,
+		dockerclient.WithAPIVersionNegotiation(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("docker: create client: %w", err)
+	}
+	return &dockerClient{cli: cli}, nil
+}
+
+// StartContainer starts a previously created container.
+func (d *dockerClient) StartContainer(ctx context.Context, containerID string) error {
+	_, err := d.cli.ContainerStart(ctx, containerID, dockerclient.ContainerStartOptions{})
+	if err != nil {
+		return fmt.Errorf("docker: start container %s: %w", containerID, err)
+	}
+	return nil
+}
+
+// StopContainer gracefully stops a container with the given timeout.
+func (d *dockerClient) StopContainer(ctx context.Context, containerID string, timeout time.Duration) error {
+	timeoutSec := int(timeout.Seconds())
+	_, err := d.cli.ContainerStop(ctx, containerID, dockerclient.ContainerStopOptions{
+		Timeout: &timeoutSec,
+	})
+	if err != nil {
+		return fmt.Errorf("docker: stop container %s: %w", containerID, err)
+	}
+	return nil
+}
+
+// RemoveContainer removes a container. Force=true to remove running containers.
+func (d *dockerClient) RemoveContainer(ctx context.Context, containerID string) error {
+	_, err := d.cli.ContainerRemove(ctx, containerID, dockerclient.ContainerRemoveOptions{
+		Force: true,
+	})
+	if err != nil {
+		return fmt.Errorf("docker: remove container %s: %w", containerID, err)
+	}
+	return nil
+}
+
+// RestartContainer restarts a running container with the given timeout.
+func (d *dockerClient) RestartContainer(ctx context.Context, containerID string, timeout time.Duration) error {
+	timeoutSec := int(timeout.Seconds())
+	_, err := d.cli.ContainerRestart(ctx, containerID, dockerclient.ContainerRestartOptions{
+		Timeout: &timeoutSec,
+	})
+	if err != nil {
+		return fmt.Errorf("docker: restart container %s: %w", containerID, err)
+	}
+	return nil
+}
+
+// InspectContainer returns information about a container.
+func (d *dockerClient) InspectContainer(ctx context.Context, containerID string) (*ContainerInfo, error) {
+	result, err := d.cli.ContainerInspect(ctx, containerID, dockerclient.ContainerInspectOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("docker: inspect container %s: %w", containerID, err)
+	}
+
+	info := &ContainerInfo{
+		ID:   result.Container.ID,
+		Name: result.Container.Name,
+	}
+
+	if result.Container.State != nil {
+		info.State = string(result.Container.State.Status)
+		info.Running = result.Container.State.Running
+		info.ExitCode = result.Container.State.ExitCode
+		if t, err := time.Parse(time.RFC3339Nano, result.Container.State.StartedAt); err == nil {
+			info.StartedAt = t
+		}
+	}
+
+	return info, nil
+}
+
+// GetLogs returns a reader for container logs.
+func (d *dockerClient) GetLogs(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error) {
+	tailStr := "all"
+	if tail > 0 {
+		tailStr = strconv.Itoa(tail)
+	}
+
+	result, err := d.cli.ContainerLogs(ctx, containerID, dockerclient.ContainerLogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     follow,
+		Tail:       tailStr,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("docker: get logs for container %s: %w", containerID, err)
+	}
+	return result, nil
+}
+
+// PullImage pulls a Docker image from a registry.
+func (d *dockerClient) PullImage(ctx context.Context, imageRef string) error {
+	resp, err := d.cli.ImagePull(ctx, imageRef, dockerclient.ImagePullOptions{})
+	if err != nil {
+		return fmt.Errorf("docker: pull image %s: %w", imageRef, err)
+	}
+	defer resp.Close()
+
+	// Drain the response body to complete the pull.
+	if _, err := io.Copy(io.Discard, resp); err != nil {
+		return fmt.Errorf("docker: pull image %s: read response: %w", imageRef, err)
+	}
+	return nil
+}
+
+// EventsStream returns channels for Docker container events and errors.
+func (d *dockerClient) EventsStream(ctx context.Context, since time.Time) (<-chan ContainerEvent, <-chan error) {
+	eventCh := make(chan ContainerEvent)
+	errCh := make(chan error, 1)
+
+	result := d.cli.Events(ctx, dockerclient.EventsListOptions{
+		Since: since.Format(time.RFC3339Nano),
+		Filters: dockerclient.Filters{
+			"type":  {"container": true},
+			"event": {"die": true, "oom": true, "start": true, "health_status": true},
+		},
+	})
+
+	go func() {
+		defer close(eventCh)
+		defer close(errCh)
+
+		for msg := range result.Messages {
+			event := ContainerEvent{
+				ContainerID:   msg.Actor.ID,
+				ContainerName: msg.Actor.Attributes["name"],
+				Action:        string(msg.Action),
+				ExitCode:      msg.Actor.Attributes["exitCode"],
+				Time:          time.Unix(msg.Time, msg.TimeNano%int64(time.Second)),
+			}
+			select {
+			case eventCh <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		// Check for errors after messages channel is drained
+		for err := range result.Err {
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return eventCh, errCh
+}
+
+// Close releases the underlying Docker client resources.
+func (d *dockerClient) Close() error {
+	return d.cli.Close()
+}
+
+// ── Container Port Constants ─────────────────────────────────────────────
+
+// ContainerPort is the port exposed inside the sandbox container (Metro/Expo).
+const ContainerPort = "8081/tcp"
+
+// containerPortParsed is the pre-parsed network.Port for container port binding.
+var containerPortParsed = network.MustParsePort(ContainerPort)
+
+// CreateContainer is implemented in sandbox.go to keep this file focused
+// on the interface and general Docker operations.
+// See sandbox.go for the full container creation logic with security settings.
