@@ -1,0 +1,29 @@
+{
+  "admin": {
+    "listen": "localhost:2019"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":443"],
+          "tls_connection_policies": [{
+            "certificate_selection": {
+              "any_tag": ["origin"]
+            }
+          }],
+          "routes": []
+        }
+      }
+    },
+    "tls": {
+      "certificates": {
+        "load_files": [{
+          "certificate": "/etc/caddy/certs/origin.pem",
+          "key": "/etc/caddy/certs/origin-key.pem",
+          "tags": ["origin"]
+        }]
+      }
+    }
+  }
+}
