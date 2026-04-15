@@ -1,6 +1,6 @@
 {
   "admin": {
-    "listen": "localhost:2019"
+    "listen": "0.0.0.0:2019"
   },
   "apps": {
     "http": {
