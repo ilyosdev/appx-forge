@@ -35,6 +35,7 @@ type Server struct {
 	sandboxReader            SandboxReader
 	agentStore               AgentStore
 	agentLifecycle           AgentLifecycle
+	filePushStore            FilePushStore
 	heartbeatIntervalSeconds int
 }
 
@@ -88,6 +89,7 @@ func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeSt
 				r.Get("/sandboxes/{id}", s.handleGetSandbox)
 				r.Delete("/sandboxes/{id}", s.handleDestroySandbox)
 				r.Post("/sandboxes/{id}/restart", s.handleRestartSandbox)
+				r.Post("/sandboxes/{id}/files", s.handleFilePush)
 
 				// Agent endpoints
 				r.Get("/agents/{id}/commands", s.handlePollCommands)

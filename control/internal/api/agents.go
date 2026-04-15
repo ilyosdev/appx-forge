@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/shared-go/auth"
 )
 
 // ── Interfaces ──────────────────────────────────────────────────────
@@ -26,6 +28,13 @@ type AgentStore interface {
 type AgentLifecycle interface {
 	HandleAck(ctx context.Context, cmdID, sandboxID uuid.UUID, cmdType, status string, result json.RawMessage) error
 	HandleEvent(ctx context.Context, nodeID, sandboxID uuid.UUID, eventType string, payload json.RawMessage) error
+}
+
+// FilePushStore abstracts the database operations needed by the file push handler.
+type FilePushStore interface {
+	GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
+	GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) error
 }
 
 // ── Response Types ──────────────────────────────────────────────────
@@ -227,6 +236,67 @@ func (s *Server) handleReportEvent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// ── File Push Handler ───────────────────────────────────────────────
+
+// handleFilePush handles POST /v1/sandboxes/{id}/files.
+// Returns 307 Temporary Redirect with an HMAC-signed URL pointing at the
+// agent hosting the sandbox. The client follows the redirect to push files
+// directly to the agent (T-03-14, T-03-15).
+func (s *Server) handleFilePush(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	pgID, err := parseUUID(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	// Look up sandbox
+	sandbox, err := s.filePushStore.GetSandbox(r.Context(), pgID)
+	if err != nil {
+		NotFound(w, "sandbox not found")
+		return
+	}
+
+	// Sandbox must be assigned to a node
+	if !sandbox.NodeID.Valid {
+		ServiceUnavailable(w, "sandbox not yet scheduled to a node")
+		return
+	}
+
+	// Get the node to find tailscale_ip and agent_listen_port
+	node, err := s.filePushStore.GetNode(r.Context(), sandbox.NodeID)
+	if err != nil {
+		s.logger.Error("failed to get node for file push", "error", err, "node_id", formatUUID(sandbox.NodeID))
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to resolve sandbox node")
+		return
+	}
+
+	// Construct agent URL
+	sandboxUUID := uuid.UUID(pgID.Bytes)
+	agentURL := fmt.Sprintf("http://%s:%d/v1/sandboxes/%s/files",
+		node.TailscaleIp.String(), node.AgentListenPort, sandboxUUID.String())
+
+	// Sign URL with HMAC (60s expiry)
+	signedURL, err := auth.SignURL(agentURL, []byte(s.config.hmacSecret), 60*time.Second)
+	if err != nil {
+		s.logger.Error("failed to sign file push URL", "error", err)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to generate signed URL")
+		return
+	}
+
+	// Update last_active_at to prevent idle reaping
+	if err := s.filePushStore.UpdateSandboxLastActive(r.Context(), pgID); err != nil {
+		s.logger.Warn("failed to update sandbox last_active_at", "error", err, "sandbox_id", idStr)
+		// Non-fatal: continue with redirect
+	}
+
+	// Return 307 Temporary Redirect
+	w.Header().Set("Location", signedURL)
+	w.WriteHeader(http.StatusTemporaryRedirect)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
