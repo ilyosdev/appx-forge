@@ -57,7 +57,7 @@ Plans:
 - [x] 02-01-PLAN.md -- Agent module scaffold + config + port allocator TDD
 - [x] 02-02-PLAN.md -- Docker SDK wrapper + container security settings TDD
 - [ ] 02-03-PLAN.md -- Docker events watcher + image pre-pull + log retrieval TDD
-- [ ] 02-04-PLAN.md -- Control plane HTTP client + heartbeat sender TDD
+- [x] 02-04-PLAN.md -- Control plane HTTP client + heartbeat sender TDD
 - [ ] 02-05-PLAN.md -- File push HTTP handler with HMAC validation TDD
 - [ ] 02-06-PLAN.md -- Agent main binary + command executor + systemd service
 

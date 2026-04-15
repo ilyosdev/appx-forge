@@ -45,9 +45,9 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 ### Agent
 
 - [x] **AGNT-01**: Single Go binary runs as systemd service on each node
-- [ ] **AGNT-02**: Registers with control plane on boot, receives agent_token
-- [ ] **AGNT-03**: Sends heartbeat every 15s with used_mb and running container count
-- [ ] **AGNT-04**: Long-polls control plane for commands (start_sandbox, stop_sandbox, restart_sandbox, get_logs, prune)
+- [x] **AGNT-02**: Registers with control plane on boot, receives agent_token
+- [x] **AGNT-03**: Sends heartbeat every 15s with used_mb and running container count
+- [x] **AGNT-04**: Long-polls control plane for commands (start_sandbox, stop_sandbox, restart_sandbox, get_logs, prune)
 - [x] **AGNT-05**: Creates Docker containers via Docker SDK: port binding, bind mount for code, resource limits, seccomp, capability dropping
 - [ ] **AGNT-06**: Watches Docker events stream for die/oom events, reports to control plane immediately
 - [ ] **AGNT-07**: Reconnects Docker event stream with `Since` timestamp on disconnect (no missed events)
@@ -188,9 +188,9 @@ Which phases cover which requirements. Updated during roadmap creation.
 | IMG-04 | Phase 1 | Complete |
 | IMG-05 | Phase 1 | Complete |
 | AGNT-01 | Phase 2 | Complete |
-| AGNT-02 | Phase 2 | Pending |
-| AGNT-03 | Phase 2 | Pending |
-| AGNT-04 | Phase 2 | Pending |
+| AGNT-02 | Phase 2 | Complete |
+| AGNT-03 | Phase 2 | Complete |
+| AGNT-04 | Phase 2 | Complete |
 | AGNT-05 | Phase 2 | Complete |
 | AGNT-06 | Phase 2 | Pending |
 | AGNT-07 | Phase 2 | Pending |
