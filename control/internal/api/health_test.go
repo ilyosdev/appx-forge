@@ -18,7 +18,7 @@ func (m *mockPinger) Ping(ctx context.Context) error {
 }
 
 func TestHandleHealthz_Healthy(t *testing.T) {
-	srv := NewServer(nil, &mockPinger{err: nil}, nil, nil, 0)
+	srv := NewServer(nil, &mockPinger{err: nil}, nil, nil, nil, nil, 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -50,7 +50,7 @@ func TestHandleHealthz_Healthy(t *testing.T) {
 }
 
 func TestHandleHealthz_Unhealthy(t *testing.T) {
-	srv := NewServer(nil, &mockPinger{err: errors.New("connection refused")}, nil, nil, 0)
+	srv := NewServer(nil, &mockPinger{err: errors.New("connection refused")}, nil, nil, nil, nil, 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/healthz", nil)
 	rec := httptest.NewRecorder()

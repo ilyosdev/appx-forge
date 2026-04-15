@@ -30,6 +30,8 @@ type Server struct {
 	startTime                time.Time
 	logger                   *slog.Logger
 	nodeStore                NodeStore
+	lifecycle                SandboxLifecycle
+	sandboxReader            SandboxReader
 	heartbeatIntervalSeconds int
 }
 
@@ -37,8 +39,9 @@ type Server struct {
 // cfg may be nil for tests that only need public routes.
 // logger may be nil (a default logger will be used).
 // nodeStore may be nil if node handlers are not needed.
+// lifecycle and sandboxReader may be nil if sandbox handlers are not needed.
 // heartbeatIntervalSec defaults to 15 if 0.
-func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeStore NodeStore, heartbeatIntervalSec int) *Server {
+func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeStore NodeStore, lc SandboxLifecycle, sr SandboxReader, heartbeatIntervalSec int) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -52,6 +55,8 @@ func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeSt
 		startTime:                time.Now(),
 		logger:                   logger,
 		nodeStore:                nodeStore,
+		lifecycle:                lc,
+		sandboxReader:            sr,
 		heartbeatIntervalSeconds: heartbeatIntervalSec,
 	}
 
@@ -74,10 +79,12 @@ func NewServer(cfg *serverConfig, pinger PoolPinger, logger *slog.Logger, nodeSt
 			r.Route("/v1", func(r chi.Router) {
 				r.Post("/nodes/{id}/heartbeat", s.handleHeartbeat)
 
-				// Placeholder: handler plans will mount their routes here.
-				r.Get("/sandboxes", func(w http.ResponseWriter, r *http.Request) {
-					NotFound(w, "not implemented")
-				})
+				// Sandbox CRUD
+				r.Post("/sandboxes", s.handleCreateSandbox)
+				r.Get("/sandboxes", s.handleListSandboxes)
+				r.Get("/sandboxes/{id}", s.handleGetSandbox)
+				r.Delete("/sandboxes/{id}", s.handleDestroySandbox)
+				r.Post("/sandboxes/{id}/restart", s.handleRestartSandbox)
 			})
 		})
 	}

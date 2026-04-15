@@ -8,7 +8,7 @@ import (
 
 func TestServer_HealthzPublic(t *testing.T) {
 	// /v1/healthz should be accessible without any auth header
-	srv := NewServer(nil, &mockPinger{err: nil}, nil, nil, 0)
+	srv := NewServer(nil, &mockPinger{err: nil}, nil, nil, nil, nil, 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/healthz", nil)
 	// No Authorization header
@@ -23,7 +23,7 @@ func TestServer_HealthzPublic(t *testing.T) {
 func TestServer_AuthenticatedRouteRejectsNoToken(t *testing.T) {
 	// An authenticated route (e.g. /v1/sandboxes) should return 401 without token
 	cfg := &serverConfig{apiToken: "test-secret"}
-	srv := NewServer(cfg, &mockPinger{err: nil}, nil, nil, 0)
+	srv := NewServer(cfg, &mockPinger{err: nil}, nil, nil, nil, nil, 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil)
 	// No Authorization header
@@ -39,7 +39,7 @@ func TestServer_AuthenticatedRouteAcceptsValidToken(t *testing.T) {
 	// An authenticated route with valid token should get through to handler
 	// Since no handler is registered for GET /v1/sandboxes, we expect 404 or 405
 	cfg := &serverConfig{apiToken: "test-secret"}
-	srv := NewServer(cfg, &mockPinger{err: nil}, nil, nil, 0)
+	srv := NewServer(cfg, &mockPinger{err: nil}, nil, nil, nil, nil, 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil)
 	req.Header.Set("Authorization", "Bearer test-secret")
@@ -54,7 +54,7 @@ func TestServer_AuthenticatedRouteAcceptsValidToken(t *testing.T) {
 }
 
 func TestServer_NotFoundRoute(t *testing.T) {
-	srv := NewServer(nil, &mockPinger{err: nil}, nil, nil, 0)
+	srv := NewServer(nil, &mockPinger{err: nil}, nil, nil, nil, nil, 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/nonexistent", nil)
 	rec := httptest.NewRecorder()
