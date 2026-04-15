@@ -245,6 +245,108 @@ func TestRegisterNode_NoAuthRequired(t *testing.T) {
 	}
 }
 
+// --- Heartbeat tests ---
+
+func TestHeartbeat_ValidRequest(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("heartbeatnodeuui"))
+
+	var capturedUsedMb int32
+	var capturedRunning int32
+	store := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (nodeRecord, error) {
+			if id != nodeID {
+				t.Fatalf("unexpected node ID in GetNode")
+			}
+			return nodeRecord{ID: nodeID, Hostname: "node-1"}, nil
+		},
+		updateHeartbeatFn: func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error {
+			capturedUsedMb = usedMb
+			capturedRunning = runningContainers
+			return nil
+		},
+	}
+
+	srv := newTestServerWithNodeStore(store, 15)
+	body := `{"used_mb":8500,"running_containers":12}`
+
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/"+nodeIDStr+"/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if capturedUsedMb != 8500 {
+		t.Fatalf("expected used_mb=8500, got %d", capturedUsedMb)
+	}
+	if capturedRunning != 12 {
+		t.Fatalf("expected running_containers=12, got %d", capturedRunning)
+	}
+}
+
+func TestHeartbeat_UnknownNode(t *testing.T) {
+	store := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (nodeRecord, error) {
+			return nodeRecord{}, pgx.ErrNoRows
+		},
+	}
+
+	srv := newTestServerWithNodeStore(store, 15)
+	body := `{"used_mb":1000,"running_containers":2}`
+
+	// Use a valid UUID that doesn't exist in the store
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/00000000-0000-0000-0000-000000000099/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHeartbeat_NoAuth(t *testing.T) {
+	store := &mockNodeStore{}
+	srv := newTestServerWithNodeStore(store, 15)
+	body := `{"used_mb":1000,"running_containers":2}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/00000000-0000-0000-0000-000000000001/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	// No Authorization header
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestHeartbeat_InvalidUUID(t *testing.T) {
+	store := &mockNodeStore{}
+	srv := newTestServerWithNodeStore(store, 15)
+	body := `{"used_mb":1000,"running_containers":2}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/not-a-uuid/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // --- Test helpers ---
 
 // newTestServerWithNodeStore creates a minimal Server for handler testing.
