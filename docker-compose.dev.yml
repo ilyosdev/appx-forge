@@ -27,6 +27,7 @@ services:
       FORGE_LOG_LEVEL: "debug"
       FORGE_HEARTBEAT_INTERVAL_SECONDS: "15"
       FORGE_HEARTBEAT_MISS_THRESHOLD: "3"
+      FORGE_CADDY_ADMIN_URL: "http://localhost:2019"
     ports:
       - "8080:8080"
     depends_on:

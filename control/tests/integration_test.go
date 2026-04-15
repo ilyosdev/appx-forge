@@ -165,6 +165,10 @@ func (a *integrationAdapter) RecordEvent(ctx context.Context, arg store.RecordEv
 	return a.q.RecordEvent(ctx, arg)
 }
 
+func (a *integrationAdapter) GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	return a.q.GetNode(ctx, id)
+}
+
 // ── Setup helper ───────────────────────────────────────────────────────
 
 const testToken = "integration-test-token"

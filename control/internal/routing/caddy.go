@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -119,6 +120,25 @@ func (c *CaddyClient) ListRoutes(ctx context.Context) ([]Route, error) {
 		}
 	}
 	return routes, nil
+}
+
+// Apply implements Flusher by calling AddRoute for each add and RemoveRoute for
+// each remove. Errors are collected; partial failures do not stop remaining ops.
+func (c *CaddyClient) Apply(ctx context.Context, adds []Route, removes []string) error {
+	var errs []error
+
+	for _, r := range adds {
+		if err := c.AddRoute(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("add %s: %w", r.AppName, err))
+		}
+	}
+	for _, appName := range removes {
+		if err := c.RemoveRoute(ctx, appName); err != nil {
+			errs = append(errs, fmt.Errorf("remove %s: %w", appName, err))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
 // ── JSON Helpers ────────────────────────────────────────────────────

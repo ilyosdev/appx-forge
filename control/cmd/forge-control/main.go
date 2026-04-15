@@ -26,6 +26,7 @@ import (
 	"github.com/appx/forge/control/internal/api"
 	"github.com/appx/forge/control/internal/config"
 	"github.com/appx/forge/control/internal/lifecycle"
+	"github.com/appx/forge/control/internal/routing"
 	"github.com/appx/forge/control/internal/store"
 )
 
@@ -90,6 +91,14 @@ func main() {
 	adapter := &storeAdapter{q: queries}
 
 	lc := lifecycle.New(adapter, logger)
+
+	// Route manager (Caddy proxy integration)
+	caddyClient := routing.NewCaddyClient(cfg.CaddyAdminURL)
+	batcher := routing.NewBatcher(caddyClient, logger)
+	defer batcher.Stop()
+	routeManager := routing.NewRouteManager(batcher, logger)
+	lc.SetRouteNotifier(routeManager)
+	logger.Info("route manager wired", "caddy_admin_url", cfg.CaddyAdminURL)
 
 	// ── HTTP Server ────────────────────────────────────────────────────
 	srv := api.NewServer(
@@ -426,4 +435,8 @@ func (a *storeAdapter) AckCommand(ctx context.Context, arg store.AckCommandParam
 
 func (a *storeAdapter) RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error) {
 	return a.q.RecordEvent(ctx, arg)
+}
+
+func (a *storeAdapter) GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	return a.q.GetNode(ctx, id)
 }

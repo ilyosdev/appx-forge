@@ -14,6 +14,8 @@ type Config struct {
 
 	HeartbeatIntervalSeconds int `envconfig:"FORGE_HEARTBEAT_INTERVAL_SECONDS" default:"15"`
 	HeartbeatMissThreshold   int `envconfig:"FORGE_HEARTBEAT_MISS_THRESHOLD" default:"3"`
+
+	CaddyAdminURL string `envconfig:"FORGE_CADDY_ADMIN_URL" default:"http://localhost:2019"`
 }
 
 // Load parses environment variables into a Config struct. Returns an error
