@@ -16,10 +16,10 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Contracts & Schema
 
-- [ ] **CNTR-01**: OpenAPI 3.1 spec defines all v1 endpoints (sandbox CRUD, node registration, agent commands, routes)
-- [ ] **CNTR-02**: Agent protocol documented (registration, long-poll commands, command ack, event reporting)
-- [ ] **CNTR-03**: File push protocol documented (control plane redirect, signed URL, agent direct endpoint)
-- [ ] **CNTR-04**: Proxy routing protocol documented (Caddy Admin API shape, drift detection)
+- [x] **CNTR-01**: OpenAPI 3.1 spec defines all v1 endpoints (sandbox CRUD, node registration, agent commands, routes)
+- [x] **CNTR-02**: Agent protocol documented (registration, long-poll commands, command ack, event reporting)
+- [x] **CNTR-03**: File push protocol documented (control plane redirect, signed URL, agent direct endpoint)
+- [x] **CNTR-04**: Proxy routing protocol documented (Caddy Admin API shape, drift detection)
 - [ ] **CNTR-05**: Postgres schema with migrations (nodes, sandboxes, events, commands tables)
 - [x] **CNTR-06**: Sandbox state machine implemented with compare-and-swap (`UPDATE WHERE state = $expected`)
 
@@ -176,10 +176,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INFRA-02 | Phase 1 | Pending |
 | INFRA-03 | Phase 1 | Pending |
 | INFRA-04 | Phase 1 | Pending |
-| CNTR-01 | Phase 1 | Pending |
-| CNTR-02 | Phase 1 | Pending |
-| CNTR-03 | Phase 1 | Pending |
-| CNTR-04 | Phase 1 | Pending |
+| CNTR-01 | Phase 1 | Complete |
+| CNTR-02 | Phase 1 | Complete |
+| CNTR-03 | Phase 1 | Complete |
+| CNTR-04 | Phase 1 | Complete |
 | CNTR-05 | Phase 1 | Pending |
 | CNTR-06 | Phase 1 | Complete |
 | IMG-01 | Phase 1 | Pending |

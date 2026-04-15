@@ -37,7 +37,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 - [x] 01-01-PLAN.md -- Go workspace + shared models + state machine TDD + HMAC utilities
 - [ ] 01-02-PLAN.md -- Postgres schema + migrations + sqlc + CAS integration tests TDD
-- [ ] 01-03-PLAN.md -- Contract documents (OpenAPI, agent protocol, file push, proxy routing)
+- [x] 01-03-PLAN.md -- Contract documents (OpenAPI, agent protocol, file push, proxy routing)
 - [ ] 01-04-PLAN.md -- Infrastructure verification scripts (Tailscale, Docker, inotify, DNS)
 - [ ] 01-05-PLAN.md -- Sandbox Docker image + smoke test
 
