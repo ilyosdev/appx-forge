@@ -7,6 +7,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/shared-go/auth"
 )
 
 // ── Mock Agent Store ─────────────────────────────────────────────────
@@ -450,5 +455,297 @@ func TestReportEvent_InvalidNodeID(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── Mock File Push Store ────────────────────────────────────────────
+
+type mockFilePushStore struct {
+	getSandboxFn            func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
+	getNodeFn               func(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	updateSandboxLastActive func(ctx context.Context, id pgtype.UUID) error
+}
+
+func (m *mockFilePushStore) GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+	if m.getSandboxFn != nil {
+		return m.getSandboxFn(ctx, id)
+	}
+	return store.Sandbox{}, errors.New("not found")
+}
+
+func (m *mockFilePushStore) GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	if m.getNodeFn != nil {
+		return m.getNodeFn(ctx, id)
+	}
+	return store.Node{}, errors.New("not found")
+}
+
+func (m *mockFilePushStore) UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) error {
+	if m.updateSandboxLastActive != nil {
+		return m.updateSandboxLastActive(ctx, id)
+	}
+	return nil
+}
+
+// ── File Push Test Helpers ──────────────────────────────────────────
+
+func newFilePushTestServer(fps FilePushStore) *Server {
+	r := chi.NewRouter()
+	s := &Server{
+		router:        r,
+		config:        &serverConfig{apiToken: "test-token", hmacSecret: "test-hmac-secret-32bytes-long!!"},
+		logger:        testLogger(),
+		filePushStore: fps,
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(BearerAuth("test-token"))
+		r.Route("/v1", func(r chi.Router) {
+			r.Post("/sandboxes/{id}/files", s.handleFilePush)
+		})
+	})
+
+	return s
+}
+
+// ── File Push Tests ─────────────────────────────────────────────────
+
+func TestFilePush_Success_307Redirect(t *testing.T) {
+	sandboxID := uuid.New()
+	nodeID := uuid.New()
+
+	tsIP := netip.MustParseAddr("100.64.1.5")
+
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgtype.UUID{Bytes: sandboxID, Valid: true},
+				AppName: "my-app",
+				NodeID:  pgtype.UUID{Bytes: nodeID, Valid: true},
+				State:   "running",
+			}, nil
+		},
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+			return store.Node{
+				ID:              pgtype.UUID{Bytes: nodeID, Valid: true},
+				TailscaleIp:     tsIP,
+				AgentListenPort: 8090,
+			}, nil
+		},
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			return nil
+		},
+	}
+
+	srv := newFilePushTestServer(fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/files", bytes.NewBufferString(`{"files":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307, got %d: %s", w.Code, w.Body.String())
+	}
+
+	loc := w.Header().Get("Location")
+	if loc == "" {
+		t.Fatal("expected Location header to be set")
+	}
+
+	// Verify the Location URL contains the sandbox ID
+	if !strings.Contains(loc, sandboxID.String()) {
+		t.Fatalf("expected Location URL to contain sandbox ID %s, got %q", sandboxID, loc)
+	}
+
+	// Verify the Location URL contains the Tailscale IP and port
+	if !strings.Contains(loc, "100.64.1.5:8090") {
+		t.Fatalf("expected Location URL to contain 100.64.1.5:8090, got %q", loc)
+	}
+
+	// Verify the signed URL has expires and sig params
+	if !strings.Contains(loc, "expires=") {
+		t.Fatalf("expected Location URL to contain expires param, got %q", loc)
+	}
+	if !strings.Contains(loc, "sig=") {
+		t.Fatalf("expected Location URL to contain sig param, got %q", loc)
+	}
+
+	// Verify the signed URL is valid via auth.VerifyURL
+	_, err := auth.VerifyURL(loc, []byte("test-hmac-secret-32bytes-long!!"))
+	if err != nil {
+		t.Fatalf("expected signed URL to be valid, got error: %v", err)
+	}
+}
+
+func TestFilePush_SandboxNotFound(t *testing.T) {
+	fps := &mockFilePushStore{} // default returns error
+
+	srv := newFilePushTestServer(fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+uuid.New().String()+"/files", bytes.NewBufferString(`{"files":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFilePush_SandboxNotScheduled(t *testing.T) {
+	sandboxID := uuid.New()
+
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgtype.UUID{Bytes: sandboxID, Valid: true},
+				AppName: "my-app",
+				NodeID:  pgtype.UUID{Valid: false}, // not assigned to a node
+				State:   "pending",
+			}, nil
+		},
+	}
+
+	srv := newFilePushTestServer(fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/files", bytes.NewBufferString(`{"files":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFilePush_InvalidSandboxID(t *testing.T) {
+	fps := &mockFilePushStore{}
+	srv := newFilePushTestServer(fps)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/not-a-uuid/files", bytes.NewBufferString(`{"files":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestFilePush_SignedURL_Has60sExpiry(t *testing.T) {
+	sandboxID := uuid.New()
+	nodeID := uuid.New()
+
+	tsIP := netip.MustParseAddr("100.64.1.5")
+
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgtype.UUID{Bytes: sandboxID, Valid: true},
+				AppName: "my-app",
+				NodeID:  pgtype.UUID{Bytes: nodeID, Valid: true},
+				State:   "running",
+			}, nil
+		},
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+			return store.Node{
+				ID:              pgtype.UUID{Bytes: nodeID, Valid: true},
+				TailscaleIp:     tsIP,
+				AgentListenPort: 8090,
+			}, nil
+		},
+	}
+
+	srv := newFilePushTestServer(fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/files", bytes.NewBufferString(`{"files":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	beforeTime := time.Now().Unix()
+	srv.ServeHTTP(w, req)
+	afterTime := time.Now().Unix()
+
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307, got %d: %s", w.Code, w.Body.String())
+	}
+
+	loc := w.Header().Get("Location")
+	u, err := url.Parse(loc)
+	if err != nil {
+		t.Fatalf("parse location URL: %v", err)
+	}
+
+	expiresStr := u.Query().Get("expires")
+	if expiresStr == "" {
+		t.Fatal("expected expires param in signed URL")
+	}
+
+	expires, err := strconv.ParseInt(expiresStr, 10, 64)
+	if err != nil {
+		t.Fatalf("parse expires: %v", err)
+	}
+
+	// Expires should be ~60s from now
+	minExpiry := beforeTime + 55 // allow 5s tolerance
+	maxExpiry := afterTime + 65  // allow 5s tolerance
+
+	if expires < minExpiry || expires > maxExpiry {
+		t.Fatalf("expected expires between %d and %d, got %d", minExpiry, maxExpiry, expires)
+	}
+}
+
+func TestFilePush_UpdatesLastActive(t *testing.T) {
+	sandboxID := uuid.New()
+	nodeID := uuid.New()
+
+	tsIP := netip.MustParseAddr("100.64.1.5")
+
+	lastActiveCalled := false
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgtype.UUID{Bytes: sandboxID, Valid: true},
+				AppName: "my-app",
+				NodeID:  pgtype.UUID{Bytes: nodeID, Valid: true},
+				State:   "running",
+			}, nil
+		},
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+			return store.Node{
+				ID:              pgtype.UUID{Bytes: nodeID, Valid: true},
+				TailscaleIp:     tsIP,
+				AgentListenPort: 8090,
+			}, nil
+		},
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			lastActiveCalled = true
+			if id.Bytes != sandboxID {
+				t.Fatalf("expected sandbox ID %s, got %s", sandboxID, uuid.UUID(id.Bytes))
+			}
+			return nil
+		},
+	}
+
+	srv := newFilePushTestServer(fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/files", bytes.NewBufferString(`{"files":[]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("expected 307, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if !lastActiveCalled {
+		t.Fatal("expected UpdateSandboxLastActive to be called")
 	}
 }
