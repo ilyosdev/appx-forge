@@ -34,7 +34,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [x] **CTRL-07**: Heartbeat processing: update node last_seen_at, mark unhealthy after 3 missed (45s)
 - [x] **CTRL-08**: Event ingestion: agent reports container events (started, exited, OOM), control plane transitions state
 - [x] **CTRL-09**: File push redirect: returns 307 to agent's direct endpoint with HMAC-signed URL (60s expiry)
-- [ ] **CTRL-10**: Route management: add/remove Caddy routes via Admin API on sandbox state changes
+- [x] **CTRL-10**: Route management: add/remove Caddy routes via Admin API on sandbox state changes
 - [ ] **CTRL-11**: Routing drift detector: every 60s diff Caddy state vs Postgres, fix discrepancies (routes only, never containers)
 - [ ] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
 - [ ] **CTRL-13**: Auto-restart with backoff: on container crash, restart up to 3 times with exponential backoff, then mark FAILED
@@ -61,7 +61,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 - [ ] **PRXY-01**: Caddy runs with base config, Cloudflare Origin CA cert for TLS termination
 - [x] **PRXY-02**: Control plane adds/removes routes via Caddy Admin API (host matcher + reverse proxy upstream)
-- [ ] **PRXY-03**: WebSocket upgrade works through Caddy (HMR for Metro)
+- [x] **PRXY-03**: WebSocket upgrade works through Caddy (HMR for Metro)
 - [x] **PRXY-04**: Route updates batched with 500ms debounce to minimize Caddy config reloads (WebSocket drop mitigation)
 - [ ] **PRXY-05**: Cloudflare DNS wildcard `*.myappx.live` points at Caddy public IP(s)
 
@@ -208,7 +208,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-07 | Phase 3 | Complete |
 | CTRL-08 | Phase 3 | Complete |
 | CTRL-09 | Phase 3 | Complete |
-| CTRL-10 | Phase 4 | Pending |
+| CTRL-10 | Phase 4 | Complete |
 | CTRL-11 | Phase 5 | Pending |
 | CTRL-12 | Phase 5 | Pending |
 | CTRL-13 | Phase 5 | Pending |
@@ -217,7 +217,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-16 | Phase 3 | Complete |
 | PRXY-01 | Phase 4 | Pending |
 | PRXY-02 | Phase 4 | Complete |
-| PRXY-03 | Phase 4 | Pending |
+| PRXY-03 | Phase 4 | Complete |
 | PRXY-04 | Phase 4 | Complete |
 | PRXY-05 | Phase 4 | Pending |
 | CLI-01 | Phase 6 | Pending |

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-01-PLAN.md
-last_updated: "2026-04-15T23:22:34.527Z"
+stopped_at: Completed 04-02-PLAN.md
+last_updated: "2026-04-15T23:35:46.913Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 3
   total_plans: 20
-  completed_plans: 18
-  percent: 90
+  completed_plans: 19
+  percent: 95
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 04 (Proxy, Routing & File Push) — EXECUTING
-Plan: 2 of 3
+Plan: 3 of 3
 Status: Ready to execute
 Last activity: 2026-04-15
 
@@ -70,6 +70,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 03 P05 | 463s | 2 tasks | 4 files |
 | Phase 03 P06 | 968s | 2 tasks | 11 files |
 | Phase 04 P01 | 256s | 2 tasks | 4 files |
+| Phase 04 P02 | 627s | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -129,6 +130,10 @@ Recent decisions affecting current work:
 - [Phase 04]: Route JSON constructed from validated Route struct fields -- no raw user JSON (T-04-02 mitigation)
 - [Phase 04]: Batcher dedup uses last-write-wins per app_name in pending map
 - [Phase 04]: flushLocked releases mutex during Flusher.Apply to avoid holding lock during network I/O
+- [Phase 04]: GetNodeByID naming resolves return-type clash between api.NodeStore and lifecycle.Store
+- [Phase 04]: CaddyClient.Apply implements Flusher with errors.Join for partial-failure tolerance
+- [Phase 04]: Route adds only via HandleAck (not HandleEvent container_started) for authoritative host_port data
+- [Phase 04]: Enqueuer interface on RouteManager enables spy-based unit testing without real Batcher
 
 ### Pending Todos
 
@@ -150,6 +155,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T23:22:34.524Z
-Stopped at: Completed 04-01-PLAN.md
+Last session: 2026-04-15T23:35:46.911Z
+Stopped at: Completed 04-02-PLAN.md
 Resume file: None
