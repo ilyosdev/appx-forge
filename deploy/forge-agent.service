@@ -1,0 +1,31 @@
+[Unit]
+Description=Forge Agent - Docker sandbox orchestration agent
+Documentation=https://github.com/appx/forge
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/forge-agent
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Environment
+EnvironmentFile=/etc/forge/agent.env
+
+# Security hardening (T-02-18 mitigation)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/forge
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forge-agent
+
+[Install]
+WantedBy=multi-user.target
