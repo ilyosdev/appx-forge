@@ -124,10 +124,10 @@ Plans:
   3. appx-api uses ForgeClient instead of RailoverService for all container operations, and RailoverService/ContainerReconciler/CircuitBreaker are deleted
   4. Integration test: appx-api creates sandbox via SDK, pushes files, verifies the preview URL returns content
   5. Ansible playbook bootstraps a fresh node with Docker, Tailscale, and agent systemd service
-**Plans:** 4 plans
+**Plans:** 1/4 plans executed
 
 Plans:
-- [ ] 06-01-PLAN.md -- Control plane missing API endpoints (list nodes, routes, events, logs proxy, drain, remove)
+- [x] 06-01-PLAN.md -- Control plane missing API endpoints (list nodes, routes, events, logs proxy, drain, remove)
 - [ ] 06-02-PLAN.md -- ForgeClient TypeScript SDK with types, client, and nock tests (TDD)
 - [ ] 06-03-PLAN.md -- forge-cli Go binary with all 13 Cobra commands
 - [ ] 06-04-PLAN.md -- Ansible playbook + runbooks + appx-api migration guide
@@ -153,5 +153,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 3. Control Plane API | 0/6 | Planning complete | - |
 | 4. Proxy, Routing & File Push | 0/3 | Planning complete | - |
 | 5. Reliability & Security | 0/3 | Planning complete | - |
-| 6. CLI, SDK & appx-api Integration | 0/4 | Planning complete | - |
+| 6. CLI, SDK & appx-api Integration | 1/4 | In Progress|  |
 | 7. Multi-Node & Failover | 0/0 | Not started | - |

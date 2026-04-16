@@ -67,19 +67,19 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### CLI
 
-- [ ] **CLI-01**: `forge node list` -- show all nodes with status, capacity, sandbox count
-- [ ] **CLI-02**: `forge node add` -- register a new node
-- [ ] **CLI-03**: `forge node drain` -- stop scheduling, let existing sandboxes idle-reap
-- [ ] **CLI-04**: `forge node remove` -- remove node (only if sandbox count is 0)
-- [ ] **CLI-05**: `forge sandbox list` -- filter by app, node, state
-- [ ] **CLI-06**: `forge sandbox inspect` -- full sandbox details
-- [ ] **CLI-07**: `forge sandbox logs` -- with --follow and --tail
+- [x] **CLI-01**: `forge node list` -- show all nodes with status, capacity, sandbox count
+- [x] **CLI-02**: `forge node add` -- register a new node
+- [x] **CLI-03**: `forge node drain` -- stop scheduling, let existing sandboxes idle-reap
+- [x] **CLI-04**: `forge node remove` -- remove node (only if sandbox count is 0)
+- [x] **CLI-05**: `forge sandbox list` -- filter by app, node, state
+- [x] **CLI-06**: `forge sandbox inspect` -- full sandbox details
+- [x] **CLI-07**: `forge sandbox logs` -- with --follow and --tail
 - [ ] **CLI-08**: `forge sandbox restart` -- force restart
 - [ ] **CLI-09**: `forge sandbox destroy` -- destroy sandbox
-- [ ] **CLI-10**: `forge routes list` -- show active routes
-- [ ] **CLI-11**: `forge routes verify` -- diff Caddy vs Postgres
-- [ ] **CLI-12**: `forge events` -- filter by sandbox, since
-- [ ] **CLI-13**: `forge healthcheck` -- control plane health
+- [x] **CLI-10**: `forge routes list` -- show active routes
+- [x] **CLI-11**: `forge routes verify` -- diff Caddy vs Postgres
+- [x] **CLI-12**: `forge events` -- filter by sandbox, since
+- [x] **CLI-13**: `forge healthcheck` -- control plane health
 
 ### TypeScript SDK
 
@@ -220,19 +220,19 @@ Which phases cover which requirements. Updated during roadmap creation.
 | PRXY-03 | Phase 4 | Complete |
 | PRXY-04 | Phase 4 | Complete |
 | PRXY-05 | Phase 4 | Complete |
-| CLI-01 | Phase 6 | Pending |
-| CLI-02 | Phase 6 | Pending |
-| CLI-03 | Phase 6 | Pending |
-| CLI-04 | Phase 6 | Pending |
-| CLI-05 | Phase 6 | Pending |
-| CLI-06 | Phase 6 | Pending |
-| CLI-07 | Phase 6 | Pending |
+| CLI-01 | Phase 6 | Complete |
+| CLI-02 | Phase 6 | Complete |
+| CLI-03 | Phase 6 | Complete |
+| CLI-04 | Phase 6 | Complete |
+| CLI-05 | Phase 6 | Complete |
+| CLI-06 | Phase 6 | Complete |
+| CLI-07 | Phase 6 | Complete |
 | CLI-08 | Phase 6 | Pending |
 | CLI-09 | Phase 6 | Pending |
-| CLI-10 | Phase 6 | Pending |
-| CLI-11 | Phase 6 | Pending |
-| CLI-12 | Phase 6 | Pending |
-| CLI-13 | Phase 6 | Pending |
+| CLI-10 | Phase 6 | Complete |
+| CLI-11 | Phase 6 | Complete |
+| CLI-12 | Phase 6 | Complete |
+| CLI-13 | Phase 6 | Complete |
 | SDK-01 | Phase 6 | Pending |
 | SDK-02 | Phase 6 | Pending |
 | SDK-03 | Phase 6 | Pending |
