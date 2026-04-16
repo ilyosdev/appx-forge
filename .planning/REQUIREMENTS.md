@@ -39,7 +39,7 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [x] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
 - [x] **CTRL-13**: Auto-restart with backoff: on container crash, restart up to 3 times with exponential backoff, then mark FAILED
 - [x] **CTRL-14**: Bearer token auth on all endpoints (except /healthz and /metrics)
-- [ ] **CTRL-15**: Prometheus metrics endpoint (/metrics): sandbox count by state, node utilization, request latency
+- [x] **CTRL-15**: Prometheus metrics endpoint (/metrics): sandbox count by state, node utilization, request latency
 - [x] **CTRL-16**: Health endpoint (/healthz): self-check + Postgres connectivity
 
 ### Agent
@@ -103,12 +103,12 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Security
 
-- [ ] **SEC-01**: Seccomp profile restricts sandbox containers to ~40 syscalls
-- [ ] **SEC-02**: Capability dropping: `--cap-drop ALL` + CHOWN/SETUID/SETGID only
-- [ ] **SEC-03**: `no-new-privileges:true` on all sandbox containers
-- [ ] **SEC-04**: PID limit (256) on sandbox containers
-- [ ] **SEC-05**: Agent token scoped per node (not global API key)
-- [ ] **SEC-06**: File push signed URLs with HMAC-SHA256 + 60s expiry
+- [x] **SEC-01**: Seccomp profile restricts sandbox containers to ~40 syscalls
+- [x] **SEC-02**: Capability dropping: `--cap-drop ALL` + CHOWN/SETUID/SETGID only
+- [x] **SEC-03**: `no-new-privileges:true` on all sandbox containers
+- [x] **SEC-04**: PID limit (256) on sandbox containers
+- [x] **SEC-05**: Agent token scoped per node (not global API key)
+- [x] **SEC-06**: File push signed URLs with HMAC-SHA256 + 60s expiry
 
 ### Deployment & Ops
 
@@ -213,7 +213,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-12 | Phase 5 | Complete |
 | CTRL-13 | Phase 5 | Complete |
 | CTRL-14 | Phase 3 | Complete |
-| CTRL-15 | Phase 5 | Pending |
+| CTRL-15 | Phase 5 | Complete |
 | CTRL-16 | Phase 3 | Complete |
 | PRXY-01 | Phase 4 | Complete |
 | PRXY-02 | Phase 4 | Complete |
@@ -242,12 +242,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SDK-07 | Phase 6 | Pending |
 | SDK-08 | Phase 6 | Pending |
 | SDK-09 | Phase 6 | Pending |
-| SEC-01 | Phase 5 | Pending |
-| SEC-02 | Phase 5 | Pending |
-| SEC-03 | Phase 5 | Pending |
-| SEC-04 | Phase 5 | Pending |
-| SEC-05 | Phase 5 | Pending |
-| SEC-06 | Phase 5 | Pending |
+| SEC-01 | Phase 5 | Complete |
+| SEC-02 | Phase 5 | Complete |
+| SEC-03 | Phase 5 | Complete |
+| SEC-04 | Phase 5 | Complete |
+| SEC-05 | Phase 5 | Complete |
+| SEC-06 | Phase 5 | Complete |
 | OPS-01 | Phase 6 | Pending |
 | OPS-02 | Phase 3 | Complete |
 | OPS-03 | Phase 6 | Pending |

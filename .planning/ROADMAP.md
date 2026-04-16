@@ -112,7 +112,7 @@ Plans:
 Plans:
 - [x] 05-01-PLAN.md -- Auto-restart with exponential backoff TDD
 - [x] 05-02-PLAN.md -- Idle reaper + routing drift detector TDD
-- [ ] 05-03-PLAN.md -- Prometheus /metrics + seccomp profile + binary wiring
+- [x] 05-03-PLAN.md -- Prometheus /metrics + seccomp profile + binary wiring
 
 ### Phase 6: CLI, SDK & appx-api Integration
 **Goal**: Ops can manage the fleet via CLI, appx-api creates sandboxes via the TypeScript SDK, and Railover is fully replaced
