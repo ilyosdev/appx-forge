@@ -153,7 +153,7 @@ appx-forge/
 - **internal/ everywhere:** Go convention -- prevents external imports of private packages. Forces clean API boundaries.
 - **shared-go/ minimal:** Only truly shared types (models, auth). Resist the urge to put business logic here. If control and agent need different behavior, duplicate rather than abstract.
 - **contracts/ written first:** The OpenAPI spec gates all parallel work. Tracks B-F generate code from it. This pattern comes directly from the Nomad, Fly.io, and Railway architectures where the API contract is the integration boundary.
-- **store/ with sqlc:** Generated code lives alongside queries. No ORM abstraction layer -- raw SQL with type safety. This is the dominant Go+Postgres pattern in 2025-2026.
+- **store/ with sqlc:** Generated code lives alongside queries. No ORM abstraction layer -- raw SQL with type safety. This is the dominant Go+Postgres pattern in 2025-2026 (Cloudflare, ngrok, and Weave all use sqlc in production).
 
 ## Architectural Patterns
 
@@ -169,7 +169,7 @@ appx-forge/
 - Con: Requires disciplined event reporting from agents
 - Con: Orphaned containers possible if agent misses a "die" event (mitigated by periodic agent-side container list sync)
 
-**Evidence:** Fly.io moved away from Nomad partly because of reconciler issues. Their flyd keeps state local to workers with explicit event-driven updates. E2B uses event-driven sandbox lifecycle with explicit timeout-based termination. The "Build an Orchestrator in Go" book (Manning) structures its Cube orchestrator around explicit task state transitions.
+**Evidence:** Fly.io moved away from Nomad partly because of reconciler issues. Their flyd is "rigidly structured as a collection of state machines" where each operation (create, start, stop) is a durable FSM with transition steps "recorded carefully in a BoltDB database." Nothing in flyd is cached; everything is materialized on-demand from disk. E2B uses event-driven sandbox lifecycle with explicit timeout-based termination. The "Build an Orchestrator in Go" book (Manning) structures its Cube orchestrator around explicit task state transitions (Pending -> Scheduled -> Running -> Completed/Failed).
 
 **State machine (from STARTER_PLAN, validated against Docker container lifecycle best practices):**
 
@@ -199,7 +199,7 @@ Key design rules:
 - Every transition writes to `events` table before updating `sandboxes` table (crash-safe ordering)
 - The `failure_count` field on sandbox enables exponential backoff for restart attempts
 
-**Example:**
+**Implementation -- use a map-based transition table (no library needed at this scale):**
 ```go
 type State string
 
@@ -254,6 +254,8 @@ func (sm *Machine) Transition(sandboxID string, event Event) (State, error) {
 }
 ```
 
+**State machine library consideration:** The `qmuntal/stateless` library provides a UML-statechart-based FSM that is thread-safe, supports guard conditions, and has entry/exit actions. However, at this scale a plain map-based transition table is simpler (< 50 LOC), easier to reason about, and has zero dependencies. Use the library only if you need nested states or complex guard conditions later.
+
 ### Pattern 2: Long-Poll Command Dispatch with Idempotent Acknowledgment
 
 **What:** Agents poll `GET /v1/agents/:id/commands?wait=30s`. Control plane holds the connection open until a command is queued or timeout expires. Agent executes command, then POSTs ack with result. Commands have unique IDs for deduplication.
@@ -266,13 +268,13 @@ func (sm *Machine) Transition(sandboxID string, event Event) (State, error) {
 - Pro: Easy to debug with curl
 - Pro: Firewall-friendly (outbound HTTP from agent)
 - Con: Slightly more overhead than persistent connections at very high command rates (not a concern at <100 nodes)
-- Con: 30s max wait means worst-case 30s latency for commands queued just after a timeout
+- Con: 30s max wait means worst-case 30s latency for commands queued just after a timeout (mitigated: commands are rare; most agent communication is heartbeats)
 
-**Evidence:** Consul uses long-polling for service discovery watches. Fly.io's attache component tracks Consul via long-poll HTTP endpoints. HashiCorp Vault uses long-poll for secret rotation notifications. The pattern is battle-tested for agent communication at scale.
+**Evidence:** Consul uses long-polling for service discovery watches. Fly.io's system relies on HTTP-based communication between control and workers. The protocol comparison data shows: WebSocket adds 2 bytes/frame overhead but requires infrastructure awareness (proxy config, idle timeouts, health checks); SSE is server-to-client only (would need separate POST for acks); long-poll adds HTTP headers per request (~hundreds of bytes) but is dead simple. At <10 commands/second across the entire fleet, the overhead difference is irrelevant.
 
-**Why not gRPC:** gRPC adds proto file maintenance, code generation step, and bidirectional streaming complexity that isn't needed for a command/ack pattern. At <100 nodes with <10 commands/second, HTTP long-poll is simpler and equally performant. Can always upgrade to gRPC later without changing the protocol semantics.
+**Why not gRPC:** E2B uses gRPC for real-time operations alongside REST for lifecycle management (dual-protocol pattern). However, gRPC adds proto file maintenance, code generation, and bidirectional streaming complexity that isn't needed for a simple command/ack pattern at <100 nodes. The protocol can always be upgraded later without changing semantics. E2B's dual-protocol approach makes sense at their scale; at Forge's scale, one protocol is better.
 
-**Why not SSE:** SSE is unidirectional (server-to-client only). We need the agent to ack commands. With SSE, we'd need a separate POST endpoint for acks anyway, effectively building long-poll with extra steps.
+**Why not SSE:** SSE is unidirectional (server-to-client only). We need the agent to ack commands. With SSE, we'd need a separate POST endpoint for acks anyway, effectively building long-poll with extra steps. SSE adds automatic reconnection with last-event-ID which is nice, but not worth the architectural complexity of split request/response paths.
 
 **Implementation detail -- idempotency:**
 ```go
@@ -339,6 +341,8 @@ func (q *CommandQueue) Poll(agentID string, timeout time.Duration) *Command {
 }
 ```
 
+**Alternative observed in wild -- NATS request-reply:** A Fly.io-like scheduler implementation uses NATS for coordinator-to-worker communication with a "first-response-wins" pattern where workers temporarily mark themselves unavailable using `atomic.Bool`. This creates a thundering herd at scale but works elegantly for small clusters. Not recommended for Forge because NATS adds operational complexity (another service to run), but worth noting as an upgrade path if long-poll becomes insufficient.
+
 ### Pattern 3: Best-Fit Decreasing Bin-Packing Scheduler
 
 **What:** When placing a sandbox, score all healthy nodes by how well the sandbox fits (tightest fit = highest score). Pick the node where the sandbox leaves the least free resources. This maximizes density -- packing nodes full before using new ones.
@@ -351,7 +355,9 @@ func (q *CommandQueue) Poll(agentID string, timeout time.Duration) *Command {
 - Con: Can create hotspots if not combined with anti-affinity (same user's sandboxes on same node)
 - Con: No spread = correlated failure risk (mitigated: this isn't a mission-critical HA system)
 
-**Evidence:** Nomad's `BinPackIterator` in `scheduler/rank.go` uses this exact pattern with a `binPackingMaxFitScore` of 18.0, scoring based on free CPU and memory percentages. Kubernetes' `MostRequestedPriority` scheduler does the same. The "Build an Orchestrator in Go" book implements this in its scheduler chapter.
+**Evidence:** Nomad's `BinPackIterator` in `scheduler/rank.go` uses this exact pattern with a `binPackingMaxFitScore` of 18.0, scoring based on free CPU and memory percentages. Nomad's scheduling pipeline has two phases: feasibility checking (filter nodes by datacenter, health, drivers, constraints) then ranking (score by bin-packing + affinity/anti-affinity). Multiple scheduling workers (one per CPU core) process evaluations with optimistic concurrency -- no locking or reservations. A plan queue on the leader handles conflicts after parallel scheduling.
+
+For Forge's scale (1-10 nodes), the full Nomad pipeline is unnecessary. A single-pass score-all-and-pick-best is sufficient. The scheduler is behind an interface -- swap the implementation later if needed.
 
 **Implementation:**
 ```go
@@ -393,6 +399,8 @@ func (s *Scheduler) PickNode(req ResourceRequest) (*Node, error) {
 }
 ```
 
+**Fly.io's rejection of bin-packing:** Fly.io explicitly moved away from Nomad's bin-packing because it created "Katamari Damacy scheduling" -- overloaded servers with all the popular images cached, while underloaded servers sat idle without the right images. Their solution was to treat cached Docker images as a scheduling resource. For Forge, this is irrelevant because all sandboxes use the same base image (appx/sandbox:vN). Single-image fleet = bin-packing works perfectly.
+
 ### Pattern 4: Signed-URL File Push (Direct-to-Agent)
 
 **What:** When SDK calls `POST /v1/sandboxes/:id/files`, control plane does NOT receive the file body. Instead, it generates a short-lived signed URL pointing at the agent's direct HTTP endpoint and returns a 307 redirect. The client (appx-api) follows the redirect and uploads directly to the agent. File goes client -> agent, never through control plane.
@@ -407,7 +415,7 @@ func (s *Scheduler) PickNode(req ResourceRequest) (*Node, error) {
 - Con: Agent must verify signed URLs (HMAC, ~20 LOC)
 - Con: Agent must be network-reachable from client (Tailscale handles this)
 
-**Evidence:** This is the standard pattern for S3 presigned uploads, Google Cloud signed URLs, and MinIO presigned PUTs. E2B uses signature-based access control with time-limited tokens for file operations. Railway's stacker model similarly has compute nodes handle data directly.
+**Evidence:** This is the standard pattern for S3 presigned uploads, Google Cloud signed URLs, and MinIO presigned PUTs. E2B uses "signature-based file access control" with cryptographic signatures containing file path, operation type, user, and access token, plus "time-limited access with configurable expiration times." Railway's stacker model similarly has compute nodes handle data directly.
 
 **Flow:**
 ```
@@ -447,7 +455,7 @@ Metro detects changes -> HMR update in <500ms
 - Con: OOM events can repeat rapidly (need deduplication)
 - Con: Stream can break on Docker daemon restart (need reconnect logic)
 
-**Evidence:** Docker Go SDK's `client.Events()` returns channels for messages and errors, standard reconnect pattern. The `docker/go-events` library provides `ExponentialBackoff` and `Breaker` patterns for resilience. The "Build an Orchestrator in Go" book covers this pattern in its worker chapters.
+**Evidence:** Docker Go SDK's `client.Events()` returns channels for messages and errors, standard reconnect pattern. The `docker/go-events` library provides `ExponentialBackoff` (random backoff with exponentially increasing bounds as consecutive failures increase) and `Breaker` (circuit breaker retry that never drops events) patterns for resilience. The `Channel` type provides a sink where writer and listener operate in separate goroutines. The "Build an Orchestrator in Go" book covers this pattern in its worker chapters.
 
 **Implementation:**
 ```go
@@ -492,6 +500,8 @@ func (a *Agent) WatchEvents(ctx context.Context) {
 }
 ```
 
+**Important edge case -- Docker daemon restart:** When Docker restarts (e.g., after an update), the events stream breaks and all containers restart. The agent must handle this by: (1) reconnecting the events stream, (2) listing all `managed-by=forge` containers to discover their new state, and (3) reporting bulk status to the control plane. This is the ONE place where a container-list reconciliation is justified -- it runs only on stream reconnect, not periodically.
+
 ### Pattern 6: Caddy Admin API Route Management
 
 **What:** Control plane manages Caddy's routing table via its REST Admin API on `localhost:2019`. Routes are added/removed as sandboxes start/stop. A lightweight reconciler runs every 60s to fix drift.
@@ -499,14 +509,15 @@ func (a *Agent) WatchEvents(ctx context.Context) {
 **When to use:** All routing configuration. No Caddyfile editing, no file-based config reloads.
 
 **Trade-offs:**
-- Pro: ~50ms config reload, no connection drops
-- Pro: ACID guarantees per request (with Etag-based optimistic concurrency)
+- Pro: Configuration changes are "lightweight, efficient, and incur zero downtime" (official docs)
+- Pro: ACID guarantees per request with automatic rollback of failed configs
 - Pro: Battle-tested proxy (HTTP/2, WebSocket, auto-TLS)
 - Pro: JSON API is easy to test and debug
 - Con: Another process to manage (Caddy binary)
 - Con: Route state is ephemeral in Caddy memory (must be reconstructable from Postgres)
+- Con: No built-in authentication on Admin API -- security relies on network isolation (bind to unix socket or localhost)
 
-**Evidence:** Caddy Admin API documentation confirms: changes occur without downtime, failed reloads automatically rollback, and the `@id` feature allows direct access to individual routes without knowing their array position.
+**Evidence:** Caddy Admin API documentation confirms: POST appends to arrays, PUT inserts at position, PATCH replaces, DELETE removes. Routes live at `apps/http/servers/[server_name]/routes`. The `@id` feature allows direct access to individual routes by name without knowing their array position -- critical for O(1) removal.
 
 **Key implementation detail -- use `@id` for O(1) route access:**
 ```go
@@ -530,6 +541,23 @@ func (c *CaddyClient) RemoveRoute(appName string) error {
     return c.delete(fmt.Sprintf("/id/forge-%s", appName))
 }
 ```
+
+### Pattern 7: Postgres Advisory Lock Leader Election
+
+**What:** For HA control plane (v1.1+), run two instances. One acquires a session-level advisory lock via `pg_try_advisory_lock()` and becomes leader. The other polls every 5s. If the leader's session terminates (crash, network partition), the lock releases automatically and the standby takes over.
+
+**When to use:** When you need hot-standby for the control plane without deploying etcd/Consul/Raft.
+
+**Trade-offs:**
+- Pro: Zero additional infrastructure (already have Postgres)
+- Pro: Session-level locks auto-release on connection drop
+- Pro: Battle-tested pattern (Temporal, Conductor, many internal tools use this)
+- Con: Failover time = session timeout + polling interval (5-15s)
+- Con: CRITICAL: PgBouncer in transaction mode breaks advisory locks (they are session-scoped). Must use direct connections or PgBouncer session mode for the leader lock connection.
+
+**Evidence:** PostgreSQL advisory locks provide both session-level (`pg_try_advisory_lock`) and transaction-level (`pg_try_advisory_xact_lock`) variants. For leader election, session-level is correct because the lock should persist across multiple transactions. The `go-pglock` library provides a ready-made Go implementation. Multiple production writeups confirm this as the standard pattern when you already have Postgres.
+
+**Implementation note:** Use a separate pgx connection (not from the pool) for the advisory lock. The pool connection could be recycled, releasing the lock unexpectedly. The leader-election goroutine holds its own dedicated connection for the lifetime of leadership.
 
 ## Data Flow
 
@@ -565,6 +593,8 @@ Caddy: appName.myappx.live now resolves to the running container
 
 Total time: <3s orchestration + ~5s Metro cold start = ~8s end-to-end
 ```
+
+**Synchronous vs asynchronous scheduling:** Fly.io uses synchronous scheduling -- "you either get the machine when you ask for it, or you don't and get an error. There's no pending state." Forge should follow this philosophy for the create-sandbox path. If no node has capacity, return an error immediately rather than queueing. The PENDING state exists only for the brief window between scheduling decision and agent acknowledgment, not as a long-lived queue.
 
 ### File Push Flow (Hot Path)
 
@@ -694,7 +724,7 @@ Control Plane (background ticker, every 5min):
 
 **What people do:** Give agents their own databases or state files, then try to merge state across nodes without a consensus protocol.
 
-**Why it's wrong:** Split-brain scenarios. Conflicting decisions about sandbox placement. Stale state leading to double-scheduling. Fly.io can do local-state-per-worker because they built custom gossip replication (Corrosion) -- that's multi-year engineering.
+**Why it's wrong:** Split-brain scenarios. Conflicting decisions about sandbox placement. Stale state leading to double-scheduling. Fly.io can do local-state-per-worker because they built custom gossip replication (Corrosion -- SWIM-gossip over SQLite) -- that's multi-year engineering.
 
 **Do this instead:** Single Postgres as source of truth. Agents are stateless -- they can reconstruct everything from Docker inspect + next long-poll from control plane. Control plane is the only writer to Postgres. At v1 scale (1-10 nodes), this is correct and simple.
 
@@ -712,7 +742,15 @@ Control Plane (background ticker, every 5min):
 
 **Why it's wrong:** With 1-3 nodes, all healthy nodes are probably equally good. Complex scheduling logic adds bugs and debugging complexity for near-zero benefit at this scale.
 
-**Do this instead:** Start with simple best-fit by free RAM. The scheduler is behind an interface -- swap the implementation later. Fly.io explicitly rejected complex bin packing, calling it "Katamari Damacy scheduling" that created hotspots.
+**Do this instead:** Start with simple best-fit by free RAM. The scheduler is behind an interface -- swap the implementation later. Fly.io explicitly rejected complex bin packing, calling it "Katamari Damacy scheduling" that created hotspots. Their approach treats scheduling as synchronous and simple.
+
+### Anti-Pattern 6: Tailscale Sidecar per Container
+
+**What people do:** Run a Tailscale container alongside each sandbox container using Docker's `network_mode: service:` to share network namespaces.
+
+**Why it's wrong:** Adds ~20MB memory overhead per sandbox, an auth key per container, and operational complexity for zero benefit. The sandboxes don't need their own Tailscale identity -- they just need to be reachable.
+
+**Do this instead:** Run Tailscale on the host (agent node level) as a systemd service. Containers bind to host ports. Proxy reaches containers via `tailscale-ip:host-port`. Agent reaches Docker via local socket. No per-container Tailscale needed.
 
 ## Integration Points
 
@@ -720,11 +758,11 @@ Control Plane (background ticker, every 5min):
 
 | Service | Integration Pattern | Notes |
 |---------|---------------------|-------|
-| **Postgres (Neon/Supabase)** | pgx/v5 connection pool from control plane only. sqlc for type-safe queries. goose for migrations. | Avoid PgBouncer in transaction mode if using advisory locks for leader election -- locks are session-scoped. Use direct connections for leader election, pooled for normal queries. |
+| **Postgres (Neon/Supabase)** | pgx/v5 connection pool from control plane only. sqlc for type-safe queries. goose for migrations. | CRITICAL: Avoid PgBouncer in transaction mode if using advisory locks for leader election -- locks are session-scoped. Use direct connections for leader election, pooled for normal queries. Neon's proxy handles connection pooling but verify advisory lock compatibility. |
 | **Cloudflare** | DNS: `*.myappx.live` CNAME to Caddy public IPs (proxied). SSL: Full mode with Origin Certificate on Caddy. | No API integration needed for v1 -- DNS is static wildcard. Disable HTTP/3 (QUIC) in Cloudflare to avoid ERR_QUIC_PROTOCOL_ERROR (known issue from Railover). |
-| **Tailscale** | Agent + control plane + Caddy all join same tailnet. Communication uses Tailscale IPs (100.x.y.z). | Install via Ansible on node bootstrap. Auth key per node. DERP relay adds 30-80ms if UDP blocked -- test with Contabo first. |
-| **Docker Engine** | Agent uses `github.com/docker/docker/client` (Go SDK). Never `docker.sock` mount. Agent runs as systemd service on host. | Pre-pull sandbox image on agent registration. Label all managed containers `managed-by=forge` for filtering. |
-| **Caddy** | Control plane calls Admin API on `localhost:2019` (or Tailscale IP if Caddy is on separate node). JSON config for route management. | Use `@id` for O(1) route lookup/removal. Base config loaded from file on Caddy startup; dynamic routes added via API. |
+| **Tailscale** | Agent + control plane + Caddy all join same tailnet. Communication uses Tailscale IPs (100.x.y.z). Host-level install (not sidecar). | Install via Ansible on node bootstrap. Auth key per node (OAuth clients preferred over auth keys -- scoped API access, never expire, require tags). DERP relay adds 30-80ms if UDP blocked -- test with Contabo first. Allow inbound UDP 41641 in Contabo firewall for direct WireGuard. |
+| **Docker Engine** | Agent uses `github.com/docker/docker/client` (Go SDK). Never `docker.sock` mount. Agent runs as systemd service on host. | Pre-pull sandbox image on agent registration. Label all managed containers `managed-by=forge` for filtering. Agent's Docker SDK creates containers with seccomp profile, capability dropping, and resource limits. |
+| **Caddy** | Control plane calls Admin API on `localhost:2019` (or Tailscale IP if Caddy is on separate node). JSON config for route management. | Use `@id` for O(1) route lookup/removal. Base config loaded from file on Caddy startup; dynamic routes added via API. Bind Admin API to unix socket or localhost only -- no built-in authentication. |
 
 ### Internal Boundaries
 
@@ -780,55 +818,56 @@ Week 4: Migration + Hardening
 
 ### Fly.io (flyd + flaps)
 
-- **Architecture:** Decentralized. Each worker runs flyd with local state in BoltDB. Flaps is a stateful proxy/scheduler that queries workers via direct RPC.
-- **State:** Local to workers, replicated via Corrosion (custom gossip layer over SQLite). No central DB for placement decisions.
-- **Scheduling:** Market-based. Scheduler "bids" on worker capacity. Synchronous -- if placement fails, return error immediately (no pending queue).
-- **Lesson for Forge:** Their market-based model is elegant but overkill at <50 nodes. Take the "no pending queue" philosophy -- if no node can fit the sandbox, fail fast.
+- **Architecture:** Decentralized. Each worker runs flyd with local state in BoltDB (append-only operation logs). Nothing is cached; everything is materialized on-demand from disk. Flaps is a stateful proxy/scheduler that queries workers via direct WireGuard connectivity.
+- **State:** Local to workers, replicated via Corrosion (custom SWIM-gossip layer over SQLite). No central DB for placement decisions. Each flyd is "a server for on-demand instances of durable finite state machines."
+- **Scheduling:** Synchronous -- "you either get the machine when you ask for it, or you don't and get an error." No pending queue. Flaps collects "capacity information from all the flyds" via Corrosion before executing best-fit ranking. They rejected Nomad's bin-packing because Docker image caching created scheduling hotspots.
+- **Migration:** FSM pattern -- flyd on source stops machine, signals target to clone volumes, monitors completion via RPC, converts devices, cleans up.
+- **Lesson for Forge:** Take their "no pending queue" philosophy and synchronous scheduling model. Reject their decentralized state model -- it required years of engineering (Corrosion) that is unjustified at Forge's scale.
 
 ### Railway
 
-- **Architecture:** Temporal workflows for deployment orchestration. Custom Go control plane for networking.
+- **Architecture:** GCP VMs with custom non-K8s orchestrator. "Stackers" are worker nodes. Temporal workflows for deployment orchestration. Custom Go control plane for networking.
 - **Networking:** Event-based. When orchestrator provisions a container, it assigns an IPv6 and pushes to a network control plane. Updates propagate to all proxies and DNS servers within milliseconds over gRPC.
-- **Compute:** GCP VMs with custom non-K8s orchestrator. "Stackers" are worker nodes.
-- **Lesson for Forge:** Event-based routing updates (push to proxy on state change) is the right pattern. Don't poll Caddy to check route state.
+- **Build:** Railpack (successor to Nixpacks) auto-detects language/framework and generates optimized OCI images. Cloudflare at the edge for routing.
+- **Lesson for Forge:** Event-based routing updates (push to proxy on state change) is the right pattern. Don't poll Caddy to check route state -- push on sandbox state transitions, reconcile only for drift detection.
 
 ### E2B
 
-- **Architecture:** API layer + control plane + compute clusters. Node-based orchestration with health tracking.
-- **Virtualization:** Firecracker microVMs (not Docker containers). <200ms cold start via VM snapshots.
-- **Templates:** Pre-built environments cached locally on nodes. Snapshot-and-restore for near-instant starts.
-- **Security:** Four-layer isolation (KVM, Firecracker VMM, guest OS, application daemon).
-- **API:** Dual-protocol: REST for lifecycle, gRPC for real-time ops.
-- **Lesson for Forge:** Template pre-caching on nodes is critical for cold start times. Pre-pull sandbox images during agent registration, not on first sandbox create. Their snapshot model is a future upgrade path (Docker checkpoint/CRIU or Firecracker migration).
+- **Architecture:** API layer (Gin framework, REST) + orchestrator (Go) + compute clusters. Infrastructure is "implemented primarily in Go and deployed using Terraform." Uses Nomad for job scheduling with Consul for service discovery. PostgreSQL with sqlc for type-safe queries.
+- **Virtualization:** Firecracker microVMs (not Docker containers). Boot time < 125ms, memory overhead < 5MB per VM. Templates are pre-built environments cached locally on nodes via GCS buckets.
+- **API:** Dual-protocol: REST for lifecycle management (sandbox create/kill/timeout), gRPC (Connect RPC) for real-time operations (filesystem, commands, terminals). This makes sense at their scale but is over-engineered for Forge v1.
+- **Node Management:** Nodes tracked by allocated CPU, memory, sandbox count, and starting sandbox count. States: ready, draining, connecting, unhealthy. Redis for distributed caching and template state.
+- **Observability:** OpenTelemetry for everything (Grafana stack: Loki, Tempo, Mimir). Feature flags via LaunchDarkly.
+- **Lesson for Forge:** Template pre-caching on nodes is critical for cold start times. Pre-pull sandbox images during agent registration, not on first sandbox create. Their sqlc + Postgres pattern validates Forge's stack choice. Their snapshot model is a future upgrade path (Docker checkpoint/CRIU or Firecracker migration).
 
 ### The "Cube" Orchestrator (Manning book)
 
-- **Architecture:** Manager + Workers + Scheduler. Manager assigns tasks to workers based on scheduler decisions. Workers execute via Docker SDK.
+- **Architecture:** Manager + Workers + Scheduler. Manager assigns tasks to workers based on scheduler decisions. Workers execute via Docker SDK. This is the canonical learning architecture for Go orchestrators.
 - **State machine:** Task lifecycle: Pending -> Scheduled -> Running -> Completed/Failed.
-- **Scheduler:** Pluggable interface. Starts with round-robin, upgrades to bin-packing.
-- **Lesson for Forge:** The book validates the control-plane/agent split as the standard architecture. The pluggable scheduler interface is the right design.
+- **Scheduler:** Pluggable interface. Starts with round-robin, upgrades to bin-packing (Borg-inspired algorithms).
+- **Lesson for Forge:** The book validates the control-plane/agent split as the standard architecture. The pluggable scheduler interface is the right design. Starting simple and evolving is the proven approach.
 
 ## Sources
 
-- [Fly.io Architecture](https://fly.io/docs/reference/architecture/) - HIGH confidence
 - [Carving The Scheduler Out of Our Orchestrator (Fly.io)](https://fly.io/blog/carving-the-scheduler-out-of-our-orchestrator/) - HIGH confidence
-- [A Foolish Consistency: Consul at Fly.io](https://fly.io/blog/a-foolish-consistency/) - HIGH confidence
-- [Railway Horizontal Scaling Architecture](https://blog.railway.com/p/launch-week-01-horizontal-scaling) - MEDIUM confidence
+- [Making Machines Move (Fly.io)](https://fly.io/blog/machine-migrations/) - HIGH confidence
+- [Building a Fly.io-like Scheduler (Dan Goodman)](https://danthegoodman.substack.com/p/building-a-flyio-like-scheduler-part) - MEDIUM confidence
 - [E2B Architecture Breakdown (Dwarves Memo)](https://memo.d.foundation/breakdown/e2b) - MEDIUM confidence
+- [E2B Infrastructure CLAUDE.md](https://github.com/e2b-dev/infra/blob/main/CLAUDE.md) - HIGH confidence
+- [E2B Infrastructure Repository](https://github.com/e2b-dev/infra) - HIGH confidence
 - [Nomad Scheduling Architecture](https://developer.hashicorp.com/nomad/docs/concepts/scheduling/how-scheduling-works) - HIGH confidence
 - [Nomad BinPackIterator (rank.go)](https://github.com/hashicorp/nomad/blob/main/scheduler/rank.go) - HIGH confidence
-- [Caddy Admin API](https://caddyserver.com/docs/api) - HIGH confidence (Context7 + official docs)
-- [Docker Go SDK](https://pkg.go.dev/github.com/docker/docker/client) - HIGH confidence (Context7)
-- [Chi Router](https://github.com/go-chi/chi) - HIGH confidence (Context7)
+- [Caddy Admin API](https://caddyserver.com/docs/api) - HIGH confidence
+- [Docker Go SDK Events Package](https://pkg.go.dev/github.com/docker/docker/api/types/events) - HIGH confidence
+- [Docker go-events (Backoff/Breaker)](https://github.com/docker/go-events) - HIGH confidence
 - [PostgreSQL Advisory Locks for Leader Election](https://ramitmittal.com/blog/general/leader-election-advisory-locks) - HIGH confidence
-- [go-pglock (Postgres Advisory Lock Library)](https://github.com/allisson/go-pglock) - MEDIUM confidence
-- [Build an Orchestrator in Go (From Scratch)](https://www.manning.com/books/build-an-orchestrator-in-go-from-scratch) - HIGH confidence
-- [Tailscale Mesh Networking](https://tailscale.com/blog/how-tailscale-works) - HIGH confidence
+- [go-pglock Library](https://github.com/allisson/go-pglock) - MEDIUM confidence
+- [Build an Orchestrator in Go (Manning)](https://www.manning.com/books/build-an-orchestrator-in-go-from-scratch) - HIGH confidence
+- [Tailscale Docker Guide](https://tailscale.com/blog/docker-tailscale-guide) - HIGH confidence
 - [Docker Events Monitoring](https://docs.docker.com/reference/cli/docker/system/events/) - HIGH confidence
-- [Goose Migrations](https://github.com/pressly/goose) - HIGH confidence
-- [sqlc Type-Safe Queries](https://docs.sqlc.dev/) - HIGH confidence
-- [Idempotent Receiver Pattern (Martin Fowler)](https://martinfowler.com/articles/patterns-of-distributed-systems/idempotent-receiver.html) - HIGH confidence
-- [Fly.io replaces Nomad analysis](https://curiouslynerdy.com/fly-io-replaces-nomad-with-homegrown/) - MEDIUM confidence
+- [sqlc Type-Safe Queries](https://sqlc.dev/) - HIGH confidence
+- [qmuntal/stateless Go FSM Library](https://github.com/qmuntal/stateless) - HIGH confidence
+- [WebSocket vs SSE vs Long Polling Comparison (AlgoMaster)](https://blog.algomaster.io/p/polling-vs-long-polling-vs-sse-vs-websockets-webhooks) - MEDIUM confidence
 
 ---
 *Architecture research for: Custom Go container orchestrator (AppX Forge)*
