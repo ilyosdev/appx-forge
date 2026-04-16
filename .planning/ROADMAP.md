@@ -130,7 +130,7 @@ Plans:
 - [x] 06-01-PLAN.md -- Control plane missing API endpoints (list nodes, routes, events, logs proxy, drain, remove)
 - [x] 06-02-PLAN.md -- ForgeClient TypeScript SDK with types, client, and nock tests (TDD)
 - [ ] 06-03-PLAN.md -- forge-cli Go binary with all 13 Cobra commands
-- [ ] 06-04-PLAN.md -- Ansible playbook + runbooks + appx-api migration guide
+- [x] 06-04-PLAN.md -- Ansible playbook + runbooks + appx-api migration guide
 
 ### Phase 7: Multi-Node & Failover
 **Goal**: Sandboxes are distributed across 3+ nodes, and a node failure triggers automatic reschedule of its running sandboxes within 90s
