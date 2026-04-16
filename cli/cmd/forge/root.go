@@ -23,6 +23,9 @@ func newRootCmd() *cobra.Command {
 	// Register subcommands
 	cmd.AddCommand(newNodeCmd())
 	cmd.AddCommand(newSandboxCmd())
+	cmd.AddCommand(newRoutesCmd())
+	cmd.AddCommand(newEventsCmd())
+	cmd.AddCommand(newHealthCmd())
 
 	return cmd
 }

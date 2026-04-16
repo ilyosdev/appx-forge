@@ -27,7 +27,7 @@ func TestEventsList(t *testing.T) {
 					"event_type": "sandbox_created",
 					"prev_state": "",
 					"next_state": "pending",
-					"created_at": time.Now().Add(-2 * time.Minute).Format("2006-01-02T15:04:05Z"),
+					"created_at": time.Now().UTC().Add(-2 * time.Minute).Format("2006-01-02T15:04:05Z"),
 				},
 				{
 					"id":         2,
@@ -35,7 +35,7 @@ func TestEventsList(t *testing.T) {
 					"event_type": "sandbox_started",
 					"prev_state": "pending",
 					"next_state": "running",
-					"created_at": time.Now().Add(-1 * time.Minute).Format("2006-01-02T15:04:05Z"),
+					"created_at": time.Now().UTC().Add(-1 * time.Minute).Format("2006-01-02T15:04:05Z"),
 				},
 			},
 		})
@@ -143,14 +143,14 @@ func TestEventsWithSinceFilter(t *testing.T) {
 					"event_type": "old_event",
 					"prev_state": "",
 					"next_state": "pending",
-					"created_at": time.Now().Add(-2 * time.Hour).Format("2006-01-02T15:04:05Z"),
+					"created_at": time.Now().UTC().Add(-2 * time.Hour).Format("2006-01-02T15:04:05Z"),
 				},
 				{
 					"id":         2,
 					"event_type": "recent_event",
 					"prev_state": "pending",
 					"next_state": "running",
-					"created_at": time.Now().Add(-1 * time.Minute).Format("2006-01-02T15:04:05Z"),
+					"created_at": time.Now().UTC().Add(-1 * time.Minute).Format("2006-01-02T15:04:05Z"),
 				},
 			},
 		})
