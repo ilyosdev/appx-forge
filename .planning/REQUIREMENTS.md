@@ -83,15 +83,15 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### TypeScript SDK
 
-- [ ] **SDK-01**: ForgeClient class with baseUrl + apiKey config
-- [ ] **SDK-02**: `sandboxes.create()` -- create sandbox, return Sandbox object with URL
-- [ ] **SDK-03**: `sandboxes.get()` -- get sandbox by ID or app:name
-- [ ] **SDK-04**: `sandboxes.list()` -- filter by user, state, app_name
-- [ ] **SDK-05**: `sandboxes.destroy()` -- destroy sandbox
-- [ ] **SDK-06**: `sandboxes.restart()` -- force restart
-- [ ] **SDK-07**: `sandboxes.pushFiles()` -- push files (follows 307 redirect to agent)
-- [ ] **SDK-08**: `sandboxes.logs()` -- get logs
-- [ ] **SDK-09**: Types generated from OpenAPI spec via openapi-typescript-codegen
+- [x] **SDK-01**: ForgeClient class with baseUrl + apiKey config
+- [x] **SDK-02**: `sandboxes.create()` -- create sandbox, return Sandbox object with URL
+- [x] **SDK-03**: `sandboxes.get()` -- get sandbox by ID or app:name
+- [x] **SDK-04**: `sandboxes.list()` -- filter by user, state, app_name
+- [x] **SDK-05**: `sandboxes.destroy()` -- destroy sandbox
+- [x] **SDK-06**: `sandboxes.restart()` -- force restart
+- [x] **SDK-07**: `sandboxes.pushFiles()` -- push files (follows 307 redirect to agent)
+- [x] **SDK-08**: `sandboxes.logs()` -- get logs
+- [x] **SDK-09**: Types generated from OpenAPI spec via openapi-typescript-codegen
 
 ### Sandbox Image
 
@@ -120,10 +120,10 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### appx-api Integration
 
-- [ ] **INT-01**: appx-api imports forge-sdk-ts, replaces RailoverService calls with ForgeClient
-- [ ] **INT-02**: Delete RailoverService, ContainerReconcilerService, ContainerCircuitBreakerService from backend
-- [ ] **INT-03**: Update container-state.types.ts to align with Forge sandbox states
-- [ ] **INT-04**: Integration tests: appx-api creates sandbox via SDK, pushes files, verifies URL works
+- [x] **INT-01**: appx-api imports forge-sdk-ts, replaces RailoverService calls with ForgeClient
+- [x] **INT-02**: Delete RailoverService, ContainerReconcilerService, ContainerCircuitBreakerService from backend
+- [x] **INT-03**: Update container-state.types.ts to align with Forge sandbox states
+- [x] **INT-04**: Integration tests: appx-api creates sandbox via SDK, pushes files, verifies URL works
 
 ### Multi-Node
 
@@ -233,15 +233,15 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLI-11 | Phase 6 | Complete |
 | CLI-12 | Phase 6 | Complete |
 | CLI-13 | Phase 6 | Complete |
-| SDK-01 | Phase 6 | Pending |
-| SDK-02 | Phase 6 | Pending |
-| SDK-03 | Phase 6 | Pending |
-| SDK-04 | Phase 6 | Pending |
-| SDK-05 | Phase 6 | Pending |
-| SDK-06 | Phase 6 | Pending |
-| SDK-07 | Phase 6 | Pending |
-| SDK-08 | Phase 6 | Pending |
-| SDK-09 | Phase 6 | Pending |
+| SDK-01 | Phase 6 | Complete |
+| SDK-02 | Phase 6 | Complete |
+| SDK-03 | Phase 6 | Complete |
+| SDK-04 | Phase 6 | Complete |
+| SDK-05 | Phase 6 | Complete |
+| SDK-06 | Phase 6 | Complete |
+| SDK-07 | Phase 6 | Complete |
+| SDK-08 | Phase 6 | Complete |
+| SDK-09 | Phase 6 | Complete |
 | SEC-01 | Phase 5 | Complete |
 | SEC-02 | Phase 5 | Complete |
 | SEC-03 | Phase 5 | Complete |
@@ -253,10 +253,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | OPS-03 | Phase 6 | Pending |
 | OPS-04 | Phase 6 | Pending |
 | OPS-05 | Phase 6 | Pending |
-| INT-01 | Phase 6 | Pending |
-| INT-02 | Phase 6 | Pending |
-| INT-03 | Phase 6 | Pending |
-| INT-04 | Phase 6 | Pending |
+| INT-01 | Phase 6 | Complete |
+| INT-02 | Phase 6 | Complete |
+| INT-03 | Phase 6 | Complete |
+| INT-04 | Phase 6 | Complete |
 | MULTI-01 | Phase 7 | Pending |
 | MULTI-02 | Phase 7 | Pending |
 | MULTI-03 | Phase 7 | Pending |

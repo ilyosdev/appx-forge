@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06-01-PLAN.md
-last_updated: "2026-04-16T00:56:07.890Z"
+stopped_at: Completed 06-02-PLAN.md
+last_updated: "2026-04-16T01:05:56.145Z"
 last_activity: 2026-04-16
 progress:
   total_phases: 7
   completed_phases: 5
   total_plans: 27
-  completed_plans: 24
-  percent: 89
+  completed_plans: 25
+  percent: 93
 ---
 
 # Project State
@@ -26,7 +26,7 @@ See: .planning/PROJECT.md (updated 2026-04-15)
 ## Current Position
 
 Phase: 06 (CLI, SDK & appx-api Integration) — EXECUTING
-Plan: 2 of 4
+Plan: 3 of 4
 Status: Ready to execute
 Last activity: 2026-04-16
 
@@ -76,6 +76,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 05 P02 | 497 | 2 tasks | 4 files |
 | Phase 05 P03 | 426 | 2 tasks | 10 files |
 | Phase 06 P01 | 843 | 2 tasks | 16 files |
+| Phase 06 P02 | 411 | 2 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -154,6 +155,8 @@ Recent decisions affecting current work:
 - [Phase 06]: LogProxyStore reuses filePushAdapter -- same GetSandbox+GetNode signatures
 - [Phase 06]: 60s HTTP client timeout on log proxy prevents indefinite holds (T-06-02)
 - [Phase 06]: EventStore separate interface from AgentStore for read/write separation
+- [Phase 06]: Native fetch over axios for SDK -- zero HTTP deps, Node 18+ built-in
+- [Phase 06]: Hand-written types over codegen -- 6 types don't justify openapi-typescript-codegen
 
 ### Pending Todos
 
@@ -175,6 +178,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-16T00:56:07.887Z
-Stopped at: Completed 06-01-PLAN.md
+Last session: 2026-04-16T01:05:56.142Z
+Stopped at: Completed 06-02-PLAN.md
 Resume file: None
