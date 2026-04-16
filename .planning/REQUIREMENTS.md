@@ -74,8 +74,8 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [x] **CLI-05**: `forge sandbox list` -- filter by app, node, state
 - [x] **CLI-06**: `forge sandbox inspect` -- full sandbox details
 - [x] **CLI-07**: `forge sandbox logs` -- with --follow and --tail
-- [ ] **CLI-08**: `forge sandbox restart` -- force restart
-- [ ] **CLI-09**: `forge sandbox destroy` -- destroy sandbox
+- [x] **CLI-08**: `forge sandbox restart` -- force restart
+- [x] **CLI-09**: `forge sandbox destroy` -- destroy sandbox
 - [x] **CLI-10**: `forge routes list` -- show active routes
 - [x] **CLI-11**: `forge routes verify` -- diff Caddy vs Postgres
 - [x] **CLI-12**: `forge events` -- filter by sandbox, since
@@ -227,8 +227,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CLI-05 | Phase 6 | Complete |
 | CLI-06 | Phase 6 | Complete |
 | CLI-07 | Phase 6 | Complete |
-| CLI-08 | Phase 6 | Pending |
-| CLI-09 | Phase 6 | Pending |
+| CLI-08 | Phase 6 | Complete |
+| CLI-09 | Phase 6 | Complete |
 | CLI-10 | Phase 6 | Complete |
 | CLI-11 | Phase 6 | Complete |
 | CLI-12 | Phase 6 | Complete |
