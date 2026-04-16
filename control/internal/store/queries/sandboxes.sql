@@ -57,3 +57,6 @@ WHERE id = $1;
 SELECT state, COUNT(*)::int AS count
 FROM sandboxes
 GROUP BY state;
+
+-- name: ListRunningSandboxesByNode :many
+SELECT * FROM sandboxes WHERE node_id = $1 AND state = 'running' ORDER BY created_at ASC;

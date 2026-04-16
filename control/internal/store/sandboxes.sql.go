@@ -272,6 +272,48 @@ func (q *Queries) ListIdleSandboxes(ctx context.Context) ([]Sandbox, error) {
 	return items, nil
 }
 
+const listRunningSandboxesByNode = `-- name: ListRunningSandboxesByNode :many
+SELECT id, app_name, user_id, node_id, container_id, host_port, image, state, state_version, resources, env, idle_timeout_seconds, created_at, updated_at, last_active_at, failure_count, metadata FROM sandboxes WHERE node_id = $1 AND state = 'running' ORDER BY created_at ASC
+`
+
+func (q *Queries) ListRunningSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listRunningSandboxesByNode, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sandbox{}
+	for rows.Next() {
+		var i Sandbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.AppName,
+			&i.UserID,
+			&i.NodeID,
+			&i.ContainerID,
+			&i.HostPort,
+			&i.Image,
+			&i.State,
+			&i.StateVersion,
+			&i.Resources,
+			&i.Env,
+			&i.IdleTimeoutSeconds,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastActiveAt,
+			&i.FailureCount,
+			&i.Metadata,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSandboxes = `-- name: ListSandboxes :many
 SELECT id, app_name, user_id, node_id, container_id, host_port, image, state, state_version, resources, env, idle_timeout_seconds, created_at, updated_at, last_active_at, failure_count, metadata FROM sandboxes ORDER BY created_at DESC LIMIT $1
 `
