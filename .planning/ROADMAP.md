@@ -144,7 +144,7 @@ Plans:
 
 Plans:
 - [x] 07-01-PLAN.md -- TDD Rescheduler: sqlc query + reschedule logic with 7 test scenarios
-- [ ] 07-02-PLAN.md -- Wire rescheduler into heartbeat monitor + multi-node scheduler distribution tests
+- [x] 07-02-PLAN.md -- Wire rescheduler into heartbeat monitor + multi-node scheduler distribution tests
 
 ## Progress
 
