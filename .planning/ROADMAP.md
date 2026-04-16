@@ -140,6 +140,11 @@ Plans:
   1. Scheduler distributes sandboxes across 3+ nodes based on available RAM (no single node gets all sandboxes)
   2. When a node stops sending heartbeats, it is marked unhealthy within 45s and its RUNNING sandboxes begin rescheduling
   3. Rescheduled sandboxes are running on healthy nodes within 90s of the original node failure
+**Plans:** 2 plans
+
+Plans:
+- [ ] 07-01-PLAN.md -- TDD Rescheduler: sqlc query + reschedule logic with 7 test scenarios
+- [ ] 07-02-PLAN.md -- Wire rescheduler into heartbeat monitor + multi-node scheduler distribution tests
 
 ## Progress
 
@@ -154,4 +159,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7
 | 4. Proxy, Routing & File Push | 0/3 | Planning complete | - |
 | 5. Reliability & Security | 0/3 | Planning complete | - |
 | 6. CLI, SDK & appx-api Integration | 1/4 | In Progress|  |
-| 7. Multi-Node & Failover | 0/0 | Not started | - |
+| 7. Multi-Node & Failover | 0/2 | Planning complete | - |
