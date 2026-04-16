@@ -21,7 +21,8 @@ type Client struct {
 	baseURL    string
 	httpClient *http.Client
 	nodeID     string
-	token      string
+	token      string // per-node token from registration (stored but API uses apiToken)
+	apiToken   string // shared API token for authenticated requests
 	regReq     RegisterRequest
 	logger     *slog.Logger
 	mu         sync.RWMutex
@@ -29,13 +30,28 @@ type Client struct {
 
 // NewClient creates a new control plane client.
 // The regReq is saved for re-registration on 401/404.
-func NewClient(baseURL string, regReq RegisterRequest, logger *slog.Logger) *Client {
-	return &Client{
+// If apiToken is non-empty, it is used as the Bearer token for all authenticated
+// requests. Otherwise, the per-node token returned by Register() is used.
+func NewClient(baseURL string, regReq RegisterRequest, logger *slog.Logger, apiToken ...string) *Client {
+	c := &Client{
 		baseURL:    baseURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		regReq:     regReq,
 		logger:     logger,
 	}
+	if len(apiToken) > 0 {
+		c.apiToken = apiToken[0]
+	}
+	return c
+}
+
+// authToken returns the token to use for authenticated requests.
+// Prefers the shared apiToken if set, falls back to the per-node token.
+func (c *Client) authToken() string {
+	if c.apiToken != "" {
+		return c.apiToken
+	}
+	return c.token
 }
 
 // Register sends POST /v1/nodes/register and stores the returned nodeID + token.
@@ -185,7 +201,7 @@ func (c *Client) PollCommands(ctx context.Context, waitSeconds int) ([]Command, 
 	}
 
 	c.mu.RLock()
-	token := c.token
+	token := c.authToken()
 	c.mu.RUnlock()
 	req.Header.Set("Authorization", "Bearer "+token)
 
@@ -203,7 +219,7 @@ func (c *Client) PollCommands(ctx context.Context, waitSeconds int) ([]Command, 
 		// Retry poll with new credentials
 		c.mu.RLock()
 		newNodeID := c.nodeID
-		newToken := c.token
+		newToken := c.authToken()
 		c.mu.RUnlock()
 
 		retryPath := fmt.Sprintf("/v1/agents/%s/commands?wait=%d", newNodeID, waitSeconds)
@@ -348,7 +364,7 @@ func (c *Client) doAuthRequest(ctx context.Context, method, path string, body []
 	}
 
 	c.mu.RLock()
-	token := c.token
+	token := c.authToken()
 	c.mu.RUnlock()
 
 	req.Header.Set("Authorization", "Bearer "+token)

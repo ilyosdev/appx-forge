@@ -21,6 +21,7 @@ func requiredEnv() map[string]string {
 		"FORGE_CONTROL_URL": "http://control.example.com",
 		"FORGE_HOSTNAME":    "node-1",
 		"FORGE_HMAC_SECRET": "test-secret-key",
+		"FORGE_CAPACITY_MB": "8000",
 	}
 }
 

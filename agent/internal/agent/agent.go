@@ -55,11 +55,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 		Hostname:        cfg.Hostname,
 		TailscaleIP:     cfg.TailscaleIP,
 		AgentListenPort: cfg.AgentPort,
-		CapacityMB:      0, // Will be populated during registration from system info
-		CapacityCPU:     0,
+		CapacityMB:      cfg.CapacityMB,
+		CapacityCPU:     cfg.CapacityCPU,
 		AgentVersion:    cfg.AgentVersion,
 	}
-	ctrlClient := controlclient.NewClient(cfg.ControlURL, regReq, logger)
+	ctrlClient := controlclient.NewClient(cfg.ControlURL, regReq, logger, cfg.APIToken)
 
 	// 4. Command executor
 	executor := NewCommandExecutor(dockerClient, portAlloc, ctrlClient, cfg.SandboxDir, logger)

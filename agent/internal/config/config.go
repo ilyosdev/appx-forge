@@ -38,6 +38,16 @@ type Config struct {
 
 	// SandboxImage is the default Docker image to pre-pull for sandboxes.
 	SandboxImage string `envconfig:"FORGE_SANDBOX_IMAGE" default:"appx/sandbox:v1"`
+
+	// CapacityMB is the total memory (in MB) this node exposes to the scheduler.
+	CapacityMB int `envconfig:"FORGE_CAPACITY_MB" required:"true"`
+
+	// CapacityCPU is the total CPU cores this node exposes to the scheduler.
+	CapacityCPU float64 `envconfig:"FORGE_CAPACITY_CPU" default:"1.0"`
+
+	// APIToken is the shared bearer token for authenticated requests to the control plane.
+	// SECURITY: Never log this value.
+	APIToken string `envconfig:"FORGE_API_TOKEN" required:"true"`
 }
 
 // Load reads configuration from environment variables.
