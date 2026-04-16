@@ -120,6 +120,7 @@ func main() {
 	srv.SetMetricsStore(adapter)
 	srv.SetRouteFetcher(caddyClient)
 	srv.SetEventStore(&eventStoreAdapter{q: queries})
+	srv.SetLogProxyStore(&filePushAdapter{q: queries}, nil)
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,

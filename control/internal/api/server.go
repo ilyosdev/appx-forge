@@ -44,6 +44,7 @@ type Server struct {
 	metricsStore             MetricsStore
 	routeFetcher             RouteListFetcher
 	eventStore               EventStore
+	logProxyStore            LogProxyStore
 	logHTTPClient            httpDoer
 	heartbeatIntervalSeconds int
 }
@@ -102,6 +103,17 @@ func (s *Server) SetRouteFetcher(rf RouteListFetcher) {
 // SetEventStore injects the event store dependency after construction.
 func (s *Server) SetEventStore(es EventStore) {
 	s.eventStore = es
+}
+
+// SetLogProxyStore injects the log proxy store dependency after construction.
+// httpClient defaults to http.DefaultClient with a 60-second timeout if nil (T-06-02).
+func (s *Server) SetLogProxyStore(lps LogProxyStore, httpClient httpDoer) {
+	s.logProxyStore = lps
+	if httpClient != nil {
+		s.logHTTPClient = httpClient
+	} else {
+		s.logHTTPClient = &http.Client{Timeout: 60 * time.Second}
+	}
 }
 
 // httpDoer abstracts HTTP client for testability (used by log proxy).
