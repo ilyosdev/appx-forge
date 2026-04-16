@@ -1,6 +1,6 @@
 import nock from 'nock';
 import { ForgeClient } from '../src/client';
-import { ForgeNotFoundError, ForgeConflictError, ForgeServiceError } from '../src/errors';
+import { ForgeError, ForgeNotFoundError, ForgeConflictError, ForgeServiceError } from '../src/errors';
 import type { Sandbox, Node, Route } from '../src/types';
 
 const BASE_URL = 'http://forge.test:8080';
@@ -327,7 +327,7 @@ describe('Authorization header', () => {
 // ── Error Handling ─────────────────────────────────────────────
 
 describe('Error handling', () => {
-  it('throws ForgeNotFoundError on 404', async () => {
+  it('throws ForgeNotFoundError on 404 with problem details', async () => {
     const problem = {
       type: 'urn:forge:error:not-found',
       title: 'Sandbox not found',
@@ -341,19 +341,16 @@ describe('Error handling', () => {
 
     const client = new ForgeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
 
-    await expect(client.sandboxes.get('missing-id')).rejects.toThrow(ForgeNotFoundError);
-    await expect(
-      (async () => {
-        try {
-          await new ForgeClient({ baseUrl: BASE_URL, apiKey: API_KEY }).sandboxes.get('missing-id');
-        } catch (e) {
-          // Re-mock for second call
-          expect((e as ForgeNotFoundError).problem.status).toBe(404);
-          expect((e as ForgeNotFoundError).problem.detail).toBe('No sandbox with id missing-id');
-          throw e;
-        }
-      })(),
-    ).rejects.toThrow(ForgeNotFoundError);
+    try {
+      await client.sandboxes.get('missing-id');
+      fail('Expected ForgeNotFoundError to be thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(ForgeNotFoundError);
+      const err = e as ForgeNotFoundError;
+      expect(err.problem.status).toBe(404);
+      expect(err.problem.detail).toBe('No sandbox with id missing-id');
+      expect(err.problem.title).toBe('Sandbox not found');
+    }
   });
 
   it('throws ForgeConflictError on 409', async () => {
@@ -413,7 +410,6 @@ describe('Error handling', () => {
       .reply(400, problem, { 'Content-Type': 'application/problem+json' });
 
     const client = new ForgeClient({ baseUrl: BASE_URL, apiKey: API_KEY });
-    const { ForgeError } = await import('../src/errors');
 
     await expect(
       client.sandboxes.create({
