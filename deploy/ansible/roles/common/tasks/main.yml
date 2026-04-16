@@ -1,0 +1,47 @@
+---
+# Role: common
+# Installs base packages, tunes kernel for Metro inotify needs,
+# and sets up the /etc/forge/ directory structure.
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install required packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ca-certificates
+      - gnupg
+      - jq
+      - lsb-release
+      - apt-transport-https
+    state: present
+
+- name: Set kernel params for inotify (Metro file watchers)
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-forge-inotify.conf
+    reload: true
+    state: present
+  loop:
+    - { key: "fs.inotify.max_user_watches", value: "524288" }
+    - { key: "fs.inotify.max_user_instances", value: "8192" }
+
+- name: Create /etc/forge directory
+  ansible.builtin.file:
+    path: /etc/forge
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Copy seccomp profile to /etc/forge/
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../seccomp-default.json"
+    dest: /etc/forge/seccomp-default.json
+    owner: root
+    group: root
+    mode: "0644"

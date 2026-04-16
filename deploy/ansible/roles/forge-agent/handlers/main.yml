@@ -1,0 +1,6 @@
+---
+- name: Restart forge-agent
+  ansible.builtin.systemd:
+    name: forge-agent
+    state: restarted
+    daemon_reload: true

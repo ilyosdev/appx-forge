@@ -1,0 +1,90 @@
+---
+# Role: docker
+# Installs Docker Engine 27.x (pinned), enables the service,
+# and pre-pulls the sandbox image.
+#
+# Why pin 27.x:
+#   - Docker 28.x has Go SDK import path breakage (moby/moby#49712)
+#   - Docker 29.x has the Swarm 60s restart bug
+#   - Docker 27.5.x is stable and tested with forge-agent
+
+- name: Create Docker keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Add Docker GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+    force: false
+
+- name: Add Docker apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu
+      {{ ansible_distribution_release }} stable
+    filename: docker
+    state: present
+
+- name: Install Docker Engine {{ docker_version }}
+  ansible.builtin.apt:
+    name:
+      - "docker-ce=5:{{ docker_version }}*"
+      - "docker-ce-cli=5:{{ docker_version }}*"
+      - containerd.io
+    state: present
+    update_cache: true
+
+- name: Pin Docker version (prevent accidental upgrades)
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - docker-ce
+    - docker-ce-cli
+
+- name: Enable and start Docker service
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Verify Docker Engine version
+  ansible.builtin.command:
+    cmd: docker version --format '{{ "{{" }}.Server.Version{{ "}}" }}'
+  register: docker_version_check
+  changed_when: false
+  failed_when: not docker_version_check.stdout.startswith("27.")
+
+- name: Show Docker version
+  ansible.builtin.debug:
+    msg: "Docker Engine version: {{ docker_version_check.stdout }}"
+
+- name: Verify Docker is NOT in Swarm mode
+  ansible.builtin.command:
+    cmd: docker info --format '{{ "{{" }}.Swarm.LocalNodeState{{ "}}" }}'
+  register: swarm_status
+  changed_when: false
+
+- name: Warn if Swarm is active
+  ansible.builtin.debug:
+    msg: "WARNING: Docker Swarm is active. Forge does not use Swarm. Consider: docker swarm leave --force"
+  when: swarm_status.stdout == "active"
+
+- name: Pre-pull sandbox image
+  ansible.builtin.command:
+    cmd: "docker pull {{ forge_sandbox_image }}"
+  register: pull_result
+  changed_when: "'Downloaded newer image' in pull_result.stdout or 'Pull complete' in pull_result.stdout"
+  # Allow failure -- image may not be published yet during initial setup
+  failed_when: false
+
+- name: Report image pull status
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'Sandbox image pulled: ' + forge_sandbox_image if pull_result.rc == 0
+      else 'WARNING: Could not pull ' + forge_sandbox_image + ' -- will retry on agent start' }}

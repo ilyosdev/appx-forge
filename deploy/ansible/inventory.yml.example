@@ -1,0 +1,50 @@
+# Forge Node Inventory
+#
+# Copy to inventory.yml and fill in real values.
+# SECURITY: inventory.yml with real IPs/keys MUST be in .gitignore or encrypted
+# with Ansible Vault. Never commit secrets to version control (T-06-11).
+#
+# Usage:
+#   cp inventory.yml.example inventory.yml
+#   # Edit inventory.yml with real values
+#   ansible-playbook -i inventory.yml playbook.yml
+
+all:
+  vars:
+    # Control plane URL (Tailscale internal address)
+    forge_control_url: "https://forge.internal.myappx.live"
+
+    # Docker image for sandbox containers
+    forge_sandbox_image: "appx/sandbox:v1"
+
+    # Tailscale auth key (generate at https://login.tailscale.com/admin/settings/keys)
+    # Use a reusable, ephemeral key for automated provisioning
+    tailscale_auth_key: "tskey-auth-XXXXX"
+
+    # Docker Engine version -- pinned to 27.x (28+ has Go SDK breakage, 29 has Swarm bug)
+    docker_version: "27.5.1"
+
+    # Agent listen port for file push (default 8090)
+    forge_agent_listen_port: 8090
+
+    # Base directory for sandbox code on each node
+    forge_code_dir: "/var/lib/forge/sandboxes"
+
+    # Path to forge-agent binary (local path or URL)
+    # Option A: local file (must exist on Ansible controller)
+    forge_agent_binary_path: "./binaries/forge-agent"
+    # Option B: download URL (uncomment to use instead)
+    # forge_agent_binary_url: "https://releases.myappx.live/forge-agent/latest/forge-agent-linux-amd64"
+
+  hosts:
+    node1:
+      ansible_host: 1.2.3.4
+      ansible_user: root
+      # Node-specific capacity (MB of RAM available for sandboxes)
+      forge_capacity_mb: 20000
+
+    # Add more nodes as needed:
+    # node2:
+    #   ansible_host: 5.6.7.8
+    #   ansible_user: root
+    #   forge_capacity_mb: 20000
