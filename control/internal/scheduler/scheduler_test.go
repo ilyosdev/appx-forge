@@ -166,3 +166,104 @@ func TestSchedule_DeterministicTiebreak(t *testing.T) {
 		t.Errorf("want first node on tiebreak, got %v", got)
 	}
 }
+
+func TestSchedule_DistributesAcrossMultipleNodes(t *testing.T) {
+	// Simulate scheduling 3 sandboxes (512MB each) across 3 nodes with different initial load.
+	// After each schedule, update UsedMB to reflect placement.
+	// Expected: scheduler picks most-free node each time, distributing across nodes.
+	node1 := uuid.New()
+	node2 := uuid.New()
+	node3 := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: node1, CapacityMB: 8000, UsedMB: 2000, Status: "healthy"}, // 6000 free
+		{ID: node2, CapacityMB: 8000, UsedMB: 2500, Status: "healthy"}, // 5500 free
+		{ID: node3, CapacityMB: 8000, UsedMB: 3000, Status: "healthy"}, // 5000 free
+	}
+
+	// First schedule: picks node1 (most free: 6000)
+	got1, err := Schedule(candidates, 512)
+	if err != nil {
+		t.Fatalf("schedule 1: %v", err)
+	}
+	if got1 != node1 {
+		t.Errorf("schedule 1: want node1 (6000 free), got %v", got1)
+	}
+
+	// Update candidates to reflect placement on node1
+	candidates[0].UsedMB = 2512 // 5488 free now
+
+	// Second schedule: picks node2 (5500 free > 5488 > 5000)
+	got2, err := Schedule(candidates, 512)
+	if err != nil {
+		t.Fatalf("schedule 2: %v", err)
+	}
+	if got2 != node2 {
+		t.Errorf("schedule 2: want node2 (5500 free), got %v", got2)
+	}
+
+	// Update candidates to reflect placement on node2
+	candidates[1].UsedMB = 3012 // 4988 free now
+
+	// Third schedule: picks node1 (5488 free > 5000 > 4988)
+	got3, err := Schedule(candidates, 512)
+	if err != nil {
+		t.Fatalf("schedule 3: %v", err)
+	}
+	if got3 != node1 {
+		t.Errorf("schedule 3: want node1 (5488 free), got %v", got3)
+	}
+
+	// Verify distribution: at least 2 different nodes used
+	used := make(map[uuid.UUID]int)
+	used[got1]++
+	used[got2]++
+	used[got3]++
+
+	if len(used) < 2 {
+		t.Errorf("expected sandboxes on at least 2 different nodes, got all on same node")
+	}
+}
+
+func TestSchedule_NeverOverloadsOneNode(t *testing.T) {
+	// 3 nodes with equal capacity. Schedule 5 sandboxes (256MB each).
+	// Most-free-RAM bin-packing naturally distributes when nodes start equal:
+	// each placement shifts the ranking so the next sandbox goes elsewhere.
+	node1 := uuid.New()
+	node2 := uuid.New()
+	node3 := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: node1, CapacityMB: 8000, UsedMB: 2000, Status: "healthy"}, // 6000 free
+		{ID: node2, CapacityMB: 8000, UsedMB: 2100, Status: "healthy"}, // 5900 free
+		{ID: node3, CapacityMB: 8000, UsedMB: 2200, Status: "healthy"}, // 5800 free
+	}
+
+	placements := make(map[uuid.UUID]int)
+	for i := 0; i < 5; i++ {
+		got, err := Schedule(candidates, 256)
+		if err != nil {
+			t.Fatalf("schedule %d: %v", i, err)
+		}
+		placements[got]++
+
+		// Update used MB on the selected node
+		for j := range candidates {
+			if candidates[j].ID == got {
+				candidates[j].UsedMB += 256
+			}
+		}
+	}
+
+	// At least 2 different nodes must be used
+	if len(placements) < 2 {
+		t.Errorf("expected load spread across nodes, got all on one: %v", placements)
+	}
+
+	// No single node should get all 5 sandboxes
+	for id, count := range placements {
+		if count == 5 {
+			t.Errorf("node %v received all 5 sandboxes -- scheduler should distribute", id)
+		}
+	}
+}
