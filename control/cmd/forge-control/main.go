@@ -100,6 +100,11 @@ func main() {
 	lc.SetRouteNotifier(routeManager)
 	logger.Info("route manager wired", "caddy_admin_url", cfg.CaddyAdminURL)
 
+	// Restart manager (auto-restart with exponential backoff)
+	restartMgr := lifecycle.NewRestartManager(adapter, logger)
+	lc.SetRestartManager(restartMgr)
+	logger.Info("restart manager wired")
+
 	// ── HTTP Server ────────────────────────────────────────────────────
 	srv := api.NewServer(
 		api.NewServerConfig(cfg.APIToken, cfg.HMACSecret),
@@ -112,6 +117,7 @@ func main() {
 	)
 	srv.SetAgentDeps(adapter, lc)
 	srv.SetFilePushStore(&filePushAdapter{q: queries})
+	srv.SetMetricsStore(adapter)
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -123,6 +129,19 @@ func main() {
 
 	// ── Background heartbeat monitor ───────────────────────────────────
 	go monitorHeartbeats(ctx, queries, cfg, logger)
+
+	// ── Idle reaper (background goroutine) ─────────────────────────────
+	idleReaper := lifecycle.NewIdleReaper(adapter, routeManager, logger,
+		time.Duration(cfg.IdleReaperIntervalSeconds)*time.Second)
+	go idleReaper.Run(ctx)
+	logger.Info("idle reaper started", "interval_seconds", cfg.IdleReaperIntervalSeconds)
+
+	// ── Drift detector (background goroutine) ──────────────────────────
+	driftStore := &driftStoreAdapter{q: queries}
+	driftDetector := routing.NewDriftDetector(caddyClient, driftStore, logger,
+		time.Duration(cfg.DriftDetectorIntervalSeconds)*time.Second)
+	go driftDetector.Run(ctx)
+	logger.Info("drift detector started", "interval_seconds", cfg.DriftDetectorIntervalSeconds)
 
 	// ── Start HTTP server ──────────────────────────────────────────────
 	errCh := make(chan error, 1)
@@ -152,7 +171,8 @@ func main() {
 		logger.Error("http server shutdown error", "error", err)
 	}
 
-	// Cancel context stops heartbeat monitor goroutine
+	// Cancel context stops background goroutines (heartbeat monitor,
+	// idle reaper, drift detector)
 	cancel()
 	logger.Info("forge-control shutdown complete")
 }
@@ -275,8 +295,10 @@ func float64ToNumeric(f float64) pgtype.Numeric {
 //   - api.NodeStore
 //   - api.SandboxReader
 //   - api.AgentStore
-//   - api.FilePushStore
+//   - api.MetricsStore
 //   - lifecycle.Store
+//   - lifecycle.RestartStore
+//   - lifecycle.IdleReaperStore
 type storeAdapter struct {
 	q *store.Queries
 }
@@ -438,5 +460,49 @@ func (a *storeAdapter) RecordEvent(ctx context.Context, arg store.RecordEventPar
 }
 
 func (a *storeAdapter) GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	return a.q.GetNode(ctx, id)
+}
+
+// ── lifecycle.RestartStore interface ──────────────────────────────────
+
+func (a *storeAdapter) IncrementSandboxFailureCount(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+	return a.q.IncrementSandboxFailureCount(ctx, id)
+}
+
+func (a *storeAdapter) ResetSandboxFailureCount(ctx context.Context, id pgtype.UUID) error {
+	return a.q.ResetSandboxFailureCount(ctx, id)
+}
+
+// ── lifecycle.IdleReaperStore interface ───────────────────────────────
+
+func (a *storeAdapter) ListIdleSandboxes(ctx context.Context) ([]store.Sandbox, error) {
+	return a.q.ListIdleSandboxes(ctx)
+}
+
+// ── api.MetricsStore interface ───────────────────────────────────────
+
+func (a *storeAdapter) CountSandboxesByState(ctx context.Context) ([]store.CountSandboxesByStateRow, error) {
+	return a.q.CountSandboxesByState(ctx)
+}
+
+func (a *storeAdapter) ListNodes(ctx context.Context) ([]store.Node, error) {
+	return a.q.ListNodes(ctx)
+}
+
+// ── driftStoreAdapter ────────────────────────────────────────────────
+
+// driftStoreAdapter is a separate adapter for routing.DriftStore because its
+// GetNode returns store.Node while the main storeAdapter.GetNode returns
+// api.NodeRecord. Go does not allow two methods with the same name and
+// different return types on one struct.
+type driftStoreAdapter struct {
+	q *store.Queries
+}
+
+func (a *driftStoreAdapter) ListSandboxesByState(ctx context.Context, state string) ([]store.Sandbox, error) {
+	return a.q.ListSandboxesByState(ctx, state)
+}
+
+func (a *driftStoreAdapter) GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error) {
 	return a.q.GetNode(ctx, id)
 }

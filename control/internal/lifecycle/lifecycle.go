@@ -96,6 +96,7 @@ type LifecycleService struct {
 	store         Store
 	logger        *slog.Logger
 	routeNotifier RouteNotifier
+	restartMgr    *RestartManager
 }
 
 // New creates a new LifecycleService.
@@ -110,6 +111,13 @@ func New(s Store, logger *slog.Logger) *LifecycleService {
 // This avoids widening the New() signature for optional dependencies.
 func (ls *LifecycleService) SetRouteNotifier(rn RouteNotifier) {
 	ls.routeNotifier = rn
+}
+
+// SetRestartManager injects the restart manager after construction.
+// When set, HandleEvent delegates container_exited events in restarting state
+// to the restart manager for exponential backoff recovery.
+func (ls *LifecycleService) SetRestartManager(rm *RestartManager) {
+	ls.restartMgr = rm
 }
 
 // ── CreateSandbox ────────────────────────────────────────────────────
@@ -323,6 +331,16 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 				ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
 			}
 		}
+
+		// Reset restart failure count on successful start (handles restart recovery).
+		if ls.restartMgr != nil && nextState == models.StateRunning && sandbox.FailureCount > 0 {
+			if err := ls.restartMgr.HandleRestarted(ctx, pgSandboxID); err != nil {
+				ls.logger.Warn("restart manager HandleRestarted failed",
+					"error", err,
+					"sandbox_id", sandboxID,
+				)
+			}
+		}
 	}
 
 	// Ack the command
@@ -413,6 +431,23 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 		switch nextState {
 		case models.StateRestarting, models.StateStopped, models.StateFailed:
 			ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+		}
+	}
+
+	// Delegate to restart manager when transitioning to restarting state.
+	// The restart manager handles failure counting and exponential backoff.
+	if ls.restartMgr != nil && nextState == models.StateRestarting {
+		result, err := ls.restartMgr.HandleCrash(ctx, sandbox)
+		if err != nil {
+			ls.logger.Warn("restart manager HandleCrash failed",
+				"error", err,
+				"sandbox_id", sandboxID,
+			)
+		} else if result.ShouldRestart {
+			ls.logger.Info("restart scheduled",
+				"sandbox_id", sandboxID,
+				"delay", result.Delay,
+			)
 		}
 	}
 
