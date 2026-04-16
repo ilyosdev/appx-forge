@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 04-03-PLAN.md
-last_updated: "2026-04-15T23:42:46.258Z"
+status: executing
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-04-16T00:00:07.851Z"
 last_activity: 2026-04-15
 progress:
   total_phases: 7
   completed_phases: 4
-  total_plans: 20
-  completed_plans: 20
-  percent: 100
+  total_plans: 23
+  completed_plans: 21
+  percent: 91
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
-**Current focus:** Phase 04 — Proxy, Routing & File Push
+**Current focus:** Phase 05 — Reliability & Security
 
 ## Current Position
 
-Phase: 04 (Proxy, Routing & File Push) — EXECUTING
-Plan: 3 of 3
-Status: Phase complete — ready for verification
+Phase: 05 (Reliability & Security) — EXECUTING
+Plan: 2 of 3
+Status: Ready to execute
 Last activity: 2026-04-15
 
 Progress: [░░░░░░░░░░] 0%
@@ -72,6 +72,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 04 P01 | 256s | 2 tasks | 4 files |
 | Phase 04 P02 | 627s | 2 tasks | 9 files |
 | Phase 04 P03 | 257 | 2 tasks | 5 files |
+| Phase 05 P01 | 239 | 1 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -138,6 +139,8 @@ Recent decisions affecting current work:
 - [Phase 04]: caddy-dev.json admin listens on 0.0.0.0:2019 (not localhost) so Docker port mapping works
 - [Phase 04]: Dev Caddy uses HTTP-only on port 8443 -- no TLS certs needed locally
 - [Phase 04]: FORGE_CADDY_ADMIN_URL uses Docker service name http://caddy:2019 for container networking
+- [Phase 05]: Backoff uses baseDelay * 2^(count-1) after atomic increment: 5s/10s/20s for attempts 1-3
+- [Phase 05]: Restart dispatches start_sandbox (not restart_sandbox) with delay in payload for agent-side enforcement
 
 ### Pending Todos
 
@@ -159,6 +162,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-15T23:42:46.255Z
-Stopped at: Completed 04-03-PLAN.md
+Last session: 2026-04-16T00:00:07.848Z
+Stopped at: Completed 05-01-PLAN.md
 Resume file: None

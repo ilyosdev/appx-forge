@@ -110,7 +110,7 @@ Plans:
 **Plans:** 3 plans
 
 Plans:
-- [ ] 05-01-PLAN.md -- Auto-restart with exponential backoff TDD
+- [x] 05-01-PLAN.md -- Auto-restart with exponential backoff TDD
 - [ ] 05-02-PLAN.md -- Idle reaper + routing drift detector TDD
 - [ ] 05-03-PLAN.md -- Prometheus /metrics + seccomp profile + binary wiring
 
