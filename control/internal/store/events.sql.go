@@ -89,6 +89,40 @@ func (q *Queries) ListEventsByType(ctx context.Context, arg ListEventsByTypePara
 	return items, nil
 }
 
+const listRecentEvents = `-- name: ListRecentEvents :many
+SELECT id, sandbox_id, node_id, event_type, actor, prev_state, next_state, payload, created_at FROM events ORDER BY created_at DESC LIMIT $1
+`
+
+func (q *Queries) ListRecentEvents(ctx context.Context, limit int32) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listRecentEvents, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Event{}
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.NodeID,
+			&i.EventType,
+			&i.Actor,
+			&i.PrevState,
+			&i.NextState,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recordEvent = `-- name: RecordEvent :one
 INSERT INTO events (sandbox_id, node_id, event_type, actor, prev_state, next_state, payload)
 VALUES ($1, $2, $3, $4, $5, $6, $7)

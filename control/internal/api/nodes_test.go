@@ -11,21 +11,27 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/appx/forge/control/internal/store"
 )
 
 // --- Mock store for node handlers ---
 
-// mockNodeStore implements NodeStore for testing registration and heartbeat.
+// mockNodeStore implements NodeStore for testing registration, heartbeat, and node management.
 type mockNodeStore struct {
-	getByHostnameAndIPFn func(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error)
-	createNodeFn         func(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error)
-	updateNodeTokenFn    func(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error
-	getNodeFn            func(ctx context.Context, id pgtype.UUID) (NodeRecord, error)
-	updateHeartbeatFn    func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error
+	getByHostnameAndIPFn       func(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error)
+	createNodeFn               func(ctx context.Context, arg CreateNodeArgs) (NodeRecord, error)
+	updateNodeTokenFn          func(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error
+	getNodeFn                  func(ctx context.Context, id pgtype.UUID) (NodeRecord, error)
+	updateHeartbeatFn          func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error
+	listNodesFn                func(ctx context.Context) ([]store.Node, error)
+	updateNodeStatusFn         func(ctx context.Context, id pgtype.UUID, status string) error
+	countActiveSandboxesFn     func(ctx context.Context, nodeID pgtype.UUID) (int32, error)
 }
 
 func (m *mockNodeStore) GetNodeByHostnameAndIP(ctx context.Context, hostname string, ip netip.Addr) (NodeRecord, error) {
@@ -61,6 +67,27 @@ func (m *mockNodeStore) UpdateNodeHeartbeat(ctx context.Context, id pgtype.UUID,
 		return m.updateHeartbeatFn(ctx, id, usedMb, runningContainers)
 	}
 	return nil
+}
+
+func (m *mockNodeStore) ListNodes(ctx context.Context) ([]store.Node, error) {
+	if m.listNodesFn != nil {
+		return m.listNodesFn(ctx)
+	}
+	return []store.Node{}, nil
+}
+
+func (m *mockNodeStore) UpdateNodeStatus(ctx context.Context, id pgtype.UUID, status string) error {
+	if m.updateNodeStatusFn != nil {
+		return m.updateNodeStatusFn(ctx, id, status)
+	}
+	return nil
+}
+
+func (m *mockNodeStore) CountActiveSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	if m.countActiveSandboxesFn != nil {
+		return m.countActiveSandboxesFn(ctx, nodeID)
+	}
+	return 0, nil
 }
 
 // testLogger returns a discard logger for tests.
@@ -347,6 +374,246 @@ func TestHeartbeat_InvalidUUID(t *testing.T) {
 	}
 }
 
+// --- List Nodes tests ---
+
+func TestListNodes_ReturnsNodeList(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("listnodeuuid0001"))
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	ns := &mockNodeStore{
+		listNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{
+				{
+					ID:                nodeID,
+					Hostname:          "vds-1",
+					TailscaleIp:       netip.MustParseAddr("100.64.1.5"),
+					AgentListenPort:   8090,
+					CapacityMb:        24000,
+					UsedMb:            8500,
+					RunningContainers: 12,
+					Status:            "healthy",
+					AgentVersion:      "0.1.0",
+					LastSeenAt:        pgtype.Timestamptz{Time: now, Valid: true},
+					RegisteredAt:      pgtype.Timestamptz{Time: now.Add(-24 * time.Hour), Valid: true},
+					AgentToken:        "secret-token-should-never-appear",
+				},
+			}, nil
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	req := httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Nodes []json.RawMessage `json:"nodes"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(resp.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(resp.Nodes))
+	}
+
+	// Verify agent_token is NEVER exposed (T-06-01)
+	raw := string(resp.Nodes[0])
+	if bytes.Contains([]byte(raw), []byte("agent_token")) {
+		t.Fatal("agent_token MUST NOT be exposed in list nodes response")
+	}
+	if bytes.Contains([]byte(raw), []byte("secret-token-should-never-appear")) {
+		t.Fatal("agent_token value leaked in response")
+	}
+
+	// Verify expected fields are present
+	var node map[string]interface{}
+	if err := json.Unmarshal(resp.Nodes[0], &node); err != nil {
+		t.Fatalf("unmarshal node: %v", err)
+	}
+	for _, field := range []string{"id", "hostname", "tailscale_ip", "capacity_mb", "used_mb", "status", "running_sandboxes", "agent_version", "last_seen_at", "registered_at"} {
+		if _, ok := node[field]; !ok {
+			t.Errorf("missing expected field %q in node response", field)
+		}
+	}
+}
+
+func TestListNodes_EmptyList(t *testing.T) {
+	ns := &mockNodeStore{
+		listNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{}, nil
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	req := httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Nodes []json.RawMessage `json:"nodes"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if len(resp.Nodes) != 0 {
+		t.Fatalf("expected 0 nodes, got %d", len(resp.Nodes))
+	}
+}
+
+// --- Drain Node tests ---
+
+func TestDrainNode_ValidRequest(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("drainnodeuuid001"))
+
+	var capturedStatus string
+	ns := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			if id != nodeID {
+				t.Fatalf("unexpected node ID")
+			}
+			return NodeRecord{ID: nodeID, Hostname: "vds-1"}, nil
+		},
+		updateNodeStatusFn: func(ctx context.Context, id pgtype.UUID, status string) error {
+			capturedStatus = status
+			return nil
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/"+nodeIDStr+"/drain", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if capturedStatus != "draining" {
+		t.Fatalf("expected status 'draining', got %q", capturedStatus)
+	}
+}
+
+func TestDrainNode_UnknownNode(t *testing.T) {
+	ns := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{}, pgx.ErrNoRows
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/00000000-0000-0000-0000-000000000099/drain", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// --- Remove Node tests ---
+
+func TestRemoveNode_ZeroSandboxes(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("removenodeuuid01"))
+
+	var capturedStatus string
+	ns := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{ID: nodeID, Hostname: "vds-1"}, nil
+		},
+		countActiveSandboxesFn: func(ctx context.Context, nid pgtype.UUID) (int32, error) {
+			return 0, nil
+		},
+		updateNodeStatusFn: func(ctx context.Context, id pgtype.UUID, status string) error {
+			capturedStatus = status
+			return nil
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodDelete, "/v1/nodes/"+nodeIDStr, nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	if capturedStatus != "removed" {
+		t.Fatalf("expected status 'removed', got %q", capturedStatus)
+	}
+}
+
+func TestRemoveNode_HasActiveSandboxes(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("removenodeuuid02"))
+
+	ns := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{ID: nodeID, Hostname: "vds-1"}, nil
+		},
+		countActiveSandboxesFn: func(ctx context.Context, nid pgtype.UUID) (int32, error) {
+			return 3, nil
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodDelete, "/v1/nodes/"+nodeIDStr, nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRemoveNode_UnknownNode(t *testing.T) {
+	ns := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{}, pgx.ErrNoRows
+		},
+	}
+
+	srv := newTestServerWithNodeStore(ns, 15)
+	req := httptest.NewRequest(http.MethodDelete, "/v1/nodes/00000000-0000-0000-0000-000000000099", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // --- Test helpers ---
 
 // newTestServerWithNodeStore creates a minimal Server for handler testing.
@@ -365,6 +632,9 @@ func newTestServerWithNodeStore(ns NodeStore, heartbeatInterval int) *Server {
 	r.Group(func(r chi.Router) {
 		r.Use(BearerAuth("test-token"))
 		r.Post("/v1/nodes/{id}/heartbeat", s.handleHeartbeat)
+		r.Get("/v1/nodes", s.handleListNodes)
+		r.Post("/v1/nodes/{id}/drain", s.handleDrainNode)
+		r.Delete("/v1/nodes/{id}", s.handleRemoveNode)
 	})
 
 	return s

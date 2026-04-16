@@ -8,3 +8,6 @@ SELECT * FROM events WHERE sandbox_id = $1 ORDER BY created_at DESC LIMIT $2;
 
 -- name: ListEventsByType :many
 SELECT * FROM events WHERE event_type = $1 ORDER BY created_at DESC LIMIT $2;
+
+-- name: ListRecentEvents :many
+SELECT * FROM events ORDER BY created_at DESC LIMIT $1;

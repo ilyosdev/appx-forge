@@ -12,6 +12,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countActiveSandboxesByNode = `-- name: CountActiveSandboxesByNode :one
+SELECT count(*)::int FROM sandboxes WHERE node_id = $1 AND state NOT IN ('destroyed', 'stopped')
+`
+
+func (q *Queries) CountActiveSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, countActiveSandboxesByNode, nodeID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createNode = `-- name: CreateNode :one
 INSERT INTO nodes (id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, agent_version, metadata)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

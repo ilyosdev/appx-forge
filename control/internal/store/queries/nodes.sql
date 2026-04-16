@@ -23,3 +23,6 @@ SELECT * FROM nodes WHERE hostname = $1 AND tailscale_ip = $2;
 
 -- name: UpdateNodeToken :exec
 UPDATE nodes SET agent_token = $1, agent_version = $2, last_seen_at = NOW() WHERE id = $3;
+
+-- name: CountActiveSandboxesByNode :one
+SELECT count(*)::int FROM sandboxes WHERE node_id = $1 AND state NOT IN ('destroyed', 'stopped');
