@@ -45,6 +45,7 @@ type Store interface {
 	ListHealthyNodes(ctx context.Context) ([]store.Node, error)
 	AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
 	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
+	UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	AckCommand(ctx context.Context, arg store.AckCommandParams) error
 	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
@@ -295,17 +296,44 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	if needsTransition {
 		currentState := models.SandboxState(sandbox.State)
 		nextState, valid := models.NextState(currentState, event)
+
 		if !valid {
-			return fmt.Errorf("%w: %s + %s from %s", ErrInvalidTransition, cmdType, status, sandbox.State)
+			// Race: HandleEvent (e.g. container_started) may have already
+			// advanced the state before this ack arrived. If we're already
+			// at the target state, treat as a no-op instead of failing.
+			alreadyAtTarget := false
+			switch event {
+			case models.EventStarted:
+				alreadyAtTarget = currentState == models.StateRunning
+			case models.EventStartFailed:
+				alreadyAtTarget = currentState == models.StateFailed
+			case models.EventDestroyed:
+				alreadyAtTarget = currentState == models.StateDestroyed
+			}
+			if !alreadyAtTarget {
+				return fmt.Errorf("%w: %s + %s from %s", ErrInvalidTransition, cmdType, status, sandbox.State)
+			}
+			ls.logger.Info("ack transition skipped: state already advanced",
+				"sandbox_id", sandboxID,
+				"current_state", currentState,
+				"cmd_type", cmdType,
+			)
+			nextState = currentState
+		} else {
+			_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+				State:   string(nextState),
+				ID:      pgSandboxID,
+				State_2: sandbox.State,
+			})
+			if err != nil {
+				return fmt.Errorf("transition state: %w", err)
+			}
 		}
 
-		_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
-			State:   string(nextState),
-			ID:      pgSandboxID,
-			State_2: sandbox.State,
-		})
-		if err != nil {
-			return fmt.Errorf("transition state: %w", err)
+		// Persist container_id and host_port from agent ack result.
+		// The agent sends these in the start_sandbox success ack payload.
+		if event == models.EventStarted {
+			ls.persistRuntimeInfo(ctx, pgSandboxID, sandboxID, ackResult)
 		}
 
 		// Record event
@@ -316,7 +344,7 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 			Actor:     "agent",
 			PrevState: pgtype.Text{String: sandbox.State, Valid: true},
 			NextState: pgtype.Text{String: string(nextState), Valid: true},
-			Payload:   ackResult,
+			Payload:   safePayload(ackResult),
 		})
 		if err != nil {
 			ls.logger.Warn("failed to record ack event", "error", err, "sandbox_id", sandboxID)
@@ -418,7 +446,7 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 		Actor:     "agent",
 		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
 		NextState: pgtype.Text{String: string(nextState), Valid: true},
-		Payload:   payload,
+		Payload:   safePayload(payload),
 	})
 	if err != nil {
 		ls.logger.Warn("failed to record event", "error", err, "sandbox_id", sandboxID)
@@ -508,6 +536,7 @@ func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.U
 		Actor:     "control-plane",
 		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
 		NextState: pgtype.Text{String: string(nextState), Valid: true},
+		Payload:   cmdPayload,
 	})
 	if err != nil {
 		ls.logger.Warn("failed to record destroy event", "error", err, "sandbox_id", sandboxID)
@@ -559,6 +588,7 @@ func (ls *LifecycleService) RestartSandbox(ctx context.Context, sandboxID uuid.U
 		Actor:     "control-plane",
 		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
 		NextState: pgtype.Text{String: sandbox.State, Valid: true},
+		Payload:   cmdPayload,
 	})
 	if err != nil {
 		ls.logger.Warn("failed to record restart event", "error", err, "sandbox_id", sandboxID)
@@ -611,4 +641,44 @@ func (ls *LifecycleService) notifyRouteRemove(ctx context.Context, appName strin
 			"sandbox_id", sandboxID,
 		)
 	}
+}
+
+// persistRuntimeInfo extracts container_id and host_port from an ack result
+// and persists them to the sandbox row. Best-effort: errors are logged.
+func (ls *LifecycleService) persistRuntimeInfo(ctx context.Context, pgSandboxID pgtype.UUID, sandboxID uuid.UUID, ackResult json.RawMessage) {
+	if len(ackResult) == 0 {
+		return
+	}
+	var info struct {
+		ContainerID string `json:"container_id"`
+		HostPort    int32  `json:"host_port"`
+	}
+	if err := json.Unmarshal(ackResult, &info); err != nil {
+		ls.logger.Warn("failed to parse ack runtime info", "error", err, "sandbox_id", sandboxID)
+		return
+	}
+	if info.ContainerID == "" && info.HostPort == 0 {
+		return
+	}
+	if err := ls.store.UpdateSandboxRuntime(ctx, store.UpdateSandboxRuntimeParams{
+		ContainerID: pgtype.Text{String: info.ContainerID, Valid: info.ContainerID != ""},
+		HostPort:    pgtype.Int4{Int32: info.HostPort, Valid: info.HostPort != 0},
+		ID:          pgSandboxID,
+	}); err != nil {
+		ls.logger.Warn("failed to persist sandbox runtime info",
+			"error", err,
+			"sandbox_id", sandboxID,
+			"container_id", info.ContainerID,
+			"host_port", info.HostPort,
+		)
+	}
+}
+
+// safePayload returns p if non-nil, or an empty JSON object otherwise.
+// Prevents NOT NULL constraint violations on the events.payload column.
+func safePayload(p []byte) []byte {
+	if len(p) == 0 {
+		return []byte(`{}`)
+	}
+	return p
 }

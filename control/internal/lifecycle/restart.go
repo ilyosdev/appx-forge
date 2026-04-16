@@ -106,6 +106,7 @@ func (rm *RestartManager) HandleCrash(ctx context.Context, sandbox store.Sandbox
 			Actor:     "control-plane",
 			PrevState: pgtype.Text{String: sandbox.State, Valid: true},
 			NextState: pgtype.Text{String: string(models.StateFailed), Valid: true},
+			Payload:   []byte(`{}`),
 		})
 
 		return CrashResult{ShouldRestart: false}, nil

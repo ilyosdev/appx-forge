@@ -130,6 +130,7 @@ func (r *Rescheduler) rescheduleSandbox(ctx context.Context, sandbox store.Sandb
 		Actor:     "rescheduler",
 		PrevState: pgtype.Text{String: string(models.StateRunning), Valid: true},
 		NextState: pgtype.Text{String: string(models.StatePending), Valid: true},
+		Payload:   []byte(`{}`),
 	})
 
 	// 3. Remove Caddy route (best-effort, errors logged)
@@ -195,6 +196,7 @@ func (r *Rescheduler) rescheduleSandbox(ctx context.Context, sandbox store.Sandb
 			Actor:     "rescheduler",
 			PrevState: pgtype.Text{String: string(models.StatePending), Valid: true},
 			NextState: pgtype.Text{String: string(models.StateFailed), Valid: true},
+			Payload:   []byte(`{}`),
 		})
 
 		return fmt.Errorf("schedule sandbox: %w", err)

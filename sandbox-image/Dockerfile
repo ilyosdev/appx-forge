@@ -11,7 +11,9 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Create app user (UID 1000 -- agent must chown bind-mount dirs to match)
-RUN useradd -u 1000 -m -s /bin/bash appuser
+# node:20-slim ships with a "node" user at UID 1000; remove it first.
+RUN userdel -r node 2>/dev/null || true && \
+    useradd -u 1000 -m -s /bin/bash appuser
 
 WORKDIR /app
 
@@ -55,9 +57,13 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=30s \
     CMD node -e "fetch('http://localhost:8081/status').then(r => r.ok ? process.exit(0) : process.exit(1)).catch(() => process.exit(1))"
 
+# Set working directory to the app template (where package.json lives)
+WORKDIR /app/app
+
 # Run as non-root user
 USER appuser
 
 # Start Metro dev server
-# Uses npx expo start which starts Metro on the configured port
-CMD ["npx", "expo", "start", "--port", "8081", "--non-interactive"]
+# CI=1 suppresses interactive prompts (--non-interactive is not a valid Expo flag)
+ENV CI=1
+CMD ["npx", "expo", "start", "--port", "8081"]

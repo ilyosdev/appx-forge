@@ -207,7 +207,7 @@ func (q *Queries) ListNodes(ctx context.Context) ([]Node, error) {
 }
 
 const updateNodeHeartbeat = `-- name: UpdateNodeHeartbeat :exec
-UPDATE nodes SET used_mb = $2, running_containers = $3, last_seen_at = NOW() WHERE id = $1
+UPDATE nodes SET used_mb = $2, running_containers = $3, status = 'healthy', last_seen_at = NOW() WHERE id = $1
 `
 
 type UpdateNodeHeartbeatParams struct {

@@ -58,5 +58,10 @@ SELECT state, COUNT(*)::int AS count
 FROM sandboxes
 GROUP BY state;
 
+-- name: UpdateSandboxRuntime :exec
+UPDATE sandboxes
+SET container_id = $1, host_port = $2, updated_at = NOW()
+WHERE id = $3;
+
 -- name: ListRunningSandboxesByNode :many
 SELECT * FROM sandboxes WHERE node_id = $1 AND state = 'running' ORDER BY created_at ASC;

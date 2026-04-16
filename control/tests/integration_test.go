@@ -168,6 +168,10 @@ func (a *integrationAdapter) TransitionSandboxState(ctx context.Context, arg sto
 	return a.q.TransitionSandboxState(ctx, arg)
 }
 
+func (a *integrationAdapter) UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
+	return a.q.UpdateSandboxRuntime(ctx, arg)
+}
+
 func (a *integrationAdapter) CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
 	return a.q.CreateCommand(ctx, arg)
 }

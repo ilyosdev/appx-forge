@@ -16,16 +16,17 @@ import (
 // ── Mock Store ───────────────────────────────────────────────────────
 
 type mockStore struct {
-	createSandboxFn       func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
-	getSandboxFn          func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
-	getSandboxByAppNameFn func(ctx context.Context, appName string) (store.Sandbox, error)
-	listHealthyNodesFn    func(ctx context.Context) ([]store.Node, error)
-	assignSandboxFn       func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
-	transitionStateFn     func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
-	createCommandFn       func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
-	ackCommandFn          func(ctx context.Context, arg store.AckCommandParams) error
-	recordEventFn         func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
-	getNodeByIDFn         func(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	createSandboxFn         func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
+	getSandboxFn            func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
+	getSandboxByAppNameFn   func(ctx context.Context, appName string) (store.Sandbox, error)
+	listHealthyNodesFn      func(ctx context.Context) ([]store.Node, error)
+	assignSandboxFn         func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
+	transitionStateFn       func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
+	updateSandboxRuntimeFn  func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
+	createCommandFn         func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
+	ackCommandFn            func(ctx context.Context, arg store.AckCommandParams) error
+	recordEventFn           func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+	getNodeByIDFn           func(ctx context.Context, id pgtype.UUID) (store.Node, error)
 }
 
 func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
@@ -68,6 +69,13 @@ func (m *mockStore) TransitionSandboxState(ctx context.Context, arg store.Transi
 		return m.transitionStateFn(ctx, arg)
 	}
 	return store.Sandbox{State: arg.State}, nil
+}
+
+func (m *mockStore) UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
+	if m.updateSandboxRuntimeFn != nil {
+		return m.updateSandboxRuntimeFn(ctx, arg)
+	}
+	return nil
 }
 
 func (m *mockStore) CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
@@ -330,6 +338,79 @@ func TestHandleAck_StopSandboxSuccess(t *testing.T) {
 	// Verify transition: destroying -> destroyed
 	if capturedTransition.State != "destroyed" {
 		t.Fatalf("expected transition to 'destroyed', got %q", capturedTransition.State)
+	}
+}
+
+func TestHandleAck_StartSandboxSuccess_AlreadyRunning(t *testing.T) {
+	// Race condition: HandleEvent(container_started) already transitioned
+	// starting→running before this ack arrives. HandleAck should succeed.
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	transitionCalled := false
+	var capturedRuntime store.UpdateSandboxRuntimeParams
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: "running", AppName: "test-app"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			transitionCalled = true
+			return store.Sandbox{}, nil
+		},
+		updateSandboxRuntimeFn: func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
+			capturedRuntime = arg
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "start_sandbox", "success",
+		json.RawMessage(`{"container_id":"abc123","host_port":43210}`))
+
+	if err != nil {
+		t.Fatalf("expected no error for already-running sandbox, got: %v", err)
+	}
+	if transitionCalled {
+		t.Fatal("expected no state transition when already at target state")
+	}
+	// Runtime info should still be persisted even when transition is skipped
+	if capturedRuntime.ContainerID.String != "abc123" {
+		t.Fatalf("expected container_id 'abc123', got %q", capturedRuntime.ContainerID.String)
+	}
+	if capturedRuntime.HostPort.Int32 != 43210 {
+		t.Fatalf("expected host_port 43210, got %d", capturedRuntime.HostPort.Int32)
+	}
+}
+
+func TestHandleAck_StartSandboxSuccess_PersistsRuntimeInfo(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	var capturedRuntime store.UpdateSandboxRuntimeParams
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: "starting", AppName: "test-app"}, nil
+		},
+		updateSandboxRuntimeFn: func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
+			capturedRuntime = arg
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "start_sandbox", "success",
+		json.RawMessage(`{"container_id":"ctr-xyz","host_port":8081}`))
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if capturedRuntime.ContainerID.String != "ctr-xyz" {
+		t.Fatalf("expected container_id 'ctr-xyz', got %q", capturedRuntime.ContainerID.String)
+	}
+	if capturedRuntime.HostPort.Int32 != 8081 {
+		t.Fatalf("expected host_port 8081, got %d", capturedRuntime.HostPort.Int32)
 	}
 }
 

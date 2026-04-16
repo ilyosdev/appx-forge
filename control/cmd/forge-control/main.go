@@ -481,6 +481,10 @@ func (a *storeAdapter) TransitionSandboxState(ctx context.Context, arg store.Tra
 	return a.q.TransitionSandboxState(ctx, arg)
 }
 
+func (a *storeAdapter) UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
+	return a.q.UpdateSandboxRuntime(ctx, arg)
+}
+
 func (a *storeAdapter) CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
 	return a.q.CreateCommand(ctx, arg)
 }

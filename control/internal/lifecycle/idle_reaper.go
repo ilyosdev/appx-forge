@@ -146,6 +146,7 @@ func (r *IdleReaper) reapOne(ctx context.Context, sb store.Sandbox) error {
 		Actor:     "idle-reaper",
 		PrevState: pgtype.Text{String: string(models.StateRunning), Valid: true},
 		NextState: pgtype.Text{String: string(models.StateStopped), Valid: true},
+		Payload:   []byte(`{}`),
 	})
 	if err != nil {
 		r.logger.Warn("failed to record idle_timeout event",

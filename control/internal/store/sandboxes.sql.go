@@ -539,3 +539,20 @@ func (q *Queries) UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) e
 	_, err := q.db.Exec(ctx, updateSandboxLastActive, id)
 	return err
 }
+
+const updateSandboxRuntime = `-- name: UpdateSandboxRuntime :exec
+UPDATE sandboxes
+SET container_id = $1, host_port = $2, updated_at = NOW()
+WHERE id = $3
+`
+
+type UpdateSandboxRuntimeParams struct {
+	ContainerID pgtype.Text `json:"container_id"`
+	HostPort    pgtype.Int4 `json:"host_port"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+func (q *Queries) UpdateSandboxRuntime(ctx context.Context, arg UpdateSandboxRuntimeParams) error {
+	_, err := q.db.Exec(ctx, updateSandboxRuntime, arg.ContainerID, arg.HostPort, arg.ID)
+	return err
+}
