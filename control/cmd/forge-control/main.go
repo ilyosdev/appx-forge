@@ -130,8 +130,12 @@ func main() {
 		},
 	}
 
+	// ── Rescheduler (node failover) ───────────────────────────────────
+	rescheduler := lifecycle.NewRescheduler(adapter, routeManager, logger)
+	logger.Info("rescheduler wired")
+
 	// ── Background heartbeat monitor ───────────────────────────────────
-	go monitorHeartbeats(ctx, queries, cfg, logger)
+	go monitorHeartbeats(ctx, queries, cfg, logger, rescheduler)
 
 	// ── Idle reaper (background goroutine) ─────────────────────────────
 	idleReaper := lifecycle.NewIdleReaper(adapter, routeManager, logger,
@@ -212,9 +216,9 @@ func runMigrations(databaseURL string) error {
 
 // monitorHeartbeats runs a background loop that marks nodes as unhealthy when
 // they miss too many heartbeats. It checks all nodes every HeartbeatIntervalSeconds.
-// This is NOT a reconciliation loop -- it only marks nodes unhealthy; it never
-// restarts containers or changes sandbox state.
-func monitorHeartbeats(ctx context.Context, q *store.Queries, cfg *config.Config, logger *slog.Logger) {
+// When a node is marked unhealthy, it triggers the rescheduler to move running
+// sandboxes to healthy nodes.
+func monitorHeartbeats(ctx context.Context, q *store.Queries, cfg *config.Config, logger *slog.Logger, rescheduler *lifecycle.Rescheduler) {
 	interval := time.Duration(cfg.HeartbeatIntervalSeconds) * time.Second
 	threshold := time.Duration(cfg.HeartbeatIntervalSeconds*cfg.HeartbeatMissThreshold) * time.Second
 
@@ -263,6 +267,21 @@ func monitorHeartbeats(ctx context.Context, q *store.Queries, cfg *config.Config
 							"error", err,
 							"node_id", formatNodeID(n.ID),
 						)
+					} else {
+						// Trigger reschedule for the newly-unhealthy node
+						result, rErr := rescheduler.RescheduleNode(ctx, n.ID)
+						if rErr != nil {
+							logger.Error("reschedule failed for unhealthy node",
+								"error", rErr,
+								"node_id", formatNodeID(n.ID),
+							)
+						} else if result.Count > 0 {
+							logger.Info("rescheduled sandboxes from unhealthy node",
+								"node_id", formatNodeID(n.ID),
+								"rescheduled", result.Count,
+								"failed", result.Failed,
+							)
+						}
 					}
 				}
 			}
@@ -301,6 +320,7 @@ func float64ToNumeric(f float64) pgtype.Numeric {
 //   - api.MetricsStore
 //   - lifecycle.Store
 //   - lifecycle.RestartStore
+//   - lifecycle.RescheduleStore
 //   - lifecycle.IdleReaperStore
 type storeAdapter struct {
 	q *store.Queries
@@ -485,6 +505,12 @@ func (a *storeAdapter) IncrementSandboxFailureCount(ctx context.Context, id pgty
 
 func (a *storeAdapter) ResetSandboxFailureCount(ctx context.Context, id pgtype.UUID) error {
 	return a.q.ResetSandboxFailureCount(ctx, id)
+}
+
+// ── lifecycle.RescheduleStore interface ──────────────────────────────
+
+func (a *storeAdapter) ListRunningSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) ([]store.Sandbox, error) {
+	return a.q.ListRunningSandboxesByNode(ctx, nodeID)
 }
 
 // ── lifecycle.IdleReaperStore interface ───────────────────────────────
