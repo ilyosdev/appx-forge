@@ -42,6 +42,9 @@ type Server struct {
 	agentLifecycle           AgentLifecycle
 	filePushStore            FilePushStore
 	metricsStore             MetricsStore
+	routeFetcher             RouteListFetcher
+	eventStore               EventStore
+	logHTTPClient            httpDoer
 	heartbeatIntervalSeconds int
 }
 
@@ -89,6 +92,21 @@ func (s *Server) SetFilePushStore(fps FilePushStore) {
 // SetMetricsStore injects the metrics store dependency after construction.
 func (s *Server) SetMetricsStore(ms MetricsStore) {
 	s.metricsStore = ms
+}
+
+// SetRouteFetcher injects the route list fetcher dependency after construction.
+func (s *Server) SetRouteFetcher(rf RouteListFetcher) {
+	s.routeFetcher = rf
+}
+
+// SetEventStore injects the event store dependency after construction.
+func (s *Server) SetEventStore(es EventStore) {
+	s.eventStore = es
+}
+
+// httpDoer abstracts HTTP client for testability (used by log proxy).
+type httpDoer interface {
+	Do(req *http.Request) (*http.Response, error)
 }
 
 // ServeHTTP delegates to the chi router.

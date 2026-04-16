@@ -99,6 +99,21 @@ func (a *integrationAdapter) UpdateNodeHeartbeat(ctx context.Context, id pgtype.
 	})
 }
 
+func (a *integrationAdapter) ListNodes(ctx context.Context) ([]store.Node, error) {
+	return a.q.ListNodes(ctx)
+}
+
+func (a *integrationAdapter) UpdateNodeStatus(ctx context.Context, id pgtype.UUID, status string) error {
+	return a.q.UpdateNodeStatus(ctx, store.UpdateNodeStatusParams{
+		ID:     id,
+		Status: status,
+	})
+}
+
+func (a *integrationAdapter) CountActiveSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	return a.q.CountActiveSandboxesByNode(ctx, nodeID)
+}
+
 // ── api.SandboxReader ──────────────────────────────────────────────────
 
 func (a *integrationAdapter) GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {

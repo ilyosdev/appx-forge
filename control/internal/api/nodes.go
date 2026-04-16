@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/appx/forge/control/internal/store"
 )
 
 // NodeStore abstracts the database operations needed by node handlers.
@@ -23,6 +25,9 @@ type NodeStore interface {
 	UpdateNodeToken(ctx context.Context, token string, agentVersion string, id pgtype.UUID) error
 	GetNode(ctx context.Context, id pgtype.UUID) (NodeRecord, error)
 	UpdateNodeHeartbeat(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error
+	ListNodes(ctx context.Context) ([]store.Node, error)
+	UpdateNodeStatus(ctx context.Context, id pgtype.UUID, status string) error
+	CountActiveSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error)
 }
 
 // NodeRecord is the minimal node data handlers need. It decouples handlers from
@@ -66,6 +71,25 @@ type registerResponse struct {
 type heartbeatRequest struct {
 	UsedMb            int32 `json:"used_mb"`
 	RunningContainers int32 `json:"running_containers"`
+}
+
+// nodeResponse is the API response for a node. It intentionally omits
+// agent_token to prevent information disclosure (T-06-01).
+type nodeResponse struct {
+	ID               string `json:"id"`
+	Hostname         string `json:"hostname"`
+	TailscaleIP      string `json:"tailscale_ip"`
+	CapacityMb       int32  `json:"capacity_mb"`
+	UsedMb           int32  `json:"used_mb"`
+	Status           string `json:"status"`
+	RunningSandboxes int32  `json:"running_sandboxes"`
+	AgentVersion     string `json:"agent_version"`
+	LastSeenAt       string `json:"last_seen_at,omitempty"`
+	RegisteredAt     string `json:"registered_at,omitempty"`
+}
+
+type nodeListResponse struct {
+	Nodes []nodeResponse `json:"nodes"`
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────
@@ -233,6 +257,136 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleListNodes handles GET /v1/nodes.
+// Returns all registered nodes with status, capacity, and sandbox count.
+// Agent token is intentionally omitted from the response (T-06-01).
+func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.nodeStore.ListNodes(r.Context())
+	if err != nil {
+		s.logger.Error("failed to list nodes", "error", err)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to list nodes")
+		return
+	}
+
+	resp := make([]nodeResponse, len(nodes))
+	for i, n := range nodes {
+		resp[i] = storeNodeToResponse(n)
+	}
+
+	writeJSON(w, http.StatusOK, nodeListResponse{Nodes: resp})
+}
+
+// handleDrainNode handles POST /v1/nodes/{id}/drain.
+// Sets node status to "draining" to prevent new sandbox scheduling.
+func (s *Server) handleDrainNode(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+
+	nodeID, err := parseUUID(idStr)
+	if err != nil {
+		BadRequest(w, "invalid node ID: must be a valid UUID")
+		return
+	}
+
+	ctx := r.Context()
+
+	// Verify node exists
+	if _, err := s.nodeStore.GetNode(ctx, nodeID); err != nil {
+		if err == pgx.ErrNoRows {
+			NotFound(w, "node not found")
+			return
+		}
+		s.logger.Error("failed to get node", "error", err, "node_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to get node")
+		return
+	}
+
+	if err := s.nodeStore.UpdateNodeStatus(ctx, nodeID, "draining"); err != nil {
+		s.logger.Error("failed to drain node", "error", err, "node_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to drain node")
+		return
+	}
+
+	s.logger.Info("node draining", "node_id", idStr)
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleRemoveNode handles DELETE /v1/nodes/{id}.
+// Only allows removal when the node has zero active sandboxes (T-06-03).
+// Returns 409 Conflict if sandboxes are still running.
+func (s *Server) handleRemoveNode(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+
+	nodeID, err := parseUUID(idStr)
+	if err != nil {
+		BadRequest(w, "invalid node ID: must be a valid UUID")
+		return
+	}
+
+	ctx := r.Context()
+
+	// Verify node exists
+	if _, err := s.nodeStore.GetNode(ctx, nodeID); err != nil {
+		if err == pgx.ErrNoRows {
+			NotFound(w, "node not found")
+			return
+		}
+		s.logger.Error("failed to get node", "error", err, "node_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to get node")
+		return
+	}
+
+	// Check for active sandboxes
+	count, err := s.nodeStore.CountActiveSandboxesByNode(ctx, nodeID)
+	if err != nil {
+		s.logger.Error("failed to count sandboxes", "error", err, "node_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to count sandboxes")
+		return
+	}
+
+	if count > 0 {
+		Conflict(w, "node has active sandboxes; drain first")
+		return
+	}
+
+	if err := s.nodeStore.UpdateNodeStatus(ctx, nodeID, "removed"); err != nil {
+		s.logger.Error("failed to remove node", "error", err, "node_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to remove node")
+		return
+	}
+
+	s.logger.Info("node removed", "node_id", idStr)
+	w.WriteHeader(http.StatusOK)
+}
+
+// storeNodeToResponse maps a store.Node to nodeResponse, omitting agent_token.
+func storeNodeToResponse(n store.Node) nodeResponse {
+	resp := nodeResponse{
+		ID:               formatUUID(n.ID),
+		Hostname:         n.Hostname,
+		TailscaleIP:      n.TailscaleIp.String(),
+		CapacityMb:       n.CapacityMb,
+		UsedMb:           n.UsedMb,
+		Status:           n.Status,
+		RunningSandboxes: n.RunningContainers,
+		AgentVersion:     n.AgentVersion,
+	}
+
+	if n.LastSeenAt.Valid {
+		resp.LastSeenAt = n.LastSeenAt.Time.Format("2006-01-02T15:04:05Z")
+	}
+	if n.RegisteredAt.Valid {
+		resp.RegisteredAt = n.RegisteredAt.Time.Format("2006-01-02T15:04:05Z")
+	}
+
+	return resp
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────

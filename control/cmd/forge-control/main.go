@@ -118,6 +118,8 @@ func main() {
 	srv.SetAgentDeps(adapter, lc)
 	srv.SetFilePushStore(&filePushAdapter{q: queries})
 	srv.SetMetricsStore(adapter)
+	srv.SetRouteFetcher(caddyClient)
+	srv.SetEventStore(&eventStoreAdapter{q: queries})
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -371,6 +373,17 @@ func (a *storeAdapter) UpdateNodeHeartbeat(ctx context.Context, id pgtype.UUID, 
 	})
 }
 
+func (a *storeAdapter) UpdateNodeStatus(ctx context.Context, id pgtype.UUID, status string) error {
+	return a.q.UpdateNodeStatus(ctx, store.UpdateNodeStatusParams{
+		ID:     id,
+		Status: status,
+	})
+}
+
+func (a *storeAdapter) CountActiveSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	return a.q.CountActiveSandboxesByNode(ctx, nodeID)
+}
+
 // ── SandboxReader interface ────────────────────────────────────────────
 
 func (a *storeAdapter) GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
@@ -505,4 +518,23 @@ func (a *driftStoreAdapter) ListSandboxesByState(ctx context.Context, state stri
 
 func (a *driftStoreAdapter) GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error) {
 	return a.q.GetNode(ctx, id)
+}
+
+// ── eventStoreAdapter ───────────────────────────────────────────────
+
+// eventStoreAdapter bridges store.Queries to api.EventStore.
+type eventStoreAdapter struct {
+	q *store.Queries
+}
+
+func (a *eventStoreAdapter) ListEventsBySandbox(ctx context.Context, arg store.ListEventsBySandboxParams) ([]store.Event, error) {
+	return a.q.ListEventsBySandbox(ctx, arg)
+}
+
+func (a *eventStoreAdapter) ListEventsByType(ctx context.Context, arg store.ListEventsByTypeParams) ([]store.Event, error) {
+	return a.q.ListEventsByType(ctx, arg)
+}
+
+func (a *eventStoreAdapter) ListRecentEvents(ctx context.Context, limit int32) ([]store.Event, error) {
+	return a.q.ListRecentEvents(ctx, limit)
 }

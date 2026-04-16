@@ -29,7 +29,11 @@ func (s *Server) RegisterRoutes() {
 		r.Group(func(r chi.Router) {
 			r.Use(BearerAuth(s.config.apiToken))
 			r.Route("/v1", func(r chi.Router) {
+				// Node management
+				r.Get("/nodes", s.handleListNodes)
 				r.Post("/nodes/{id}/heartbeat", s.handleHeartbeat)
+				r.Post("/nodes/{id}/drain", s.handleDrainNode)
+				r.Delete("/nodes/{id}", s.handleRemoveNode)
 
 				// Sandbox CRUD
 				r.Post("/sandboxes", s.handleCreateSandbox)
@@ -38,6 +42,11 @@ func (s *Server) RegisterRoutes() {
 				r.Delete("/sandboxes/{id}", s.handleDestroySandbox)
 				r.Post("/sandboxes/{id}/restart", s.handleRestartSandbox)
 				r.Post("/sandboxes/{id}/files", s.handleFilePush)
+				r.Get("/sandboxes/{id}/logs", s.handleGetLogs)
+
+				// Routes and events
+				r.Get("/routes", s.handleListRoutes)
+				r.Get("/events", s.handleListEvents)
 
 				// Agent endpoints
 				r.Get("/agents/{id}/commands", s.handlePollCommands)
