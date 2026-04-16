@@ -35,8 +35,8 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 - [x] **CTRL-08**: Event ingestion: agent reports container events (started, exited, OOM), control plane transitions state
 - [x] **CTRL-09**: File push redirect: returns 307 to agent's direct endpoint with HMAC-signed URL (60s expiry)
 - [x] **CTRL-10**: Route management: add/remove Caddy routes via Admin API on sandbox state changes
-- [ ] **CTRL-11**: Routing drift detector: every 60s diff Caddy state vs Postgres, fix discrepancies (routes only, never containers)
-- [ ] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
+- [x] **CTRL-11**: Routing drift detector: every 60s diff Caddy state vs Postgres, fix discrepancies (routes only, never containers)
+- [x] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
 - [x] **CTRL-13**: Auto-restart with backoff: on container crash, restart up to 3 times with exponential backoff, then mark FAILED
 - [x] **CTRL-14**: Bearer token auth on all endpoints (except /healthz and /metrics)
 - [ ] **CTRL-15**: Prometheus metrics endpoint (/metrics): sandbox count by state, node utilization, request latency
@@ -209,8 +209,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTRL-08 | Phase 3 | Complete |
 | CTRL-09 | Phase 3 | Complete |
 | CTRL-10 | Phase 4 | Complete |
-| CTRL-11 | Phase 5 | Pending |
-| CTRL-12 | Phase 5 | Pending |
+| CTRL-11 | Phase 5 | Complete |
+| CTRL-12 | Phase 5 | Complete |
 | CTRL-13 | Phase 5 | Complete |
 | CTRL-14 | Phase 3 | Complete |
 | CTRL-15 | Phase 5 | Pending |
