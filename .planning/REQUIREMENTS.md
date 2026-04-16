@@ -128,8 +128,8 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 ### Multi-Node
 
 - [ ] **MULTI-01**: Scheduler distributes sandboxes across 3+ nodes
-- [ ] **MULTI-02**: Node failure detection: missed heartbeats -> mark unhealthy -> reschedule RUNNING sandboxes
-- [ ] **MULTI-03**: Reschedule completes within 90s of node failure detection
+- [x] **MULTI-02**: Node failure detection: missed heartbeats -> mark unhealthy -> reschedule RUNNING sandboxes
+- [x] **MULTI-03**: Reschedule completes within 90s of node failure detection
 
 ## v2 Requirements
 
@@ -258,8 +258,8 @@ Which phases cover which requirements. Updated during roadmap creation.
 | INT-03 | Phase 6 | Complete |
 | INT-04 | Phase 6 | Complete |
 | MULTI-01 | Phase 7 | Pending |
-| MULTI-02 | Phase 7 | Pending |
-| MULTI-03 | Phase 7 | Pending |
+| MULTI-02 | Phase 7 | Complete |
+| MULTI-03 | Phase 7 | Complete |
 
 **Coverage:**
 - v1 requirements: 88 total

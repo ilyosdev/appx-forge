@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Completed 06-03-PLAN.md
-last_updated: "2026-04-16T01:32:57.040Z"
+status: executing
+stopped_at: Completed 07-01-PLAN.md
+last_updated: "2026-04-16T01:49:47.732Z"
 last_activity: 2026-04-16
 progress:
   total_phases: 7
   completed_phases: 6
-  total_plans: 27
-  completed_plans: 27
-  percent: 100
+  total_plans: 29
+  completed_plans: 28
+  percent: 97
 ---
 
 # Project State
@@ -21,13 +21,13 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-15)
 
 **Core value:** Sub-second sandbox claim, ~5s cold start, zero spurious restarts -- reliable container orchestration simple enough to explain on one whiteboard
-**Current focus:** Phase 06 — CLI, SDK & appx-api Integration
+**Current focus:** Phase 07 — Multi-Node & Failover
 
 ## Current Position
 
-Phase: 06 (CLI, SDK & appx-api Integration) — EXECUTING
-Plan: 4 of 4
-Status: Phase complete — ready for verification
+Phase: 07 (Multi-Node & Failover) — EXECUTING
+Plan: 2 of 2
+Status: Ready to execute
 Last activity: 2026-04-16
 
 Progress: [░░░░░░░░░░] 0%
@@ -79,6 +79,7 @@ Progress: [░░░░░░░░░░] 0%
 | Phase 06 P02 | 411 | 2 tasks | 10 files |
 | Phase 06 P04 | 403 | 2 tasks | 13 files |
 | Phase 06 P03 | 820 | 2 tasks | 17 files |
+| Phase 07 P01 | 312 | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -164,6 +165,9 @@ Recent decisions affecting current work:
 - [Phase 06]: Constructor-based newRootCmd() instead of global var for test isolation
 - [Phase 06]: getNoAuth() method for unauthenticated endpoints like /v1/healthz
 - [Phase 06]: Routes verify exits 1 on drift for monitoring integration
+- [Phase 07]: Sequential per-sandbox reschedule processing prevents thundering herd (T-07-01)
+- [Phase 07]: CAS state transition (UPDATE WHERE state=running) prevents double-reschedule (T-07-02)
+- [Phase 07]: No-capacity fallback transitions sandbox to FAILED rather than looping indefinitely
 
 ### Pending Todos
 
@@ -185,6 +189,6 @@ Items acknowledged and carried forward from previous milestone close:
 
 ## Session Continuity
 
-Last session: 2026-04-16T01:32:57.037Z
-Stopped at: Completed 06-03-PLAN.md
+Last session: 2026-04-16T01:49:47.729Z
+Stopped at: Completed 07-01-PLAN.md
 Resume file: None
