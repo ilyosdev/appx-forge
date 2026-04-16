@@ -41,6 +41,7 @@ type Server struct {
 	agentStore               AgentStore
 	agentLifecycle           AgentLifecycle
 	filePushStore            FilePushStore
+	metricsStore             MetricsStore
 	heartbeatIntervalSeconds int
 }
 
@@ -83,6 +84,11 @@ func (s *Server) SetAgentDeps(as AgentStore, al AgentLifecycle) {
 // SetFilePushStore injects the file push store dependency after construction.
 func (s *Server) SetFilePushStore(fps FilePushStore) {
 	s.filePushStore = fps
+}
+
+// SetMetricsStore injects the metrics store dependency after construction.
+func (s *Server) SetMetricsStore(ms MetricsStore) {
+	s.metricsStore = ms
 }
 
 // ServeHTTP delegates to the chi router.

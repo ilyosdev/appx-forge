@@ -21,6 +21,7 @@ func (s *Server) RegisterRoutes() {
 
 	// Public routes (no auth required)
 	r.Get("/v1/healthz", s.handleHealthz)
+	r.Get("/v1/metrics", s.handleMetrics)
 	r.Post("/v1/nodes/register", s.handleRegisterNode)
 
 	// Authenticated routes
