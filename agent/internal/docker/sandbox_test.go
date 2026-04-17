@@ -319,12 +319,16 @@ func TestCreateContainerBindMount(t *testing.T) {
 		t.Fatal("HostConfig is nil")
 	}
 
-	expectedBind := filepath.Join(spec.SandboxDir, "my-cool-app", "code") + ":/app/code"
-	if len(hc.Binds) != 1 {
-		t.Fatalf("Binds has %d entries, want 1: %v", len(hc.Binds), hc.Binds)
+	expectedCodeBind := filepath.Join(spec.SandboxDir, "my-cool-app", "code") + ":/app/code"
+	expectedCacheBind := "/mnt/metro-cache:/mnt/metro-cache"
+	if len(hc.Binds) != 2 {
+		t.Fatalf("Binds has %d entries, want 2: %v", len(hc.Binds), hc.Binds)
 	}
-	if hc.Binds[0] != expectedBind {
-		t.Errorf("Bind = %q, want %q", hc.Binds[0], expectedBind)
+	if hc.Binds[0] != expectedCodeBind {
+		t.Errorf("Binds[0] = %q, want %q", hc.Binds[0], expectedCodeBind)
+	}
+	if hc.Binds[1] != expectedCacheBind {
+		t.Errorf("Binds[1] = %q, want %q", hc.Binds[1], expectedCacheBind)
 	}
 }
 

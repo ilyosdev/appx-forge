@@ -62,6 +62,11 @@ var ValidTransitions = map[SandboxState]map[SandboxEvent]SandboxState{
 	StateFailed: {
 		EventRestartAttempt: StateStarting,
 		EventDestroyRequest: StateDestroyed,
+		// Restart recovery: a start_sandbox ack can arrive while a stale
+		// container_exited event has already flipped us to failed. Accepting
+		// this transition closes the OOM-restart race where the new
+		// container is healthy but the DB says failed.
+		EventStarted: StateRunning,
 	},
 }
 

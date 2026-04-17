@@ -101,6 +101,7 @@ func TestValidTransitionsAccepted(t *testing.T) {
 		{StateRunning, EventIdleTimeout, StateStopped},
 		{StateRunning, EventNodeFailed, StatePending},
 		{StateFailed, EventRestartAttempt, StateStarting},
+		{StateFailed, EventStarted, StateRunning}, // restart recovery ack race
 		{StateRestarting, EventRestartAttempt, StateStarting},
 		{StateStopped, EventScheduled, StateStarting},
 	}

@@ -332,8 +332,15 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 
 		// Persist container_id and host_port from agent ack result.
 		// The agent sends these in the start_sandbox success ack payload.
+		// Re-fetch the sandbox row afterwards so downstream notifications
+		// (route upsert) see the updated host_port. Without this, restarts
+		// push the STALE pre-restart port into Caddy and drift -- which only
+		// compares app_names -- never heals it.
 		if event == models.EventStarted {
 			ls.persistRuntimeInfo(ctx, pgSandboxID, sandboxID, ackResult)
+			if refreshed, err := ls.store.GetSandbox(ctx, pgSandboxID); err == nil {
+				sandbox = refreshed
+			}
 		}
 
 		// Record event

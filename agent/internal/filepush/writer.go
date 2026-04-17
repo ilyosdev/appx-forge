@@ -143,8 +143,19 @@ func WriteTar(codeDir string, r io.Reader) (WriteResult, error) {
 	return result, nil
 }
 
-// isValidPath returns false for paths that could escape the code directory:
-// paths containing ".." components or starting with "/".
+// protectedFiles are paths the control plane / SDK may never write.
+// Metro config is baked into the sandbox image and enforced at container start;
+// allowing a push to overwrite it would silently undo B3 memory tuning
+// (see .planning/phases/19-shared-bundler/19-B3-SPEC.md, section B3-3).
+var protectedFiles = map[string]struct{}{
+	"metro.config.js":  {},
+	"metro.config.ts":  {},
+	"metro.config.cjs": {},
+	"metro.config.mjs": {},
+}
+
+// isValidPath returns false for paths that could escape the code directory
+// (containing ".." or starting with "/") or that target a protected file.
 func isValidPath(p string) bool {
 	if p == "" {
 		return false
@@ -152,11 +163,14 @@ func isValidPath(p string) bool {
 	if filepath.IsAbs(p) {
 		return false
 	}
-	// Check for ".." in any path component
-	for _, part := range strings.Split(filepath.ToSlash(p), "/") {
+	clean := filepath.ToSlash(filepath.Clean(p))
+	for _, part := range strings.Split(clean, "/") {
 		if part == ".." {
 			return false
 		}
+	}
+	if _, blocked := protectedFiles[clean]; blocked {
+		return false
 	}
 	return true
 }

@@ -59,7 +59,13 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 				HostPort: strconv.Itoa(spec.HostPort),
 			}},
 		},
-		Binds: []string{codePath + ":/app/code"},
+		Binds: []string{
+			codePath + ":/app/code",
+			// Shared Metro transform cache — dedups framework-file transforms
+			// across every sandbox on the host. Created by Server 2 host setup
+			// (see phase 19-B3-SPEC.md, section B3-4).
+			"/mnt/metro-cache:/mnt/metro-cache",
+		},
 		Resources: container.Resources{
 			Memory:   spec.MemoryMB * 1024 * 1024,
 			NanoCPUs: int64(spec.CPUCores * 1e9),
@@ -76,6 +82,11 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 
 	// 5. Create container with forge-{appName} naming convention.
 	containerName := "forge-" + spec.AppName
+
+	// Remove any pre-existing container with the same name (idempotent restart).
+	// Docker container names are unique per host; a previous crashed container
+	// would block re-creation. Best-effort: ignore "not found" errors.
+	_, _ = d.raw().ContainerRemove(ctx, containerName, dockerclient.ContainerRemoveOptions{Force: true})
 
 	result, err := d.raw().ContainerCreate(ctx, dockerclient.ContainerCreateOptions{
 		Config:     cfg,

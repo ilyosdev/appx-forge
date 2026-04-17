@@ -156,6 +156,29 @@ func TestWriteFiles_ReportsPartialFailures(t *testing.T) {
 	}
 }
 
+func TestWriteFiles_RejectsMetroConfigOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	cases := []string{
+		"metro.config.js",
+		"metro.config.ts",
+		"metro.config.cjs",
+		"metro.config.mjs",
+		"./metro.config.js", // filepath.Clean normalises to metro.config.js
+	}
+
+	for _, path := range cases {
+		files := []FileEntry{{Path: path, Content: b64("module.exports = {}"), Delete: false}}
+		result := WriteFiles(dir, files)
+
+		if len(result.Written) != 0 {
+			t.Errorf("path %q: expected no writes, got Written=%v", path, result.Written)
+		}
+		if len(result.Failed) != 1 {
+			t.Errorf("path %q: expected 1 failed, got %v", path, result.Failed)
+		}
+	}
+}
+
 func TestWriteFiles_EmptyFilesArray(t *testing.T) {
 	dir := t.TempDir()
 
