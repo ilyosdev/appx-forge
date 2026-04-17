@@ -469,6 +469,10 @@ func (a *storeAdapter) CreateSandbox(ctx context.Context, arg store.CreateSandbo
 	return a.q.CreateSandbox(ctx, arg)
 }
 
+func (a *storeAdapter) DeleteSandbox(ctx context.Context, id pgtype.UUID) error {
+	return a.q.DeleteSandbox(ctx, id)
+}
+
 func (a *storeAdapter) ListHealthyNodes(ctx context.Context) ([]store.Node, error) {
 	return a.q.ListHealthyNodes(ctx)
 }

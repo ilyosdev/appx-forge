@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/appx/forge/control/internal/scheduler"
@@ -39,6 +40,7 @@ var (
 // Store abstracts the database operations needed by the lifecycle service.
 type Store interface {
 	CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
+	DeleteSandbox(ctx context.Context, id pgtype.UUID) error
 	GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
 	GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error)
 	GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error)
@@ -152,6 +154,29 @@ func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest
 	idleTimeout := req.IdleTimeoutSeconds
 	if idleTimeout == 0 {
 		idleTimeout = 1800
+	}
+
+	// Soft-recycle: if a prior row exists for this app_name and is in a terminal-ish
+	// state (destroyed or failed), delete it so the unique constraint lets us recreate.
+	// Active states (pending/starting/running/restarting/stopped/destroying) still return
+	// ErrConflict — the caller must destroy first if they really want to replace a live sandbox.
+	if existing, lookupErr := ls.store.GetSandboxByAppName(ctx, req.AppName); lookupErr == nil {
+		state := models.SandboxState(existing.State)
+		if state == models.StateDestroyed || state == models.StateFailed {
+			if derr := ls.store.DeleteSandbox(ctx, existing.ID); derr != nil {
+				return nil, fmt.Errorf("recycle destroyed sandbox: %w", derr)
+			}
+			ls.logger.Info("recycled prior sandbox row",
+				"app_name", req.AppName,
+				"prior_state", existing.State,
+				"prior_id", uuid.UUID(existing.ID.Bytes).String(),
+			)
+		} else {
+			return nil, ErrConflict
+		}
+	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
+		// Unknown lookup error — surface it, do NOT silently proceed.
+		return nil, fmt.Errorf("lookup existing sandbox: %w", lookupErr)
 	}
 
 	// Create PENDING sandbox row

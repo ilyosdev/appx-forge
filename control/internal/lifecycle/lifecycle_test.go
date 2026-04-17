@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/appx/forge/control/internal/store"
@@ -17,6 +18,7 @@ import (
 
 type mockStore struct {
 	createSandboxFn         func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
+	deleteSandboxFn         func(ctx context.Context, id pgtype.UUID) error
 	getSandboxFn            func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
 	getSandboxByAppNameFn   func(ctx context.Context, appName string) (store.Sandbox, error)
 	listHealthyNodesFn      func(ctx context.Context) ([]store.Node, error)
@@ -36,6 +38,13 @@ func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxPa
 	return store.Sandbox{ID: arg.ID, AppName: arg.AppName, UserID: arg.UserID, Image: arg.Image, State: "pending"}, nil
 }
 
+func (m *mockStore) DeleteSandbox(ctx context.Context, id pgtype.UUID) error {
+	if m.deleteSandboxFn != nil {
+		return m.deleteSandboxFn(ctx, id)
+	}
+	return nil
+}
+
 func (m *mockStore) GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
 	if m.getSandboxFn != nil {
 		return m.getSandboxFn(ctx, id)
@@ -47,7 +56,9 @@ func (m *mockStore) GetSandboxByAppName(ctx context.Context, appName string) (st
 	if m.getSandboxByAppNameFn != nil {
 		return m.getSandboxByAppNameFn(ctx, appName)
 	}
-	return store.Sandbox{}, errors.New("not found")
+	// Default: "no prior row" — matches production pgx behavior and lets
+	// CreateSandbox's soft-recycle pre-check proceed to the normal INSERT path.
+	return store.Sandbox{}, pgx.ErrNoRows
 }
 
 func (m *mockStore) ListHealthyNodes(ctx context.Context) ([]store.Node, error) {
@@ -205,9 +216,11 @@ func TestCreateSandbox_HappyPath(t *testing.T) {
 }
 
 func TestCreateSandbox_DuplicateAppName(t *testing.T) {
+	// Primary rejection path: pre-check sees an existing row in an active state (running).
+	existingID := makePgUUID(uuid.New())
 	ms := &mockStore{
-		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
-			return store.Sandbox{}, errors.New("duplicate key value violates unique constraint")
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{ID: existingID, AppName: appName, State: "running"}, nil
 		},
 	}
 
@@ -223,6 +236,277 @@ func TestCreateSandbox_DuplicateAppName(t *testing.T) {
 	}
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("expected ErrConflict, got %v", err)
+	}
+}
+
+func TestCreateSandbox_DuplicateAppName_RaceOnInsert(t *testing.T) {
+	// Fallback path: two concurrent callers pass the pre-check (both see pgx.ErrNoRows),
+	// and one of them loses the race on INSERT. The unique-constraint error path still
+	// maps to ErrConflict.
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			return store.Sandbox{}, errors.New("duplicate key value violates unique constraint")
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "race-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+	})
+
+	if err == nil {
+		t.Fatal("expected error for race-on-insert duplicate")
+	}
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict, got %v", err)
+	}
+}
+
+func TestCreateSandbox_RecyclesDestroyed(t *testing.T) {
+	existingUUID := uuid.New()
+	existingID := makePgUUID(existingUUID)
+	nodeID := uuid.New()
+
+	var deleteCalls int
+	var deleteCalledWith pgtype.UUID
+	var capturedCreate store.CreateSandboxParams
+	var createCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{ID: existingID, AppName: appName, State: "destroyed"}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			deleteCalledWith = id
+			return nil
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createCalls++
+			capturedCreate = arg
+			return store.Sandbox{ID: arg.ID, AppName: arg.AppName, UserID: arg.UserID, State: "pending"}, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{makeNode(nodeID, 24000, 0)}, nil
+		},
+		assignSandboxFn: func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
+			return store.Sandbox{ID: arg.ID, AppName: "recycled-app", State: "starting", NodeID: arg.NodeID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	result, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "recycled-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
+	})
+
+	if err != nil {
+		t.Fatalf("expected recycle to succeed, got error: %v", err)
+	}
+	if errors.Is(err, ErrConflict) {
+		t.Fatal("expected no ErrConflict when prior row is destroyed")
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected DeleteSandbox to be called exactly once, got %d", deleteCalls)
+	}
+	if deleteCalledWith != existingID {
+		t.Fatalf("expected DeleteSandbox called with existing ID %v, got %v", existingID, deleteCalledWith)
+	}
+	if createCalls != 1 {
+		t.Fatalf("expected CreateSandbox to be called exactly once, got %d", createCalls)
+	}
+	if capturedCreate.ID == existingID {
+		t.Fatal("expected CreateSandbox to use a fresh UUID, not the recycled one")
+	}
+	if result == nil || result.AppName != "recycled-app" {
+		t.Fatalf("expected result with app_name 'recycled-app', got %+v", result)
+	}
+}
+
+func TestCreateSandbox_RecyclesFailed(t *testing.T) {
+	existingUUID := uuid.New()
+	existingID := makePgUUID(existingUUID)
+	nodeID := uuid.New()
+
+	var deleteCalls int
+	var createCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{ID: existingID, AppName: appName, State: "failed"}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			if id != existingID {
+				t.Fatalf("expected DeleteSandbox to get existing ID %v, got %v", existingID, id)
+			}
+			return nil
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createCalls++
+			return store.Sandbox{ID: arg.ID, AppName: arg.AppName, State: "pending"}, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{makeNode(nodeID, 24000, 0)}, nil
+		},
+		assignSandboxFn: func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
+			return store.Sandbox{ID: arg.ID, AppName: "failed-app", State: "starting", NodeID: arg.NodeID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "failed-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
+	})
+
+	if err != nil {
+		t.Fatalf("expected recycle of failed row to succeed, got error: %v", err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected DeleteSandbox to be called exactly once, got %d", deleteCalls)
+	}
+	if createCalls != 1 {
+		t.Fatalf("expected CreateSandbox to be called exactly once, got %d", createCalls)
+	}
+}
+
+func TestCreateSandbox_RejectsActiveDuplicate_Running(t *testing.T) {
+	var deleteCalls int
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{ID: makePgUUID(uuid.New()), AppName: appName, State: "running"}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "running-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+	})
+
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict for active running duplicate, got %v", err)
+	}
+	if deleteCalls != 0 {
+		t.Fatalf("expected DeleteSandbox NOT to be called, got %d calls", deleteCalls)
+	}
+}
+
+func TestCreateSandbox_RejectsActiveDuplicate_Starting(t *testing.T) {
+	var deleteCalls int
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{ID: makePgUUID(uuid.New()), AppName: appName, State: "starting"}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "starting-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+	})
+
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict for active starting duplicate, got %v", err)
+	}
+	if deleteCalls != 0 {
+		t.Fatalf("expected DeleteSandbox NOT to be called, got %d calls", deleteCalls)
+	}
+}
+
+func TestCreateSandbox_NoPriorRow_HappyPath(t *testing.T) {
+	nodeID := uuid.New()
+	var deleteCalls int
+	var createCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			return nil
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createCalls++
+			return store.Sandbox{ID: arg.ID, AppName: arg.AppName, State: "pending"}, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{makeNode(nodeID, 24000, 0)}, nil
+		},
+		assignSandboxFn: func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
+			return store.Sandbox{ID: arg.ID, AppName: "fresh-app", State: "starting", NodeID: arg.NodeID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "fresh-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
+	})
+
+	if err != nil {
+		t.Fatalf("expected happy path to succeed, got error: %v", err)
+	}
+	if deleteCalls != 0 {
+		t.Fatalf("expected DeleteSandbox NOT to be called when no prior row, got %d calls", deleteCalls)
+	}
+	if createCalls != 1 {
+		t.Fatalf("expected CreateSandbox to be called exactly once, got %d", createCalls)
+	}
+}
+
+func TestCreateSandbox_DeleteFails_ReturnsError(t *testing.T) {
+	existingID := makePgUUID(uuid.New())
+	var createCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{ID: existingID, AppName: appName, State: "destroyed"}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			return errors.New("simulated delete failure")
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createCalls++
+			return store.Sandbox{}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName: "delete-fail-app",
+		UserID:  "user-123",
+		Image:   "appx/sandbox:v1",
+	})
+
+	if err == nil {
+		t.Fatal("expected error when DeleteSandbox fails")
+	}
+	if createCalls != 0 {
+		t.Fatalf("expected CreateSandbox NOT to be called when delete fails (fail fast), got %d calls", createCalls)
 	}
 }
 

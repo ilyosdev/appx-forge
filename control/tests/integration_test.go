@@ -156,6 +156,10 @@ func (a *integrationAdapter) CreateSandbox(ctx context.Context, arg store.Create
 	return a.q.CreateSandbox(ctx, arg)
 }
 
+func (a *integrationAdapter) DeleteSandbox(ctx context.Context, id pgtype.UUID) error {
+	return a.q.DeleteSandbox(ctx, id)
+}
+
 func (a *integrationAdapter) ListHealthyNodes(ctx context.Context) ([]store.Node, error) {
 	return a.q.ListHealthyNodes(ctx)
 }

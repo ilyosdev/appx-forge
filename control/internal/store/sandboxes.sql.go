@@ -137,6 +137,15 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (S
 	return i, err
 }
 
+const deleteSandbox = `-- name: DeleteSandbox :exec
+DELETE FROM sandboxes WHERE id = $1
+`
+
+func (q *Queries) DeleteSandbox(ctx context.Context, id pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteSandbox, id)
+	return err
+}
+
 const getSandbox = `-- name: GetSandbox :one
 SELECT id, app_name, user_id, node_id, container_id, host_port, image, state, state_version, resources, env, idle_timeout_seconds, created_at, updated_at, last_active_at, failure_count, metadata FROM sandboxes WHERE id = $1
 `

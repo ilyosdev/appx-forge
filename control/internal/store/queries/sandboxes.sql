@@ -65,3 +65,6 @@ WHERE id = $3;
 
 -- name: ListRunningSandboxesByNode :many
 SELECT * FROM sandboxes WHERE node_id = $1 AND state = 'running' ORDER BY created_at ASC;
+
+-- name: DeleteSandbox :exec
+DELETE FROM sandboxes WHERE id = $1;
