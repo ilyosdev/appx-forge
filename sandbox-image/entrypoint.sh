@@ -1,9 +1,21 @@
 #!/bin/bash
 set -e
 
-# Seed template files into bind-mounted /app/code (preserves agent-written files).
-# -n: never overwrite existing files -- agent-written code takes precedence.
+# Seed template files into bind-mounted /app/code.
+# Two-phase seed:
+#   1. -n (no-overwrite) copies USER-OWNED files if absent. Agent-written
+#      code in subdirectories (app/, components/, ...) is preserved.
+#   2. Framework files (entry.js, app.json, babel.config.js, package.json,
+#      tsconfig.json) are FORCE-refreshed on every container start. These
+#      are infrastructure, not user code — when we ship a new sandbox image
+#      (e.g. switching entry.js to expo-router/entry), existing sandboxes'
+#      bind mounts must pick up the change without requiring a wipe.
 cp -rn /opt/template/. /app/code/ 2>/dev/null || true
+for f in entry.js app.json babel.config.js package.json tsconfig.json; do
+  if [ -f "/opt/template/$f" ]; then
+    cp -f "/opt/template/$f" "/app/code/$f"
+  fi
+done
 
 # Symlink shared node_modules once (idempotent).
 if [ ! -e /app/code/node_modules ]; then

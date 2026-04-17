@@ -1,0 +1,19 @@
+{
+  "expo": {
+    "name": "Appx Sandbox",
+    "slug": "appx-sandbox",
+    "scheme": "appxsandbox",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "ios": { "supportsTablet": true },
+    "android": { "edgeToEdge": true },
+    "web": { "bundler": "metro", "output": "single" },
+    "plugins": [
+      "expo-router",
+      "expo-font",
+      "expo-splash-screen"
+    ],
+    "experiments": { "typedRoutes": true }
+  }
+}
