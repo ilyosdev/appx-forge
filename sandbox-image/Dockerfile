@@ -1,5 +1,12 @@
-# Forge Sandbox Image v4 (B3 — memory-tuned Metro).
-# See .planning/phases/19-shared-bundler/19-B3-SPEC.md for rationale.
+# Forge Sandbox Image v5 (B3 + semver hoisting fix).
+# See .planning/phases/19-shared-bundler/19-B3-SPEC.md for B3 rationale.
+#
+# v5 fix: react-native-reanimated@4's validate-worklets-version.js requires
+# `semver/functions/*` (v7 API). npm hoisted semver@6 to top-level (v6 has no
+# functions/ subfolder). Metro config disables hierarchical node_modules lookup
+# for haste-map footprint, so the nested semver@7 inside reanimated wasn't
+# reachable. Pinning `semver ^7.7.2` as a direct dep in app/package.json forces
+# npm to hoist v7 — nested v6 gets pushed down for any stray v6-only consumer.
 FROM node:22-slim
 
 RUN apt-get update && \
