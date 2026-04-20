@@ -36,4 +36,33 @@ chmod 444 /app/code/metro.config.js
 # Layer 3 lives in forge-agent: http/writer.go rejects file-push writes to
 # metro.config.*. See appx-forge/agent/internal/http/writer.go.
 
+# Teach Metro what public URL it's served under. Caddy fronts every sandbox
+# on {appName}.{domain}:443 — without these env vars, Expo's CLI bakes
+# ${metroHost}:8081 into the manifest's launchAsset.url and Expo Go then
+# returns "Could not connect to development server" on scan because only
+# 443 is exposed publicly.
+#
+# Precedence:
+#   1. An explicitly-injected EXPO_PACKAGER_PROXY_URL wins (API can override).
+#   2. Otherwise derive from APP_NAME (set by the API in forge.service.ts).
+#   3. As a last resort, parse the container name `forge-${appName}` from
+#      /etc/hostname — docker uses the container name here by default.
+FORGE_DOMAIN="${FORGE_DOMAIN:-myappx.live}"
+if [ -z "$APP_NAME" ] && [ -r /etc/hostname ]; then
+  CN=$(cat /etc/hostname)
+  if [ "${CN#forge-}" != "$CN" ]; then
+    APP_NAME="${CN#forge-}"
+  fi
+fi
+if [ -n "$APP_NAME" ]; then
+  # EXPO_PACKAGER_PROXY_URL tells Expo CLI what URL to stamp into the
+  # manifest's launchAsset.url. We deliberately DO NOT set
+  # REACT_NATIVE_PACKAGER_HOSTNAME — it doubles as an override for where Metro
+  # tries to bind/connect, and setting it to a public hostname sends Metro
+  # into a "waiting on http://localhost:8081" stall because it thinks the
+  # packager is remote.
+  export EXPO_PACKAGER_PROXY_URL="${EXPO_PACKAGER_PROXY_URL:-https://${APP_NAME}.${FORGE_DOMAIN}}"
+  echo "[entrypoint] EXPO_PACKAGER_PROXY_URL=${EXPO_PACKAGER_PROXY_URL}"
+fi
+
 exec "$@"
