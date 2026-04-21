@@ -17,8 +17,8 @@ const config = getDefaultConfig(projectRoot);
 // Bundle wall-clock regresses 30-50% -- acceptable for dev preview.
 config.maxWorkers = 1;
 
-// Native-only. Expo Go never requests web bundles.
-config.resolver.platforms = ['ios', 'android', 'native'];
+// ios/android/native for Expo Go; web for browser iframe preview.
+config.resolver.platforms = ['ios', 'android', 'native', 'web'];
 
 // Shrink file-map / haste-map footprint.
 config.resolver.blockList = [

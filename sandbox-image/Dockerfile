@@ -1,5 +1,10 @@
-# Forge Sandbox Image v5 (B3 + semver hoisting fix).
+# Forge Sandbox Image v8 (inotify watcher fix + web platform support).
 # See .planning/phases/19-shared-bundler/19-B3-SPEC.md for B3 rationale.
+#
+# v8 fix: template had no app/ subdir → Metro never added inotify watcher on
+# app/ → AI-generated files pushed to app/ were invisible. Added app/index.tsx
+# placeholder so Metro registers the watcher on startup. Also added 'web' to
+# metro platforms for browser iframe route discovery.
 #
 # v5 fix: react-native-reanimated@4's validate-worklets-version.js requires
 # `semver/functions/*` (v7 API). npm hoisted semver@6 to top-level (v6 has no
