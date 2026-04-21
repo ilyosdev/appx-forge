@@ -35,6 +35,9 @@ RUN cd /opt/expo-shared-deps && \
 # Layer 2: template (readonly source seed). Entrypoint copies into /app/code
 # with -n so user-written files are preserved across restarts.
 COPY app/ /opt/template/
+# Remove macOS AppleDouble metadata files (._*) — these crash Metro's TypeScript
+# parser when they land in app/ alongside real .tsx files.
+RUN find /opt/template -name '._*' -delete 2>/dev/null || true
 
 # Layer 3: baked Metro config. Entrypoint enforces it into /app/code/ as 444.
 COPY metro-base-config.js /opt/metro-base-config.js
