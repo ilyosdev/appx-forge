@@ -1,24 +1,8 @@
-import { View, Text, StyleSheet } from 'react-native';
+import { Redirect } from 'expo-router';
 
-// Placeholder so Metro registers an inotify watcher on app/ at startup.
-// Overwritten by AI-generated code on first generation — never shown to users.
+// Seed file — exists so Metro registers an inotify watcher on app/ at startup.
+// For tab-based apps (the most common AI-generated layout): redirects to (tabs).
+// For apps that generate their own app/index.tsx: overwritten during code push.
 export default function Index() {
-  return (
-    <View style={styles.container}>
-      <Text style={styles.text}>Loading...</Text>
-    </View>
-  );
+  return <Redirect href="/(tabs)" />;
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: '#000',
-  },
-  text: {
-    color: '#fff',
-    fontSize: 16,
-  },
-});
