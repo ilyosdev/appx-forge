@@ -41,6 +41,7 @@ func (s *Server) RegisterRoutes() {
 				r.Get("/sandboxes/{id}", s.handleGetSandbox)
 				r.Delete("/sandboxes/{id}", s.handleDestroySandbox)
 				r.Post("/sandboxes/{id}/restart", s.handleRestartSandbox)
+				r.Post("/sandboxes/{id}/wake", s.handleWakeSandbox)
 				r.Post("/sandboxes/{id}/files", s.handleFilePush)
 				r.Get("/sandboxes/{id}/logs", s.handleGetLogs)
 

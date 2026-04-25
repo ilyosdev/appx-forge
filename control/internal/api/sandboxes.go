@@ -28,6 +28,7 @@ type SandboxLifecycle interface {
 	CreateSandbox(ctx context.Context, req lifecycle.CreateRequest) (*lifecycle.SandboxResult, error)
 	DestroySandbox(ctx context.Context, id uuid.UUID) error
 	RestartSandbox(ctx context.Context, id uuid.UUID) error
+	WakeSandbox(ctx context.Context, id uuid.UUID) error
 }
 
 // SandboxReader abstracts the read-only store operations for sandbox handlers.
@@ -309,6 +310,39 @@ func (s *Server) handleRestartSandbox(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("restart sandbox failed", "error", err, "sandbox_id", idStr)
 		WriteProblem(w, http.StatusInternalServerError,
 			"urn:forge:error:internal", "Internal Server Error", "failed to restart sandbox")
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleWakeSandbox handles POST /v1/sandboxes/{id}/wake.
+// Re-starts a stopped (idle-reaped) sandbox without creating a new one.
+func (s *Server) handleWakeSandbox(w http.ResponseWriter, r *http.Request) {
+	if s.lifecycle == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	if err := s.lifecycle.WakeSandbox(r.Context(), id); err != nil {
+		if errors.Is(err, lifecycle.ErrNotFound) {
+			NotFound(w, "sandbox not found")
+			return
+		}
+		if errors.Is(err, lifecycle.ErrInvalidState) {
+			WriteProblem(w, http.StatusConflict, "urn:forge:error:conflict", "Conflict", err.Error())
+			return
+		}
+		s.logger.Error("wake sandbox failed", "error", err, "sandbox_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to wake sandbox")
 		return
 	}
 

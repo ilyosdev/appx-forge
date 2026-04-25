@@ -309,7 +309,15 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	case cmdType == string(models.CmdStartSandbox) && status == "failure":
 		event = models.EventStartFailed
 	case cmdType == string(models.CmdStopSandbox) && status == "success":
-		event = models.EventDestroyed
+		// Idle-reaper already transitioned running→stopped before dispatching the
+		// stop command. When the ack arrives the sandbox is in StateStopped, not
+		// StateDestroying, so EventDestroyed is invalid. Only use EventDestroyed
+		// for the explicit destroy flow (sandbox is StateDestroying).
+		if models.SandboxState(sandbox.State) == models.StateDestroying {
+			event = models.EventDestroyed
+		} else {
+			needsTransition = false
+		}
 	case cmdType == string(models.CmdRestartSandbox) && status == "success":
 		// Restart success: no state change, container restarted at Docker level
 		needsTransition = false
@@ -574,6 +582,82 @@ func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.U
 		ls.logger.Warn("failed to record destroy event", "error", err, "sandbox_id", sandboxID)
 	}
 
+	return nil
+}
+
+// ── WakeSandbox ──────────────────────────────────────────────────────
+
+// WakeSandbox re-starts a stopped sandbox by firing EventScheduled and
+// dispatching a new start_sandbox command. Only valid from StateStopped.
+func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	if sandbox.State != string(models.StateStopped) {
+		return fmt.Errorf("%w: sandbox must be stopped to wake, current state: %s", ErrInvalidState, sandbox.State)
+	}
+
+	// Transition stopped → starting via EventScheduled
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(models.StateStarting),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Decode resources and env to re-issue the start command
+	var resources Resources
+	if len(sandbox.Resources) > 0 {
+		_ = json.Unmarshal(sandbox.Resources, &resources)
+	}
+	var env map[string]string
+	if len(sandbox.Env) > 0 {
+		_ = json.Unmarshal(sandbox.Env, &env)
+	}
+
+	cmdPayload, err := json.Marshal(map[string]interface{}{
+		"app_name":  sandbox.AppName,
+		"image":     sandbox.Image,
+		"resources": resources,
+		"env":       env,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal command payload: %w", err)
+	}
+
+	cmdID := uuid.New()
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sandbox.NodeID,
+		SandboxID:      pgSandboxID,
+		CommandType:    string(models.CmdStartSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return fmt.Errorf("create start command: %w", err)
+	}
+
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: string(models.EventScheduled),
+		Actor:     "control-plane-wake",
+		PrevState: pgtype.Text{String: string(models.StateStopped), Valid: true},
+		NextState: pgtype.Text{String: string(models.StateStarting), Valid: true},
+		Payload:   cmdPayload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record wake event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	ls.logger.Info("waking stopped sandbox", "sandbox_id", sandboxID, "app_name", sandbox.AppName)
 	return nil
 }
 
