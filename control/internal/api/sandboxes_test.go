@@ -46,6 +46,12 @@ func (m *mockLifecycle) RestartSandbox(ctx context.Context, id uuid.UUID) error 
 	return nil
 }
 
+// WakeSandbox satisfies the SandboxLifecycle interface (added in b90f6a6).
+// Stub returns nil — no Phase 30 test exercises wake semantics.
+func (m *mockLifecycle) WakeSandbox(ctx context.Context, id uuid.UUID) error {
+	return nil
+}
+
 // ── Mock Sandbox Reader ─────────────────────────────────────────────
 
 type mockSandboxReader struct {
