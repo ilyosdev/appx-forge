@@ -15,9 +15,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/appx/forge/control/internal/api"
 	"github.com/appx/forge/control/internal/lifecycle"
+	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
 	"github.com/appx/forge/control/tests/testhelpers"
 )
@@ -192,13 +194,84 @@ func (a *integrationAdapter) GetNodeByID(ctx context.Context, id pgtype.UUID) (s
 	return a.q.GetNode(ctx, id)
 }
 
+// ── scheduler.SandboxStore (Phase 30 reconciler) ───────────────────────
+//
+// Mirrors main.go's reconcilerStoreAdapter so the integration server gets
+// the same wiring path the production binary uses. Lets T21+ heartbeat
+// reconcile tests exercise the real bump/agent-lost code paths against
+// real Postgres rather than a fake store.
+
+func (a *integrationAdapter) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]scheduler.SandboxRow, error) {
+	rows, err := a.q.ListSandboxesForNode(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]scheduler.SandboxRow, len(rows))
+	for i, r := range rows {
+		out[i] = scheduler.SandboxRow{
+			AppName:   r.AppName,
+			State:     r.State,
+			CreatedAt: r.CreatedAt.Time,
+		}
+	}
+	return out, nil
+}
+
+func (a *integrationAdapter) MarkSandboxVerified(ctx context.Context, appName, state string) error {
+	return a.q.MarkSandboxVerified(ctx, store.MarkSandboxVerifiedParams{
+		AppName: appName,
+		State:   state,
+	})
+}
+
+func (a *integrationAdapter) MarkSandboxAgentLost(ctx context.Context, appName string, nodeID pgtype.UUID) error {
+	return a.q.MarkSandboxAgentLost(ctx, store.MarkSandboxAgentLostParams{
+		AppName: appName,
+		NodeID:  nodeID,
+	})
+}
+
+// reconcilerAPIAdapter satisfies api.Reconciler by translating
+// api.ContainerInfo → scheduler.ContainerInfo. Identical pattern to
+// main.go's reconcilerAdapter; redeclared here because the production
+// adapter is a private type in cmd/forge-control.
+type reconcilerAPIAdapter struct {
+	r *scheduler.HeartbeatReconciler
+}
+
+func (a *reconcilerAPIAdapter) Reconcile(ctx context.Context, nodeID pgtype.UUID, containers []api.ContainerInfo) error {
+	out := make([]scheduler.ContainerInfo, len(containers))
+	for i, c := range containers {
+		out[i] = scheduler.ContainerInfo{
+			AppName:     c.AppName,
+			State:       c.State,
+			HostPort:    c.HostPort,
+			ContainerID: c.ContainerID,
+		}
+	}
+	return a.r.Reconcile(ctx, nodeID, out)
+}
+
 // ── Setup helper ───────────────────────────────────────────────────────
 
 const testToken = "integration-test-token"
 
 // setupIntegrationServer creates a fully wired api.Server backed by a real
-// Postgres container. Returns the httptest server URL and a cleanup function.
+// Postgres container. Returns the httptest server URL and the queries handle.
+//
+// Tests that need raw SQL (e.g. seeding controlled created_at / verified_at
+// timestamps for reconciler tests) should use setupIntegrationServerWithPool
+// below instead.
 func setupIntegrationServer(t *testing.T) (string, *store.Queries) {
+	url, queries, _ := setupIntegrationServerWithPool(t)
+	return url, queries
+}
+
+// setupIntegrationServerWithPool is identical to setupIntegrationServer but
+// also returns the underlying pgxpool so callers can issue raw SQL. Phase 30
+// reconciler integration tests need this for fixture timestamps that the
+// sqlc API can't set directly.
+func setupIntegrationServerWithPool(t *testing.T) (string, *store.Queries, *pgxpool.Pool) {
 	t.Helper()
 
 	connStr, ctr := testhelpers.SetupTestDB(t)
@@ -225,10 +298,17 @@ func setupIntegrationServer(t *testing.T) (string, *store.Queries) {
 	)
 	srv.SetAgentDeps(adapter, lc)
 
+	// Phase 30 — wire heartbeat reconciler. Backwards compat for legacy
+	// (non-rich) heartbeats: handler still 200s when req.Containers is
+	// nil; the reconciler is only invoked on rich heartbeats. Existing
+	// integration tests that send legacy heartbeats are unaffected.
+	heartbeatReconciler := scheduler.NewHeartbeatReconciler(adapter, discardLogger())
+	srv.SetReconciler(&reconcilerAPIAdapter{r: heartbeatReconciler})
+
 	ts := httptest.NewServer(srv)
 	t.Cleanup(ts.Close)
 
-	return ts.URL, queries
+	return ts.URL, queries, pool
 }
 
 // ── Integration Tests ──────────────────────────────────────────────────
