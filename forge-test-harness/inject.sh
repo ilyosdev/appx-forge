@@ -46,9 +46,14 @@ partition_agent_from_control() {
   echo "[inject] partition control → agent for ${seconds}s"
   $COMPOSE exec -T control-plane sh -c "iptables -A OUTPUT -d agent -j DROP" || {
     echo "[inject] WARN: iptables not available in control-plane container; falling back to docker network disconnect"
-    docker network disconnect "$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$(${COMPOSE} ps -q agent)" | head -1)" "$(${COMPOSE} ps -q agent)"
+    local agent_id net
+    agent_id=$($COMPOSE ps -q agent)
+    # Need a separator between map keys; default range syntax concatenates
+    # them. `println` emits one network name per line so head -1 works.
+    net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' "$agent_id" | head -n1)
+    docker network disconnect "$net" "$agent_id"
     sleep "$seconds"
-    docker network connect "$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$(${COMPOSE} ps -q agent)" | head -1)" "$(${COMPOSE} ps -q agent)"
+    docker network connect "$net" "$agent_id"
     return 0
   }
   sleep "$seconds"
