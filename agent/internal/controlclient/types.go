@@ -26,9 +26,29 @@ type RegisterResponse struct {
 }
 
 // HeartbeatRequest is sent to POST /v1/nodes/{id}/heartbeat.
+//
+// Phase 30 — gains Containers (full list, not just count) so the control
+// plane can reconcile its DB against agent truth on every tick. The legacy
+// RunningContainers count is kept for transition (older control planes that
+// don't read Containers still get the count they expect).
 type HeartbeatRequest struct {
-	UsedMB            int `json:"used_mb"`
-	RunningContainers int `json:"running_containers"`
+	UsedMB            int             `json:"used_mb"`
+	RunningContainers int             `json:"running_containers"`
+	Containers        []ContainerInfo `json:"containers"`
+}
+
+// ContainerInfo is the protocol-side representation of a single container
+// reported by the agent in its heartbeat.
+//
+// This mirrors agent/internal/docker.ContainerSnapshot field-for-field. The
+// duplication is intentional — keeping the controlclient package free of a
+// docker dependency means the protocol types stay light and the dependency
+// graph stays tidy. Conversion happens in HeartbeatSender.
+type ContainerInfo struct {
+	AppName     string `json:"app_name"`
+	State       string `json:"state"`
+	HostPort    int    `json:"host_port"`
+	ContainerID string `json:"container_id"`
 }
 
 // Command represents a command received from the control plane via long-poll.

@@ -67,9 +67,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 	// 5. Events watcher
 	watcher := events.NewWatcher(dockerClient, logger)
 
-	// 6. Heartbeat sender with a simple resource collector
+	// 6. Heartbeat sender with a simple resource collector + Phase 30 snapshotter
 	collector := &dockerResourceCollector{docker: dockerClient, logger: logger}
-	heartbeatSender := health.NewHeartbeatSender(ctrlClient, collector, 15*time.Second, logger)
+	snapshotter := docker.NewSnapshotter(dockerClient)
+	heartbeatSender := health.NewHeartbeatSender(ctrlClient, collector, snapshotter, 15*time.Second, logger)
 
 	// 7. Image puller
 	puller := docker.NewImagePuller(dockerClient, cfg.SandboxImage, logger)

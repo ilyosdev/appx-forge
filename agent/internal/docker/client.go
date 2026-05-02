@@ -48,6 +48,11 @@ type Client interface {
 	// Events are filtered to container-type events starting from the given time.
 	EventsStream(ctx context.Context, since time.Time) (<-chan ContainerEvent, <-chan error)
 
+	// ListContainers returns all Forge-managed containers (running + stopped)
+	// as ContainerSnapshot entries. Phase 30 — used by Snapshotter to feed
+	// the heartbeat protocol's container list.
+	ListContainers(ctx context.Context) ([]ContainerSnapshot, error)
+
 	// Close releases the underlying Docker client resources.
 	Close() error
 }
