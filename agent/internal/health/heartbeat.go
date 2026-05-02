@@ -82,17 +82,20 @@ func (h *HeartbeatSender) Start(ctx context.Context) {
 }
 
 // sendHeartbeat collects resources, snapshots containers, and sends a single
-// heartbeat. Snapshot failure is non-fatal — the heartbeat still goes out
-// with an empty container list and a warn log so the control plane sees
-// liveness even when Docker is misbehaving.
+// heartbeat. On snapshot failure, the heartbeat is SKIPPED entirely rather
+// than sent with an empty container list. Sending an empty list would, over
+// a multi-tick failure (>60s), trip T7 reconciler's grace window and cause
+// it to mass-mark every Forge sandbox as 'agent_lost' — trading correctness
+// for liveness. Skipping ticks lets the control plane's existing
+// missed-heartbeat alarm surface the real signal: this node is in trouble.
 func (h *HeartbeatSender) sendHeartbeat(ctx context.Context) {
-	usedMB, runningContainers := h.collector.Collect()
-
 	snapshots, err := h.snapshotter.Snapshot(ctx)
 	if err != nil {
-		h.logger.Warn("heartbeat snapshot failed; sending without container list", "error", err)
-		snapshots = []docker.ContainerSnapshot{}
+		h.logger.Warn("heartbeat snapshot failed; SKIPPING this tick to avoid sending an empty list (would trip T7 reconciler's mass-destroy grace window if Docker stays down)", "error", err)
+		return
 	}
+
+	usedMB, runningContainers := h.collector.Collect()
 
 	containers := make([]controlclient.ContainerInfo, 0, len(snapshots))
 	for _, s := range snapshots {

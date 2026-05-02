@@ -302,9 +302,12 @@ func TestHeartbeatSender_IncludesContainerList(t *testing.T) {
 	}
 }
 
-// Phase 30 T4 — snapshot failure does not stop the heartbeat; container list
-// degrades to empty but the heartbeat still goes out.
-func TestHeartbeatSender_SnapshotErrorDegradesGracefully(t *testing.T) {
+// Phase 30 T4 — snapshot failure SKIPS the tick instead of sending an empty
+// container list. Sending an empty list would, over a multi-tick failure
+// (>60s), trip T7 reconciler's grace window and mass-mark every Forge
+// sandbox as 'agent_lost'. Skipping ticks lets the control plane's existing
+// missed-heartbeat alarm surface the real signal: this node is in trouble.
+func TestHeartbeatSender_SnapshotErrorSkipsTickInsteadOfSendingEmptyList(t *testing.T) {
 	client := &mockHeartbeatClient{}
 	collector := &mockCollector{usedMB: 100, runningContainers: 0}
 	snapshotter := &mockSnapshotter{err: errors.New("docker daemon unreachable")}
@@ -316,18 +319,20 @@ func TestHeartbeatSender_SnapshotErrorDegradesGracefully(t *testing.T) {
 
 	go sender.Start(ctx)
 
-	time.Sleep(40 * time.Millisecond)
+	// Wait several tick intervals; assert NO heartbeat was sent.
+	time.Sleep(60 * time.Millisecond)
 	cancel()
 	time.Sleep(10 * time.Millisecond)
 
 	calls := client.getCalls()
-	if len(calls) == 0 {
-		t.Fatal("expected heartbeat to fire even when snapshot fails")
+	if len(calls) != 0 {
+		t.Fatalf("heartbeat should NOT be sent on snapshot failure, but got %d calls (first: %+v)", len(calls), calls[0])
 	}
-	if calls[0].Containers == nil {
-		t.Error("Containers must be empty slice (not nil) on snapshot error — JSON would be 'null' otherwise")
-	}
-	if len(calls[0].Containers) != 0 {
-		t.Errorf("expected empty container list on snapshot error, got %d entries", len(calls[0].Containers))
+
+	// Collector should also NOT be called when snapshot fails (snapshot now
+	// runs first; failure short-circuits the rest of the tick).
+	collectCount := int(collector.collectCalls.Load())
+	if collectCount != 0 {
+		t.Errorf("collector.Collect() should not be called when snapshot fails; got %d calls", collectCount)
 	}
 }

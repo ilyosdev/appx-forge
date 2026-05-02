@@ -47,7 +47,7 @@ func TestNewAgentManual(t *testing.T) {
 	executor := NewCommandExecutor(dc, portAlloc, ctrlClient, cfg.SandboxDir, logger)
 	watcher := events.NewWatcher(dc, logger)
 	collector := &mockCollector{}
-	heartbeatSender := health.NewHeartbeatSender(ctrlClient, collector, 15*time.Second, logger)
+	heartbeatSender := health.NewHeartbeatSender(ctrlClient, collector, &emptySnapshotter{}, 15*time.Second, logger)
 	puller := docker.NewImagePuller(dc, cfg.SandboxImage, logger)
 	filePushHandler := filepush.NewHandler([]byte(cfg.HMACSecret), executor, logger)
 
@@ -143,4 +143,12 @@ type mockCollector struct{}
 
 func (m *mockCollector) Collect() (usedMB int, runningContainers int) {
 	return 0, 0
+}
+
+// emptySnapshotter is a no-op SnapshotProvider for tests that don't exercise
+// the heartbeat container-list path. Returns ([], nil) on every call.
+type emptySnapshotter struct{}
+
+func (*emptySnapshotter) Snapshot(_ context.Context) ([]docker.ContainerSnapshot, error) {
+	return []docker.ContainerSnapshot{}, nil
 }
