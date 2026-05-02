@@ -69,8 +69,35 @@ type registerResponse struct {
 }
 
 type heartbeatRequest struct {
-	UsedMb            int32 `json:"used_mb"`
-	RunningContainers int32 `json:"running_containers"`
+	UsedMb            int32           `json:"used_mb"`
+	RunningContainers int32           `json:"running_containers"` // legacy, kept for transition
+	Containers        []ContainerInfo `json:"containers"`         // Phase 30 — nil/empty for legacy agents
+}
+
+// ContainerInfo is the protocol-side representation of a single container
+// reported by the agent in its rich heartbeat (Phase 30).
+//
+// Mirrors the shape of agent's docker.ContainerSnapshot and
+// controlclient.ContainerInfo. Defined here in the control plane API
+// package to keep it self-contained — no agent module dependency.
+type ContainerInfo struct {
+	AppName     string `json:"app_name"`
+	State       string `json:"state"`
+	HostPort    int    `json:"host_port"`
+	ContainerID string `json:"container_id"`
+}
+
+// Reconciler is the interface handleHeartbeat needs from the heartbeat
+// reconciliation service (Phase 30 T7). Defined here in the consumer
+// package so this file doesn't depend on internal/scheduler.
+//
+// When req.Containers is non-nil AND a Reconciler is wired on the Server,
+// handleHeartbeat calls Reconcile. The reconciler diffs against the DB and
+// bumps verified_at + marks agent_lost rows past the grace window.
+// Errors are LOGGED but not propagated — heartbeat is still acknowledged
+// so the agent's liveness signal is not masked by reconciler failures.
+type Reconciler interface {
+	Reconcile(ctx context.Context, nodeID pgtype.UUID, containers []ContainerInfo) error
 }
 
 // nodeResponse is the API response for a node. It intentionally omits
@@ -254,6 +281,18 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		WriteProblem(w, http.StatusInternalServerError,
 			"urn:forge:error:internal", "Internal Server Error", "failed to update heartbeat")
 		return
+	}
+
+	// Phase 30 — if the agent sent a rich heartbeat (Containers field) AND a
+	// reconciler is wired on the Server, kick off reconciliation. Errors are
+	// logged but don't fail the heartbeat ack; the agent's liveness signal
+	// must not be masked by reconciler problems. Concrete reconciler ships
+	// in T7 (internal/scheduler.HeartbeatReconciler).
+	if req.Containers != nil && s.reconciler != nil {
+		if err := s.reconciler.Reconcile(ctx, nodeID, req.Containers); err != nil {
+			s.logger.Warn("reconcile failed; heartbeat still acknowledged",
+				"err", err, "node_id", idStr)
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -638,4 +639,148 @@ func newTestServerWithNodeStore(ns NodeStore, heartbeatInterval int) *Server {
 	})
 
 	return s
+}
+
+// newTestServerWithNodeStoreAndReconciler is the Phase 30 variant of
+// newTestServerWithNodeStore that also wires a Reconciler. Used by the rich
+// heartbeat tests to assert handleHeartbeat calls Reconcile when Containers
+// is non-nil.
+func newTestServerWithNodeStoreAndReconciler(ns NodeStore, heartbeatInterval int, rc Reconciler) *Server {
+	s := newTestServerWithNodeStore(ns, heartbeatInterval)
+	s.reconciler = rc
+	return s
+}
+
+// --- Phase 30 (rich heartbeat) ---
+
+// fakeReconciler satisfies api.Reconciler for tests. Captures every Reconcile
+// call so assertions can verify the handler dispatched correctly.
+type fakeReconciler struct {
+	calls     []reconcileCall
+	returnErr error
+}
+
+type reconcileCall struct {
+	NodeID     pgtype.UUID
+	Containers []ContainerInfo
+}
+
+func (f *fakeReconciler) Reconcile(ctx context.Context, nodeID pgtype.UUID, containers []ContainerInfo) error {
+	f.calls = append(f.calls, reconcileCall{NodeID: nodeID, Containers: containers})
+	return f.returnErr
+}
+
+func TestHeartbeat_Phase30_AcceptsContainerListAndCallsReconciler(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("heartbeatphase30"))
+
+	store := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{ID: nodeID, Hostname: "node-1"}, nil
+		},
+		updateHeartbeatFn: func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error {
+			return nil
+		},
+	}
+	reconciler := &fakeReconciler{}
+	srv := newTestServerWithNodeStoreAndReconciler(store, 15, reconciler)
+
+	body := `{
+		"used_mb": 1024,
+		"running_containers": 2,
+		"containers": [
+			{"app_name":"pool-X","state":"running","host_port":8081,"container_id":"c1"},
+			{"app_name":"app-Y","state":"running","host_port":8082,"container_id":"c2"}
+		]
+	}`
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/"+nodeIDStr+"/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (body=%s)", w.Code, w.Body.String())
+	}
+	if len(reconciler.calls) != 1 {
+		t.Fatalf("expected 1 reconcile call, got %d", len(reconciler.calls))
+	}
+	got := reconciler.calls[0]
+	if len(got.Containers) != 2 {
+		t.Fatalf("expected 2 containers in reconcile call, got %d", len(got.Containers))
+	}
+	if got.Containers[0].AppName != "pool-X" {
+		t.Errorf("unexpected first AppName: %s", got.Containers[0].AppName)
+	}
+	if got.Containers[0].HostPort != 8081 {
+		t.Errorf("unexpected first HostPort: %d", got.Containers[0].HostPort)
+	}
+	if got.Containers[1].AppName != "app-Y" {
+		t.Errorf("unexpected second AppName: %s", got.Containers[1].AppName)
+	}
+}
+
+func TestHeartbeat_Phase30_LegacyWithoutContainerListStillAcked(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("heartbeatlegacy0"))
+
+	store := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{ID: nodeID, Hostname: "node-1"}, nil
+		},
+		updateHeartbeatFn: func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error {
+			return nil
+		},
+	}
+	reconciler := &fakeReconciler{}
+	srv := newTestServerWithNodeStoreAndReconciler(store, 15, reconciler)
+
+	// Legacy body — no containers field. Must still 200, must NOT call reconciler.
+	body := `{"used_mb":512,"running_containers":1}`
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/"+nodeIDStr+"/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if len(reconciler.calls) != 0 {
+		t.Errorf("legacy heartbeat without containers should not trigger reconcile, got %d calls", len(reconciler.calls))
+	}
+}
+
+func TestHeartbeat_Phase30_ReconcileErrorDoesNotFailHeartbeat(t *testing.T) {
+	nodeID := pgtype.UUID{Valid: true}
+	copy(nodeID.Bytes[:], []byte("heartbeatreconErr"))
+
+	store := &mockNodeStore{
+		getNodeFn: func(ctx context.Context, id pgtype.UUID) (NodeRecord, error) {
+			return NodeRecord{ID: nodeID, Hostname: "node-1"}, nil
+		},
+		updateHeartbeatFn: func(ctx context.Context, id pgtype.UUID, usedMb int32, runningContainers int32) error {
+			return nil
+		},
+	}
+	reconciler := &fakeReconciler{returnErr: errors.New("db down")}
+	srv := newTestServerWithNodeStoreAndReconciler(store, 15, reconciler)
+
+	body := `{"used_mb":1,"running_containers":0,"containers":[{"app_name":"x","state":"running","host_port":1,"container_id":"c"}]}`
+	nodeIDStr := formatUUID(nodeID)
+	req := httptest.NewRequest(http.MethodPost, "/v1/nodes/"+nodeIDStr+"/heartbeat", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	// Reconcile error must not propagate — heartbeat ack is sacred.
+	if w.Code != http.StatusOK {
+		t.Fatalf("reconcile error should not fail heartbeat ack; got %d (body=%s)", w.Code, w.Body.String())
+	}
 }

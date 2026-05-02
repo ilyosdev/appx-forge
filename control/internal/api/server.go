@@ -47,6 +47,7 @@ type Server struct {
 	logProxyStore            LogProxyStore
 	logHTTPClient            httpDoer
 	heartbeatIntervalSeconds int
+	reconciler               Reconciler // Phase 30 — may be nil; handler tolerates nil and skips reconcile
 }
 
 // NewServer creates a new Server with chi router, middleware, and route groups.
@@ -103,6 +104,15 @@ func (s *Server) SetRouteFetcher(rf RouteListFetcher) {
 // SetEventStore injects the event store dependency after construction.
 func (s *Server) SetEventStore(es EventStore) {
 	s.eventStore = es
+}
+
+// SetReconciler injects the heartbeat Reconciler after construction.
+// Phase 30 — the concrete impl is internal/scheduler.HeartbeatReconciler (T7).
+// When wired, handleHeartbeat calls Reconcile on rich heartbeats (those carrying
+// req.Containers). When nil, the handler still acks heartbeats normally and
+// just skips the reconcile branch — backwards compat for legacy agent rollout.
+func (s *Server) SetReconciler(r Reconciler) {
+	s.reconciler = r
 }
 
 // SetLogProxyStore injects the log proxy store dependency after construction.
