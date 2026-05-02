@@ -90,3 +90,13 @@ SELECT app_name, state, created_at
 FROM sandboxes
 WHERE node_id = $1
   AND state IN ('pending','starting','running','restarting');
+
+-- name: MarkSandboxDestroyed :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', $2::text),
+    verified_at = NOW(),
+    updated_at = NOW(),
+    state_version = state_version + 1
+WHERE app_name = $1
+  AND state IN ('pending','starting','running','restarting');

@@ -9,12 +9,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/appx/forge/control/internal/lifecycle"
+	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
 )
 
@@ -75,10 +77,20 @@ type SandboxResponse struct {
 	LastActiveAt string           `json:"last_active_at,omitempty"`
 	FailureCount int32            `json:"failure_count"`
 	Metadata     json.RawMessage  `json:"metadata,omitempty"`
+	// Phase 30 — last time control plane verified this row against agent truth.
+	// ISO8601 (RFC3339). Empty when the row predates the verified_at column
+	// or has never been touched by reconciler / freshness check.
+	VerifiedAt string `json:"verified_at,omitempty"`
 }
 
 type sandboxListResponse struct {
 	Sandboxes []SandboxResponse `json:"sandboxes"`
+	// Phase 30 — oldest verified_at across the returned rows. Lets the
+	// caller (backend ContainerStateService) decide whether the cached
+	// fleet snapshot is fresh enough to use, or whether to issue a
+	// per-row force_refresh follow-up. Empty when no rows have a
+	// verified_at (legacy data).
+	FleetVerifiedAt string `json:"fleet_verified_at,omitempty"`
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────
@@ -159,6 +171,13 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 
 // handleGetSandbox handles GET /v1/sandboxes/{id}.
 // Supports UUID lookup and app:name lookup.
+//
+// Phase 30 — when freshness is wired AND the row's verified_at is stale
+// (or ?force_refresh=true), the handler calls SandboxFreshnessService to
+// confirm container existence against the agent before returning. On
+// confirmed agent miss the row is marked destroyed and the handler returns
+// 404. On agent unreachable the freshness impl returns the cached row;
+// the handler stays available with the stored verified_at.
 func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	if s.sandboxReader == nil {
 		ServiceUnavailable(w, "sandbox service not configured")
@@ -188,6 +207,24 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := sandboxToResponse(sandbox)
+
+	// Phase 30 — freshness check. Skipped when the service is not wired
+	// or when the row has no app_name (defensive — should never happen).
+	forceRefresh := r.URL.Query().Get("force_refresh") == "true"
+	if s.freshness != nil && sandbox.AppName != "" {
+		_, refreshedAt, refErr := s.freshness.GetSandbox(r.Context(), sandbox.AppName, forceRefresh)
+		if errors.Is(refErr, scheduler.ErrSandboxNotFound) {
+			NotFound(w, "sandbox not found")
+			return
+		}
+		if refErr != nil {
+			s.logger.Warn("freshness check failed; serving cached row",
+				"app_name", sandbox.AppName, "err", refErr)
+		} else if !refreshedAt.IsZero() {
+			resp.VerifiedAt = refreshedAt.Format(time.RFC3339)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -251,11 +288,23 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := make([]SandboxResponse, len(sandboxes))
+	// Phase 30 — track the oldest verified_at to surface fleet freshness.
+	var oldestVerified time.Time
 	for i, sb := range sandboxes {
 		resp[i] = sandboxToResponse(sb)
+		if sb.VerifiedAt.Valid {
+			t := sb.VerifiedAt.Time
+			if oldestVerified.IsZero() || t.Before(oldestVerified) {
+				oldestVerified = t
+			}
+		}
 	}
 
-	writeJSON(w, http.StatusOK, sandboxListResponse{Sandboxes: resp})
+	listResp := sandboxListResponse{Sandboxes: resp}
+	if !oldestVerified.IsZero() {
+		listResp.FleetVerifiedAt = oldestVerified.Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, listResp)
 }
 
 // handleDestroySandbox handles DELETE /v1/sandboxes/{id}.
@@ -388,6 +437,10 @@ func sandboxToResponse(s store.Sandbox) SandboxResponse {
 
 	if s.LastActiveAt.Valid {
 		resp.LastActiveAt = s.LastActiveAt.Time.Format("2006-01-02T15:04:05Z")
+	}
+
+	if s.VerifiedAt.Valid {
+		resp.VerifiedAt = s.VerifiedAt.Time.Format(time.RFC3339)
 	}
 
 	return resp

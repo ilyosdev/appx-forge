@@ -648,3 +648,24 @@ func (q *Queries) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) 
 	}
 	return items, nil
 }
+
+const markSandboxDestroyed = `-- name: MarkSandboxDestroyed :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', $2::text),
+    verified_at = NOW(),
+    updated_at = NOW(),
+    state_version = state_version + 1
+WHERE app_name = $1
+  AND state IN ('pending','starting','running','restarting')
+`
+
+type MarkSandboxDestroyedParams struct {
+	AppName string `json:"app_name"`
+	Reason  string `json:"reason"`
+}
+
+func (q *Queries) MarkSandboxDestroyed(ctx context.Context, arg MarkSandboxDestroyedParams) error {
+	_, err := q.db.Exec(ctx, markSandboxDestroyed, arg.AppName, arg.Reason)
+	return err
+}

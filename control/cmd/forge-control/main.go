@@ -6,7 +6,9 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net"
@@ -130,6 +132,26 @@ func main() {
 		&reconcilerStoreAdapter{q: queries}, logger)
 	srv.SetReconciler(&reconcilerAdapter{r: heartbeatReconciler})
 	logger.Info("heartbeat reconciler wired")
+
+	// Phase 30 — read-through freshness service. On a stale GetSandbox
+	// (verified_at older than the configured window) or ?force_refresh,
+	// the service synchronously calls agent's GET /v1/containers/{name}
+	// to confirm container existence; on miss the row is marked destroyed.
+	agentClient := &agentHTTPClient{
+		store:   &agentLookupAdapter{q: queries},
+		http:    &http.Client{Timeout: time.Duration(cfg.AgentRequestTimeoutSeconds) * time.Second},
+		logger:  logger,
+	}
+	freshnessSvc := scheduler.NewSandboxFreshnessService(
+		&freshnessStoreAdapter{q: queries},
+		agentClient,
+		time.Duration(cfg.FreshnessWindowSeconds)*time.Second,
+		logger,
+	)
+	srv.SetFreshness(freshnessSvc)
+	logger.Info("freshness service wired",
+		"window_seconds", cfg.FreshnessWindowSeconds,
+		"agent_timeout_seconds", cfg.AgentRequestTimeoutSeconds)
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -643,4 +665,130 @@ func (a *reconcilerAdapter) Reconcile(ctx context.Context, nodeID pgtype.UUID, c
 		}
 	}
 	return a.r.Reconcile(ctx, nodeID, out)
+}
+
+// ── freshnessStoreAdapter ──────────────────────────────────────────────
+
+// freshnessStoreAdapter implements scheduler.FreshnessStore by translating
+// sqlc rows to scheduler.SandboxRow. Reuses the T7 MarkSandboxVerified
+// query and the new (T9) MarkSandboxDestroyed query.
+type freshnessStoreAdapter struct {
+	q *store.Queries
+}
+
+func (a *freshnessStoreAdapter) GetSandboxByName(ctx context.Context, name string) (*scheduler.SandboxRow, time.Time, error) {
+	sb, err := a.q.GetSandboxByAppName(ctx, name)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	row := &scheduler.SandboxRow{
+		AppName:   sb.AppName,
+		State:     sb.State,
+		CreatedAt: sb.CreatedAt.Time,
+	}
+	var verifiedAt time.Time
+	if sb.VerifiedAt.Valid {
+		verifiedAt = sb.VerifiedAt.Time
+	}
+	return row, verifiedAt, nil
+}
+
+func (a *freshnessStoreAdapter) MarkSandboxVerified(ctx context.Context, appName, state string) error {
+	return a.q.MarkSandboxVerified(ctx, store.MarkSandboxVerifiedParams{
+		AppName: appName,
+		State:   state,
+	})
+}
+
+func (a *freshnessStoreAdapter) MarkSandboxDestroyed(ctx context.Context, appName, reason string) error {
+	return a.q.MarkSandboxDestroyed(ctx, store.MarkSandboxDestroyedParams{
+		AppName: appName,
+		Reason:  reason,
+	})
+}
+
+// ── agentHTTPClient ────────────────────────────────────────────────────
+
+// agentLookupStore is the read surface agentHTTPClient needs to resolve
+// app_name → node tailscale_ip + agent_listen_port (where the GET goes).
+type agentLookupStore interface {
+	GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error)
+	GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error)
+}
+
+type agentLookupAdapter struct {
+	q *store.Queries
+}
+
+func (a *agentLookupAdapter) GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error) {
+	return a.q.GetSandboxByAppName(ctx, appName)
+}
+
+func (a *agentLookupAdapter) GetNode(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+	return a.q.GetNode(ctx, id)
+}
+
+// agentHTTPClient satisfies scheduler.AgentClient by calling the agent's
+// GET /v1/containers/{name} endpoint (added in T5). The endpoint is
+// unauthenticated — it is only reachable via Tailscale. Network failure
+// or non-2xx/404 status surfaces as err so the freshness service falls
+// through to the cached row instead of declaring the container missing.
+type agentHTTPClient struct {
+	store  agentLookupStore
+	http   *http.Client
+	logger *slog.Logger
+}
+
+// containerExistsResponse mirrors the agent-side response shape
+// (agent/internal/agent/containers_handler.go). Duplicated here to keep
+// control free of any agent-package dependency.
+type containerExistsResponse struct {
+	Exists      bool   `json:"exists"`
+	AppName     string `json:"app_name"`
+	State       string `json:"state,omitempty"`
+	HostPort    int    `json:"host_port,omitempty"`
+	ContainerID string `json:"container_id,omitempty"`
+}
+
+func (c *agentHTTPClient) ContainerExists(ctx context.Context, name string) (bool, string, error) {
+	sb, err := c.store.GetSandboxByAppName(ctx, name)
+	if err != nil {
+		// Sandbox doesn't exist in DB — agent can't tell us anything new.
+		return false, "", err
+	}
+	if !sb.NodeID.Valid {
+		// Not yet scheduled to a node; treat as agent-unreachable rather
+		// than a confirmed miss so we don't spuriously mark destroyed.
+		return false, "", errors.New("sandbox not assigned to a node")
+	}
+	node, err := c.store.GetNode(ctx, sb.NodeID)
+	if err != nil {
+		return false, "", err
+	}
+
+	url := fmt.Sprintf("http://%s:%d/v1/containers/%s",
+		node.TailscaleIp.String(), node.AgentListenPort, name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, "", err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, "", err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		var body containerExistsResponse
+		if decErr := json.NewDecoder(resp.Body).Decode(&body); decErr != nil {
+			return false, "", decErr
+		}
+		return body.Exists, body.State, nil
+	case http.StatusNotFound:
+		// Agent confirms container is absent.
+		return false, "", nil
+	default:
+		return false, "", fmt.Errorf("agent returned status %d", resp.StatusCode)
+	}
 }

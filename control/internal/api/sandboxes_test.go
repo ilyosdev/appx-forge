@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
 	"github.com/appx/forge/control/internal/lifecycle"
+	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -430,6 +432,198 @@ func TestSandboxDestroy_NotFound(t *testing.T) {
 }
 
 // ── POST /v1/sandboxes/{id}/restart Tests ───────────────────────────
+
+// ── Phase 30: verified_at + freshness wiring ─────────────────────────
+
+// fakeFreshness lets tests stub api.Freshness without spinning up a real
+// SandboxFreshnessService. The fields capture the most recent call so
+// assertions can confirm the handler forwarded the right name + force flag.
+type fakeFreshness struct {
+	row          *scheduler.SandboxRow
+	verifiedAt   time.Time
+	err          error
+	calledName   string
+	calledForce  bool
+	calledCount  int
+}
+
+func (f *fakeFreshness) GetSandbox(ctx context.Context, name string, forceRefresh bool) (*scheduler.SandboxRow, time.Time, error) {
+	f.calledName = name
+	f.calledForce = forceRefresh
+	f.calledCount++
+	return f.row, f.verifiedAt, f.err
+}
+
+func makeSandboxWithVerified(id uuid.UUID, appName, state string, verifiedAt time.Time) store.Sandbox {
+	sb := makeSandbox(id, appName, state)
+	if !verifiedAt.IsZero() {
+		sb.VerifiedAt = pgtype.Timestamptz{Time: verifiedAt, Valid: true}
+	}
+	return sb
+}
+
+func TestSandboxGet_IncludesVerifiedAtFromStore(t *testing.T) {
+	sandboxID := uuid.New()
+	stored := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
+	reader := &mockSandboxReader{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return makeSandboxWithVerified(sandboxID, appName, "running", stored), nil
+		},
+	}
+
+	srv := newSandboxTestServer(&mockLifecycle{}, reader)
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/app:pool-X", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp SandboxResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.VerifiedAt == "" {
+		t.Errorf("expected verified_at populated from stored row, got empty")
+	}
+}
+
+func TestSandboxGet_FreshnessRefreshUpdatesVerifiedAt(t *testing.T) {
+	sandboxID := uuid.New()
+	stored := time.Now().Add(-30 * time.Second)
+	refreshed := time.Now().UTC().Truncate(time.Second)
+
+	reader := &mockSandboxReader{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return makeSandboxWithVerified(sandboxID, appName, "running", stored), nil
+		},
+	}
+	freshness := &fakeFreshness{
+		row:        &scheduler.SandboxRow{AppName: "pool-X", State: "running"},
+		verifiedAt: refreshed,
+	}
+
+	srv := newSandboxTestServer(&mockLifecycle{}, reader)
+	srv.SetFreshness(freshness)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/app:pool-X?force_refresh=true", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if freshness.calledCount != 1 {
+		t.Errorf("freshness should have been called once, got %d", freshness.calledCount)
+	}
+	if freshness.calledName != "pool-X" {
+		t.Errorf("freshness called with wrong name: %q", freshness.calledName)
+	}
+	if !freshness.calledForce {
+		t.Errorf("force_refresh=true query should have propagated")
+	}
+	var resp SandboxResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.VerifiedAt != refreshed.Format(time.RFC3339) {
+		t.Errorf("expected verified_at=%q, got %q", refreshed.Format(time.RFC3339), resp.VerifiedAt)
+	}
+}
+
+func TestSandboxGet_FreshnessReturns404OnAgentMiss(t *testing.T) {
+	sandboxID := uuid.New()
+	reader := &mockSandboxReader{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return makeSandboxWithVerified(sandboxID, appName, "running",
+				time.Now().Add(-30*time.Second)), nil
+		},
+	}
+	freshness := &fakeFreshness{err: scheduler.ErrSandboxNotFound}
+
+	srv := newSandboxTestServer(&mockLifecycle{}, reader)
+	srv.SetFreshness(freshness)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/app:pool-X", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if freshness.calledCount != 1 {
+		t.Errorf("freshness should have been called once")
+	}
+}
+
+func TestSandboxGet_FreshnessUnreachable_ReturnsCachedRow(t *testing.T) {
+	sandboxID := uuid.New()
+	stored := time.Now().Add(-30 * time.Second).UTC().Truncate(time.Second)
+	reader := &mockSandboxReader{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return makeSandboxWithVerified(sandboxID, appName, "running", stored), nil
+		},
+	}
+	freshness := &fakeFreshness{err: errors.New("connection refused")}
+
+	srv := newSandboxTestServer(&mockLifecycle{}, reader)
+	srv.SetFreshness(freshness)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/app:pool-X", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 (degrade to cached on agent error), got %d: %s", w.Code, w.Body.String())
+	}
+	var resp SandboxResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	// VerifiedAt should still reflect the stored row (handler did not overwrite on err).
+	if resp.VerifiedAt == "" {
+		t.Errorf("expected stored verified_at to remain populated, got empty")
+	}
+}
+
+func TestSandboxList_FleetVerifiedAtIsOldest(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	old := now.Add(-30 * time.Second)
+	mid := now.Add(-10 * time.Second)
+	new := now.Add(-5 * time.Second)
+
+	reader := &mockSandboxReader{
+		listSandboxesFn: func(ctx context.Context, limit int32) ([]store.Sandbox, error) {
+			return []store.Sandbox{
+				makeSandboxWithVerified(uuid.New(), "app-1", "running", new),
+				makeSandboxWithVerified(uuid.New(), "app-2", "running", old),
+				makeSandboxWithVerified(uuid.New(), "app-3", "running", mid),
+			}, nil
+		},
+	}
+
+	srv := newSandboxTestServer(&mockLifecycle{}, reader)
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp sandboxListResponse
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.FleetVerifiedAt != old.Format(time.RFC3339) {
+		t.Errorf("expected fleet_verified_at=%q (oldest), got %q",
+			old.Format(time.RFC3339), resp.FleetVerifiedAt)
+	}
+}
 
 func TestSandboxRestart_Success(t *testing.T) {
 	sandboxID := uuid.New()
