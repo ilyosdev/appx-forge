@@ -24,17 +24,18 @@ import (
 // Agent orchestrates all agent components and manages their lifecycle.
 // It is the top-level struct created by main and driven by Run/Shutdown.
 type Agent struct {
-	cfg        *config.Config
-	docker     docker.Client
-	ctrlClient *controlclient.Client
-	executor   *CommandExecutor
-	watcher    *events.Watcher
-	heartbeat  *health.HeartbeatSender
-	puller     *docker.ImagePuller
-	filePush   *filepush.Handler
-	ports      *ports.Allocator
-	httpServer *http.Server
-	logger     *slog.Logger
+	cfg         *config.Config
+	docker      docker.Client
+	ctrlClient  *controlclient.Client
+	executor    *CommandExecutor
+	watcher     *events.Watcher
+	heartbeat   *health.HeartbeatSender
+	puller      *docker.ImagePuller
+	filePush    *filepush.Handler
+	ports       *ports.Allocator
+	httpServer  *http.Server
+	snapshotter *docker.Snapshotter // Phase 30 — shared by heartbeat sender + /v1/containers/{name} handler + startup reachability check
+	logger      *slog.Logger
 }
 
 // New creates an Agent by wiring all components together.
@@ -79,16 +80,17 @@ func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 	filePushHandler := filepush.NewHandler([]byte(cfg.HMACSecret), executor, logger)
 
 	return &Agent{
-		cfg:        cfg,
-		docker:     dockerClient,
-		ctrlClient: ctrlClient,
-		executor:   executor,
-		watcher:    watcher,
-		heartbeat:  heartbeatSender,
-		puller:     puller,
-		filePush:   filePushHandler,
-		ports:      portAlloc,
-		logger:     logger,
+		cfg:         cfg,
+		docker:      dockerClient,
+		ctrlClient:  ctrlClient,
+		executor:    executor,
+		watcher:     watcher,
+		heartbeat:   heartbeatSender,
+		puller:      puller,
+		filePush:    filePushHandler,
+		ports:       portAlloc,
+		snapshotter: snapshotter,
+		logger:      logger,
 	}, nil
 }
 
@@ -103,6 +105,17 @@ func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 // Run blocks until ctx is cancelled. It returns nil on clean shutdown
 // or an error if a fatal problem occurs during startup.
 func (a *Agent) Run(ctx context.Context) error {
+	// Phase 30 — startup snapshot: validate Docker reachability and seed the
+	// in-memory view from the daemon. No separate persistence; Docker is the
+	// only source of truth. Failing here means we'd be running with an
+	// unknown view, which would feed noise into the heartbeat reconciler;
+	// surface the error and let systemd restart us.
+	initial, err := a.snapshotter.Snapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("agent: startup snapshot failed: %w", err)
+	}
+	a.logger.Info("startup snapshot complete", "containers", len(initial))
+
 	// Step 1: Register with control plane (retries internally)
 	a.logger.Info("registering with control plane", "url", a.cfg.ControlURL)
 	regResp, err := a.ctrlClient.Register(ctx)
@@ -135,6 +148,9 @@ func (a *Agent) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 	mux.Handle("POST /v1/sandboxes/{id}/files", a.filePush)
+	// Phase 30 — synchronous existence endpoint; control plane consults
+	// this on stale verified_at reads. See containers_handler.go.
+	mux.Handle("GET /v1/containers/{name}", newContainerExistsHandler(a.snapshotter))
 
 	listenAddr := net.JoinHostPort(a.cfg.TailscaleIP, fmt.Sprintf("%d", a.cfg.AgentPort))
 	if a.cfg.TailscaleIP == "" {
