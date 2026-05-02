@@ -577,3 +577,74 @@ func (q *Queries) UpdateSandboxRuntime(ctx context.Context, arg UpdateSandboxRun
 	_, err := q.db.Exec(ctx, updateSandboxRuntime, arg.ContainerID, arg.HostPort, arg.ID)
 	return err
 }
+
+const markSandboxVerified = `-- name: MarkSandboxVerified :exec
+UPDATE sandboxes
+SET verified_at = NOW(), state = $2
+WHERE app_name = $1
+  AND verified_at < NOW()
+`
+
+type MarkSandboxVerifiedParams struct {
+	AppName string `json:"app_name"`
+	State   string `json:"state"`
+}
+
+func (q *Queries) MarkSandboxVerified(ctx context.Context, arg MarkSandboxVerifiedParams) error {
+	_, err := q.db.Exec(ctx, markSandboxVerified, arg.AppName, arg.State)
+	return err
+}
+
+const markSandboxAgentLost = `-- name: MarkSandboxAgentLost :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', 'agent_lost_at_heartbeat'),
+    verified_at = NOW()
+WHERE app_name = $1
+  AND node_id = $2
+  AND state IN ('pending','starting','running','restarting')
+  AND created_at < NOW() - INTERVAL '60 seconds'
+`
+
+type MarkSandboxAgentLostParams struct {
+	AppName string      `json:"app_name"`
+	NodeID  pgtype.UUID `json:"node_id"`
+}
+
+func (q *Queries) MarkSandboxAgentLost(ctx context.Context, arg MarkSandboxAgentLostParams) error {
+	_, err := q.db.Exec(ctx, markSandboxAgentLost, arg.AppName, arg.NodeID)
+	return err
+}
+
+const listSandboxesForNode = `-- name: ListSandboxesForNode :many
+SELECT app_name, state, created_at
+FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('pending','starting','running','restarting')
+`
+
+type ListSandboxesForNodeRow struct {
+	AppName   string             `json:"app_name"`
+	State     string             `json:"state"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]ListSandboxesForNodeRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxesForNode, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxesForNodeRow{}
+	for rows.Next() {
+		var i ListSandboxesForNodeRow
+		if err := rows.Scan(&i.AppName, &i.State, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

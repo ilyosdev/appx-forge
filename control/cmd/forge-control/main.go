@@ -27,6 +27,7 @@ import (
 	"github.com/appx/forge/control/internal/config"
 	"github.com/appx/forge/control/internal/lifecycle"
 	"github.com/appx/forge/control/internal/routing"
+	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
 )
 
@@ -121,6 +122,14 @@ func main() {
 	srv.SetRouteFetcher(caddyClient)
 	srv.SetEventStore(&eventStoreAdapter{q: queries})
 	srv.SetLogProxyStore(&filePushAdapter{q: queries}, nil)
+
+	// Phase 30 — heartbeat reconciler. Diffs each rich heartbeat against
+	// the per-node DB working set: bumps verified_at for confirmed rows,
+	// marks agent-lost for DB rows missing past the 60s grace window.
+	heartbeatReconciler := scheduler.NewHeartbeatReconciler(
+		&reconcilerStoreAdapter{q: queries}, logger)
+	srv.SetReconciler(&reconcilerAdapter{r: heartbeatReconciler})
+	logger.Info("heartbeat reconciler wired")
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddr,
@@ -572,4 +581,66 @@ func (a *eventStoreAdapter) ListEventsByType(ctx context.Context, arg store.List
 
 func (a *eventStoreAdapter) ListRecentEvents(ctx context.Context, limit int32) ([]store.Event, error) {
 	return a.q.ListRecentEvents(ctx, limit)
+}
+
+// ── reconcilerStoreAdapter ─────────────────────────────────────────────
+
+// reconcilerStoreAdapter implements scheduler.SandboxStore. Translates
+// sqlc rows into the package-local SandboxRow shape (which carries only
+// the three fields the reconciler needs).
+type reconcilerStoreAdapter struct {
+	q *store.Queries
+}
+
+func (a *reconcilerStoreAdapter) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]scheduler.SandboxRow, error) {
+	rows, err := a.q.ListSandboxesForNode(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]scheduler.SandboxRow, len(rows))
+	for i, r := range rows {
+		out[i] = scheduler.SandboxRow{
+			AppName:   r.AppName,
+			State:     r.State,
+			CreatedAt: r.CreatedAt.Time,
+		}
+	}
+	return out, nil
+}
+
+func (a *reconcilerStoreAdapter) MarkSandboxVerified(ctx context.Context, appName, state string) error {
+	return a.q.MarkSandboxVerified(ctx, store.MarkSandboxVerifiedParams{
+		AppName: appName,
+		State:   state,
+	})
+}
+
+func (a *reconcilerStoreAdapter) MarkSandboxAgentLost(ctx context.Context, appName string, nodeID pgtype.UUID) error {
+	return a.q.MarkSandboxAgentLost(ctx, store.MarkSandboxAgentLostParams{
+		AppName: appName,
+		NodeID:  nodeID,
+	})
+}
+
+// ── reconcilerAdapter ──────────────────────────────────────────────────
+
+// reconcilerAdapter satisfies api.Reconciler by translating api.ContainerInfo
+// to scheduler.ContainerInfo. The duplicate types exist because scheduler
+// cannot import api without closing an import cycle (api → lifecycle →
+// scheduler).
+type reconcilerAdapter struct {
+	r *scheduler.HeartbeatReconciler
+}
+
+func (a *reconcilerAdapter) Reconcile(ctx context.Context, nodeID pgtype.UUID, containers []api.ContainerInfo) error {
+	out := make([]scheduler.ContainerInfo, len(containers))
+	for i, c := range containers {
+		out[i] = scheduler.ContainerInfo{
+			AppName:     c.AppName,
+			State:       c.State,
+			HostPort:    c.HostPort,
+			ContainerID: c.ContainerID,
+		}
+	}
+	return a.r.Reconcile(ctx, nodeID, out)
 }
