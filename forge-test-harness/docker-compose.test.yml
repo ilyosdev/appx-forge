@@ -1,0 +1,128 @@
+# Phase 30 chaos harness — full Forge stack on a developer machine.
+#
+# This compose brings up the same dependencies the production deployment
+# uses (Postgres for control plane, MySQL + Redis for backend) plus a
+# locally-built control plane and agent. The `--build` flag is required
+# on first run; subsequent runs reuse cached layers.
+#
+# Build context for control + agent is the parent directory because both
+# Dockerfiles COPY go.work + shared-go/ + their own subtree (matches the
+# pattern in ../docker-compose.dev.yml).
+#
+# Ports use "+1" offsets from the dev compose to avoid collisions when a
+# developer is already running docker-compose.dev.yml.
+#
+# Bring up:
+#     docker compose -f docker-compose.test.yml up -d --build --wait
+# Tear down (with volumes — no state survives):
+#     docker compose -f docker-compose.test.yml down -v
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: forge
+      POSTGRES_PASSWORD: forge
+      POSTGRES_DB: forge_test
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forge -d forge_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: control/Dockerfile
+    environment:
+      FORGE_LISTEN_ADDR: ":8090"
+      FORGE_DATABASE_URL: "postgres://forge:forge@postgres:5432/forge_test?sslmode=disable"
+      FORGE_API_TOKEN: "harness-token"
+      FORGE_HMAC_SECRET: "harness-hmac-secret"
+      FORGE_LOG_LEVEL: "info"
+      FORGE_HEARTBEAT_INTERVAL_SECONDS: "5"
+      FORGE_HEARTBEAT_MISS_THRESHOLD: "3"
+      # Phase 30 — tighten the freshness window for chaos tests so we
+      # observe stale-row → control-plane refresh paths in seconds, not
+      # the production-tuned 30s.
+      FORGE_FRESHNESS_WINDOW_SECONDS: "5"
+      FORGE_AGENT_REQUEST_TIMEOUT_SECONDS: "3"
+    ports:
+      - "8090:8090"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8090/v1/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  agent:
+    build:
+      context: ..
+      dockerfile: agent/Dockerfile
+    environment:
+      # The agent registers itself with the control plane via this URL.
+      # Inside the compose network, control-plane resolves by service name.
+      FORGE_CONTROL_URL: "http://control-plane:8090"
+      FORGE_HOSTNAME: "harness-agent-1"
+      # No Tailscale in the harness — agent listens on its container's
+      # internal IP. Empty string here makes it bind 0.0.0.0 (dev mode).
+      FORGE_TAILSCALE_IP: ""
+      FORGE_AGENT_PORT: "8091"
+      FORGE_HMAC_SECRET: "harness-hmac-secret"
+      FORGE_API_TOKEN: "harness-token"
+      FORGE_CAPACITY_MB: "8192"
+      FORGE_CAPACITY_CPU: "2.0"
+      FORGE_AGENT_VERSION: "harness-0.1.0"
+      FORGE_PORT_RANGE_MIN: "40000"
+      FORGE_PORT_RANGE_MAX: "40100"
+    volumes:
+      # Talk to the host's Docker daemon so the agent can spawn sandbox
+      # containers as siblings (Docker-out-of-Docker pattern). Chaos
+      # scenarios that `docker kill` rely on this — sandboxes show up
+      # in the host's `docker ps` listing.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Sandbox bundle volumes live here. tmpfs to avoid leaking state
+      # across compose-down/-up cycles.
+      - sandbox-data:/var/lib/forge/sandboxes
+    ports:
+      - "8091:8091"
+    cap_add:
+      # Required so inject.sh's `partition` action can run iptables
+      # inside this container.
+      - NET_ADMIN
+    depends_on:
+      control-plane:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: text2design
+      MYSQL_USER: smetakon
+      MYSQL_PASSWORD: smetakon_secret
+    ports:
+      - "3308:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  sandbox-data:
