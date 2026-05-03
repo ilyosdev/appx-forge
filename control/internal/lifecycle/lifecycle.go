@@ -359,7 +359,36 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 				State_2: sandbox.State,
 			})
 			if err != nil {
-				return fmt.Errorf("transition state: %w", err)
+				// Optimistic-lock miss: another handler (typically the
+				// container_started event from the same agent) advanced
+				// the row between our read and write. Re-read; if the
+				// row's current state is already what this ack would set
+				// (or further along in the same direction), treat as
+				// idempotent no-op instead of bubbling a 500 to the
+				// agent — same shape as the `!valid` branch above.
+				if errors.Is(err, pgx.ErrNoRows) {
+					if refreshed, ferr := ls.store.GetSandbox(ctx, pgSandboxID); ferr == nil {
+						currentNow := models.SandboxState(refreshed.State)
+						if currentNow == nextState ||
+							(event == models.EventStarted && currentNow == models.StateRunning) ||
+							(event == models.EventStartFailed && currentNow == models.StateFailed) ||
+							(event == models.EventDestroyed && currentNow == models.StateDestroyed) {
+							ls.logger.Info("ack transition skipped: state already advanced (concurrent)",
+								"sandbox_id", sandboxID,
+								"current_state", currentNow,
+								"cmd_type", cmdType,
+							)
+							sandbox = refreshed
+							nextState = currentNow
+						} else {
+							return fmt.Errorf("transition state: %w", err)
+						}
+					} else {
+						return fmt.Errorf("transition state: %w", err)
+					}
+				} else {
+					return fmt.Errorf("transition state: %w", err)
+				}
 			}
 		}
 
