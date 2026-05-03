@@ -19,8 +19,29 @@ import { resolve } from 'node:path';
 
 const HARNESS_DIR = resolve(__dirname);
 
-/** Bring the stack up. Builds images on first run, reuses cache otherwise. */
+/**
+ * Bring the stack up. Builds images on first run, reuses cache otherwise.
+ *
+ * Performs an idempotent down -v before up to guarantee no leaked state
+ * from a prior spec in the same jest invocation — Docker's network /
+ * volume cleanup is async, and a prior spec's afterAll(stopStack) may
+ * not have fully reaped resources by the time the next spec's
+ * beforeAll(startStack) runs. Without this guard, running multiple
+ * chaos specs in one `jest` call leaks containers/networks and one
+ * scenario fails on bring-up. With it, each spec gets a clean slate.
+ *
+ * Cheap when there's nothing to clean — `down` on an absent stack
+ * exits 0 fast.
+ */
 export function startStack(): void {
+  try {
+    execSync(
+      'docker compose -f docker-compose.test.yml down -v --remove-orphans --timeout 5',
+      { cwd: HARNESS_DIR, stdio: 'pipe' },
+    );
+  } catch {
+    // No prior stack is fine.
+  }
   execSync(
     'docker compose -f docker-compose.test.yml up -d --build --wait',
     { cwd: HARNESS_DIR, stdio: 'inherit' },
@@ -29,10 +50,13 @@ export function startStack(): void {
 
 /** Tear the stack down + drop volumes (no state survives). */
 export function stopStack(): void {
-  execSync('docker compose -f docker-compose.test.yml down -v', {
-    cwd: HARNESS_DIR,
-    stdio: 'inherit',
-  });
+  execSync(
+    'docker compose -f docker-compose.test.yml down -v --remove-orphans --timeout 5',
+    {
+      cwd: HARNESS_DIR,
+      stdio: 'inherit',
+    },
+  );
 }
 
 /**
@@ -51,6 +75,14 @@ export function inject(action: string, ...args: string[]): void {
  * Poll `check` every 500ms until it resolves true, or fail after
  * `timeoutMs`. Logs OK / FAIL with elapsed time so the scenario log
  * makes the recovery latency obvious without a separate assertion.
+ *
+ * Errors thrown by `check` are treated as "condition not met yet" and
+ * the loop continues polling. This is intentional: the chaos scenarios
+ * intentionally cause transient failures (control-plane restart,
+ * partition heal) and the recovery condition is "things start working
+ * again" — the natural way to express that is "fetch succeeds and
+ * returns expected shape." Letting the first fetch error bubble out
+ * would defeat the polling.
  */
 export async function waitForCondition(
   check: () => Promise<boolean>,
@@ -58,15 +90,23 @@ export async function waitForCondition(
   description: string,
 ): Promise<void> {
   const start = Date.now();
+  let lastError: unknown = null;
   while (Date.now() - start < timeoutMs) {
-    if (await check()) {
-      // eslint-disable-next-line no-console
-      console.log(`OK: ${description} in ${Date.now() - start}ms`);
-      return;
+    try {
+      if (await check()) {
+        // eslint-disable-next-line no-console
+        console.log(`OK: ${description} in ${Date.now() - start}ms`);
+        return;
+      }
+    } catch (err) {
+      lastError = err;
     }
     await new Promise((r) => setTimeout(r, 500));
   }
-  throw new Error(`FAIL: ${description} after ${timeoutMs}ms`);
+  const errSuffix = lastError
+    ? ` (last error: ${(lastError as Error).message ?? lastError})`
+    : '';
+  throw new Error(`FAIL: ${description} after ${timeoutMs}ms${errSuffix}`);
 }
 
 /** Convenience — fetch + 2xx check, suitable for healthz polls. */
