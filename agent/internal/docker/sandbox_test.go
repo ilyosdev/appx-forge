@@ -64,6 +64,9 @@ func (m *mockDockerSDK) ImagePull(_ context.Context, _ string, _ dockerclient.Im
 func (m *mockDockerSDK) Events(_ context.Context, _ dockerclient.EventsListOptions) dockerclient.EventsResult {
 	return dockerclient.EventsResult{}
 }
+func (m *mockDockerSDK) ContainerList(_ context.Context, _ dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error) {
+	return dockerclient.ContainerListResult{}, nil
+}
 func (m *mockDockerSDK) Close() error { return nil }
 
 // newTestClient creates a dockerClient with a mock SDK client for testing.

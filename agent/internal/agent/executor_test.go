@@ -111,6 +111,10 @@ func (m *mockDockerClient) EventsStream(ctx context.Context, since time.Time) (<
 	return ch, errCh
 }
 
+func (m *mockDockerClient) ListContainers(_ context.Context) ([]docker.ContainerSnapshot, error) {
+	return []docker.ContainerSnapshot{}, nil
+}
+
 func (m *mockDockerClient) Close() error {
 	return nil
 }

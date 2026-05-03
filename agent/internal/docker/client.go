@@ -48,6 +48,11 @@ type Client interface {
 	// Events are filtered to container-type events starting from the given time.
 	EventsStream(ctx context.Context, since time.Time) (<-chan ContainerEvent, <-chan error)
 
+	// ListContainers returns all Forge-managed containers (running + stopped)
+	// as ContainerSnapshot entries. Phase 30 — used by Snapshotter to feed
+	// the heartbeat protocol's container list.
+	ListContainers(ctx context.Context) ([]ContainerSnapshot, error)
+
 	// Close releases the underlying Docker client resources.
 	Close() error
 }
@@ -117,6 +122,7 @@ type rawDockerClient interface {
 	ContainerInspect(ctx context.Context, containerID string, opts dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error)
 	ContainerLogs(ctx context.Context, containerID string, opts dockerclient.ContainerLogsOptions) (dockerclient.ContainerLogsResult, error)
 	ImagePull(ctx context.Context, ref string, opts dockerclient.ImagePullOptions) (dockerclient.ImagePullResponse, error)
+	ContainerList(ctx context.Context, opts dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error)
 	Events(ctx context.Context, opts dockerclient.EventsListOptions) dockerclient.EventsResult
 	Close() error
 }
@@ -299,6 +305,50 @@ func (d *dockerClient) EventsStream(ctx context.Context, since time.Time) (<-cha
 // Close releases the underlying Docker client resources.
 func (d *dockerClient) Close() error {
 	return d.raw().Close()
+}
+
+// ListContainers returns all Forge-managed containers (running + stopped)
+// visible to the Docker daemon, mapped to ContainerSnapshot. Used by
+// Snapshotter for the heartbeat container list (Phase 30) and by the
+// agent's startup cache rebuild.
+//
+// Filters: only containers with the `forge.app_name` label are included
+// — the agent doesn't manage non-Forge containers and shouldn't report
+// them to the control plane.
+//
+// Not added to the Client interface to avoid forcing existing mocks
+// (mockClient in client_test.go, and others) to implement it; consumers
+// that need this method receive *dockerClient directly via Snapshotter's
+// DockerLister interface (structural typing).
+func (d *dockerClient) ListContainers(ctx context.Context) ([]ContainerSnapshot, error) {
+	result, err := d.raw().ContainerList(ctx, dockerclient.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("docker: list containers: %w", err)
+	}
+
+	snapshots := make([]ContainerSnapshot, 0, len(result.Items))
+	for _, item := range result.Items {
+		appName := item.Labels["forge.app_name"]
+		if appName == "" {
+			continue // skip non-Forge containers
+		}
+
+		hostPort := 0
+		for _, p := range item.Ports {
+			if p.PublicPort != 0 {
+				hostPort = int(p.PublicPort)
+				break
+			}
+		}
+
+		snapshots = append(snapshots, ContainerSnapshot{
+			AppName:     appName,
+			State:       string(item.State),
+			HostPort:    hostPort,
+			ContainerID: item.ID,
+		})
+	}
+	return snapshots, nil
 }
 
 // ── Container Port Constants ─────────────────────────────────────────────

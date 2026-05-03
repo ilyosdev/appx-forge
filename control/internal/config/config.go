@@ -19,6 +19,16 @@ type Config struct {
 
 	IdleReaperIntervalSeconds    int `envconfig:"FORGE_IDLE_REAPER_INTERVAL_SECONDS" default:"60"`
 	DriftDetectorIntervalSeconds int `envconfig:"FORGE_DRIFT_DETECTOR_INTERVAL_SECONDS" default:"60"`
+
+	// Phase 30 — read-through freshness threshold. A row is considered
+	// fresh if verified_at is within this window; older rows trigger a
+	// synchronous agent.ContainerExists call.
+	FreshnessWindowSeconds int `envconfig:"FORGE_FRESHNESS_WINDOW_SECONDS" default:"10"`
+
+	// Phase 30 — HTTP timeout on the control plane → agent containers
+	// query. Kept short because the call is on the GET /sandboxes
+	// critical path; agent unreachable falls through to cached row.
+	AgentRequestTimeoutSeconds int `envconfig:"FORGE_AGENT_REQUEST_TIMEOUT_SECONDS" default:"3"`
 }
 
 // Load parses environment variables into a Config struct. Returns an error

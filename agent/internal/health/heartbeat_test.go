@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"sync"
@@ -10,7 +11,40 @@ import (
 	"time"
 
 	"github.com/appx/forge/agent/internal/controlclient"
+	"github.com/appx/forge/agent/internal/docker"
 )
+
+// mockSnapshotter returns a fixed list of container snapshots (Phase 30 T4).
+type mockSnapshotter struct {
+	mu         sync.Mutex
+	containers []docker.ContainerSnapshot
+	err        error
+}
+
+func (m *mockSnapshotter) Snapshot(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return nil, m.err
+	}
+	out := make([]docker.ContainerSnapshot, len(m.containers))
+	copy(out, m.containers)
+	return out, nil
+}
+
+func (m *mockSnapshotter) setContainers(c []docker.ContainerSnapshot) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.containers = c
+}
+
+// emptySnapshotter is a minimal SnapshotProvider for tests that don't care
+// about the container-list payload.
+type emptySnapshotter struct{}
+
+func (emptySnapshotter) Snapshot(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+	return []docker.ContainerSnapshot{}, nil
+}
 
 // newTestLogger returns a no-op logger for tests.
 func newTestLogger() *slog.Logger {
@@ -65,7 +99,7 @@ func TestHeartbeatSender_CallsAtInterval(t *testing.T) {
 	client := &mockHeartbeatClient{}
 	collector := &mockCollector{usedMB: 100, runningContainers: 1}
 
-	sender := NewHeartbeatSender(client, collector, 20*time.Millisecond, newTestLogger())
+	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, 20*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -89,7 +123,7 @@ func TestHeartbeatSender_PassesCurrentResourceUsage(t *testing.T) {
 	client := &mockHeartbeatClient{}
 	collector := &mockCollector{usedMB: 8500, runningContainers: 12}
 
-	sender := NewHeartbeatSender(client, collector, 15*time.Millisecond, newTestLogger())
+	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, 15*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -134,7 +168,7 @@ func TestHeartbeatSender_ContinuesOnError(t *testing.T) {
 	client := &mockHeartbeatClient{err: context.DeadlineExceeded}
 	collector := &mockCollector{usedMB: 100, runningContainers: 1}
 
-	sender := NewHeartbeatSender(client, collector, 15*time.Millisecond, newTestLogger())
+	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, 15*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -156,7 +190,7 @@ func TestHeartbeatSender_StopsOnContextCancel(t *testing.T) {
 	client := &mockHeartbeatClient{}
 	collector := &mockCollector{usedMB: 100, runningContainers: 1}
 
-	sender := NewHeartbeatSender(client, collector, 10*time.Millisecond, newTestLogger())
+	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, 10*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -191,7 +225,7 @@ func TestHeartbeatSender_CallsResourceCollector(t *testing.T) {
 	client := &mockHeartbeatClient{}
 	collector := &mockCollector{usedMB: 500, runningContainers: 3}
 
-	sender := NewHeartbeatSender(client, collector, 15*time.Millisecond, newTestLogger())
+	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, 15*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -211,5 +245,94 @@ func TestHeartbeatSender_CallsResourceCollector(t *testing.T) {
 	heartbeatCalls := len(client.getCalls())
 	if collectCount != heartbeatCalls {
 		t.Errorf("Collect calls (%d) should equal Heartbeat calls (%d)", collectCount, heartbeatCalls)
+	}
+}
+
+// Phase 30 T4 — heartbeat carries the full container list, not just a count.
+func TestHeartbeatSender_IncludesContainerList(t *testing.T) {
+	client := &mockHeartbeatClient{}
+	collector := &mockCollector{usedMB: 1234, runningContainers: 2}
+	snapshotter := &mockSnapshotter{
+		containers: []docker.ContainerSnapshot{
+			{AppName: "pool-X", State: "running", HostPort: 8081, ContainerID: "c1"},
+			{AppName: "app-Y", State: "running", HostPort: 8082, ContainerID: "c2"},
+		},
+	}
+
+	sender := NewHeartbeatSender(client, collector, snapshotter, 15*time.Millisecond, newTestLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go sender.Start(ctx)
+
+	time.Sleep(40 * time.Millisecond)
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+
+	calls := client.getCalls()
+	if len(calls) == 0 {
+		t.Fatal("expected at least one heartbeat call")
+	}
+
+	first := calls[0]
+	if len(first.Containers) != 2 {
+		t.Fatalf("expected 2 containers in heartbeat payload, got %d", len(first.Containers))
+	}
+	if first.Containers[0].AppName != "pool-X" {
+		t.Errorf("first container app_name: got %q, want pool-X", first.Containers[0].AppName)
+	}
+	if first.Containers[0].State != "running" {
+		t.Errorf("first container state: got %q, want running", first.Containers[0].State)
+	}
+	if first.Containers[0].HostPort != 8081 {
+		t.Errorf("first container host_port: got %d, want 8081", first.Containers[0].HostPort)
+	}
+	if first.Containers[0].ContainerID != "c1" {
+		t.Errorf("first container container_id: got %q, want c1", first.Containers[0].ContainerID)
+	}
+	if first.Containers[1].AppName != "app-Y" {
+		t.Errorf("second container app_name: got %q, want app-Y", first.Containers[1].AppName)
+	}
+	if first.UsedMB != 1234 {
+		t.Errorf("used_mb: got %d, want 1234", first.UsedMB)
+	}
+	if first.RunningContainers != 2 {
+		t.Errorf("running_containers (legacy): got %d, want 2", first.RunningContainers)
+	}
+}
+
+// Phase 30 T4 — snapshot failure SKIPS the tick instead of sending an empty
+// container list. Sending an empty list would, over a multi-tick failure
+// (>60s), trip T7 reconciler's grace window and mass-mark every Forge
+// sandbox as 'agent_lost'. Skipping ticks lets the control plane's existing
+// missed-heartbeat alarm surface the real signal: this node is in trouble.
+func TestHeartbeatSender_SnapshotErrorSkipsTickInsteadOfSendingEmptyList(t *testing.T) {
+	client := &mockHeartbeatClient{}
+	collector := &mockCollector{usedMB: 100, runningContainers: 0}
+	snapshotter := &mockSnapshotter{err: errors.New("docker daemon unreachable")}
+
+	sender := NewHeartbeatSender(client, collector, snapshotter, 15*time.Millisecond, newTestLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go sender.Start(ctx)
+
+	// Wait several tick intervals; assert NO heartbeat was sent.
+	time.Sleep(60 * time.Millisecond)
+	cancel()
+	time.Sleep(10 * time.Millisecond)
+
+	calls := client.getCalls()
+	if len(calls) != 0 {
+		t.Fatalf("heartbeat should NOT be sent on snapshot failure, but got %d calls (first: %+v)", len(calls), calls[0])
+	}
+
+	// Collector should also NOT be called when snapshot fails (snapshot now
+	// runs first; failure short-circuits the rest of the tick).
+	collectCount := int(collector.collectCalls.Load())
+	if collectCount != 0 {
+		t.Errorf("collector.Collect() should not be called when snapshot fails; got %d calls", collectCount)
 	}
 }

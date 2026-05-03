@@ -68,3 +68,35 @@ SELECT * FROM sandboxes WHERE node_id = $1 AND state = 'running' ORDER BY create
 
 -- name: DeleteSandbox :exec
 DELETE FROM sandboxes WHERE id = $1;
+
+-- name: MarkSandboxVerified :exec
+UPDATE sandboxes
+SET verified_at = NOW(), state = $2
+WHERE app_name = $1
+  AND verified_at < NOW();
+
+-- name: MarkSandboxAgentLost :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', 'agent_lost_at_heartbeat'),
+    verified_at = NOW()
+WHERE app_name = $1
+  AND node_id = $2
+  AND state IN ('pending','starting','running','restarting')
+  AND created_at < NOW() - INTERVAL '60 seconds';
+
+-- name: ListSandboxesForNode :many
+SELECT app_name, state, created_at
+FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('pending','starting','running','restarting');
+
+-- name: MarkSandboxDestroyed :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', $2::text),
+    verified_at = NOW(),
+    updated_at = NOW(),
+    state_version = state_version + 1
+WHERE app_name = $1
+  AND state IN ('pending','starting','running','restarting');
