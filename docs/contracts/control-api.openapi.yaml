@@ -1,0 +1,532 @@
+openapi: 3.1.0
+info:
+  title: Forge Control Plane API
+  version: 0.1.0
+  description: |
+    HTTP API for the Forge control plane. Used by:
+    - appx-api (via forge-sdk-ts)
+    - forge-cli
+    - forge-agent (registration, heartbeats, command polling)
+
+    All endpoints require Bearer token auth except /healthz and /metrics.
+    Agent endpoints additionally require a node-scoped token.
+
+    Error responses use application/problem+json (RFC 7807).
+servers:
+  - url: https://forge.internal.myappx.live/v1
+    description: Production
+  - url: http://localhost:8080/v1
+    description: Local dev
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Health check
+      operationId: getHealthz
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  postgres: { type: string, example: ok }
+                  uptime_seconds: { type: integer }
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      operationId: getMetrics
+      security: []
+      responses:
+        '200':
+          description: Prometheus metrics in text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /sandboxes:
+    post:
+      summary: Create a sandbox
+      operationId: createSandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SandboxCreate'
+      responses:
+        '201':
+          description: Sandbox created (in 'pending' state, scheduling async)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sandbox'
+        '409':
+          description: app_name already exists
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: No nodes available
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      summary: List sandboxes
+      operationId: listSandboxes
+      parameters:
+        - in: query
+          name: app_name
+          schema: { type: string }
+        - in: query
+          name: user_id
+          schema: { type: string }
+        - in: query
+          name: state
+          schema:
+            type: string
+            enum: [pending, starting, running, restarting, destroying, destroyed, failed, stopped]
+        - in: query
+          name: node_id
+          schema: { type: string, format: uuid }
+        - in: query
+          name: limit
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        '200':
+          description: List of sandboxes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sandboxes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Sandbox' }
+
+  /sandboxes/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema:
+          oneOf:
+            - { type: string, format: uuid, description: Sandbox UUID }
+            - { type: string, pattern: '^app:.+', description: 'Lookup by app_name with prefix "app:"' }
+    get:
+      summary: Get sandbox
+      operationId: getSandbox
+      responses:
+        '200':
+          description: Sandbox details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Sandbox'
+        '404':
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      summary: Destroy sandbox
+      operationId: destroySandbox
+      responses:
+        '202':
+          description: Destruction queued
+        '404':
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sandboxes/{id}/restart:
+    post:
+      summary: Force restart a sandbox
+      operationId: restartSandbox
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '202':
+          description: Restart queued
+        '404':
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sandboxes/{id}/files:
+    post:
+      summary: Push files to sandbox
+      operationId: pushFiles
+      description: |
+        Returns 307 redirect to agent's direct file-push endpoint with signed URL.
+        Client should follow redirect with the same body.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/x-tar:
+            schema:
+              type: string
+              format: binary
+          application/json:
+            schema:
+              type: object
+              properties:
+                files:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      path: { type: string }
+                      content: { type: string, description: 'Base64-encoded' }
+                      delete: { type: boolean, default: false }
+      responses:
+        '307':
+          description: Redirect to agent endpoint
+          headers:
+            Location: { schema: { type: string } }
+        '200':
+          description: Files written successfully (if not redirected)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  written: { type: array, items: { type: string } }
+                  failed: { type: array, items: { type: string } }
+        '404':
+          description: Sandbox not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /sandboxes/{id}/logs:
+    get:
+      summary: Get sandbox logs
+      operationId: getLogs
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: tail
+          schema: { type: integer, default: 100 }
+        - in: query
+          name: follow
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Log stream
+          content:
+            text/plain:
+              schema: { type: string }
+        '404':
+          description: Sandbox not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /nodes:
+    get:
+      summary: List nodes
+      operationId: listNodes
+      responses:
+        '200':
+          description: List of nodes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+
+  /nodes/register:
+    post:
+      summary: Agent registration
+      operationId: registerNode
+      description: |
+        Called by forge-agent on startup. Returns node_id and agent_token.
+        Re-registration with same hostname + tailscale_ip is idempotent (returns existing node_id).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hostname, tailscale_ip, capacity_mb, agent_version]
+              properties:
+                hostname: { type: string }
+                tailscale_ip: { type: string, format: ipv4 }
+                agent_listen_port: { type: integer, default: 8090 }
+                capacity_mb: { type: integer }
+                capacity_cpu: { type: number }
+                agent_version: { type: string }
+                metadata: { type: object }
+      responses:
+        '201':
+          description: Registered (or re-registered)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string, format: uuid }
+                  agent_token: { type: string }
+                  heartbeat_interval_seconds: { type: integer, example: 15 }
+
+  /nodes/{id}/heartbeat:
+    post:
+      summary: Agent heartbeat
+      operationId: heartbeat
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                used_mb: { type: integer }
+                running_containers: { type: integer }
+      responses:
+        '200':
+          description: Heartbeat acknowledged
+        '404':
+          description: Node not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /agents/{id}/commands:
+    get:
+      summary: Long-poll for commands
+      operationId: pollCommands
+      description: |
+        Agent calls this to receive commands. Server holds the connection
+        for up to `wait` seconds, returning empty array if no commands ready.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: query
+          name: wait
+          schema: { type: integer, default: 30, maximum: 60 }
+      responses:
+        '200':
+          description: Commands (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commands:
+                    type: array
+                    items: { $ref: '#/components/schemas/AgentCommand' }
+
+  /agents/{id}/commands/{cmd_id}/ack:
+    post:
+      summary: Acknowledge command completion
+      operationId: ackCommand
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: cmd_id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { type: string, enum: [success, failure] }
+                error: { type: string }
+                result: { type: object }
+      responses:
+        '200':
+          description: Ack recorded
+
+  /agents/{id}/events:
+    post:
+      summary: Report container event (crash, exit, oom)
+      operationId: reportEvent
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sandbox_id, event_type]
+              properties:
+                sandbox_id: { type: string, format: uuid }
+                event_type:
+                  type: string
+                  enum: [container_started, container_exited, container_oom, container_unhealthy]
+                container_id: { type: string }
+                exit_code: { type: integer }
+                payload: { type: object }
+      responses:
+        '200':
+          description: Event recorded
+
+  /routes:
+    get:
+      summary: List active routes (debug/ops)
+      operationId: listRoutes
+      responses:
+        '200':
+          description: Routes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  routes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Route' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+
+  schemas:
+    SandboxCreate:
+      type: object
+      required: [app_name, user_id, image]
+      properties:
+        app_name:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{1,62}$'
+          description: Becomes {app_name}.myappx.live
+        user_id: { type: string }
+        image: { type: string, example: 'appx/sandbox:v1' }
+        resources:
+          type: object
+          properties:
+            cpu_cores: { type: number, default: 0.5 }
+            memory_mb: { type: integer, default: 512 }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        idle_timeout_seconds:
+          type: integer
+          default: 1800
+          description: Auto-stop sandbox after this many seconds of inactivity
+        metadata: { type: object }
+
+    Sandbox:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        app_name: { type: string }
+        user_id: { type: string }
+        node_id: { type: string, format: uuid, nullable: true }
+        container_id: { type: string, nullable: true }
+        image: { type: string }
+        state:
+          type: string
+          enum: [pending, starting, running, restarting, destroying, destroyed, failed, stopped]
+        url: { type: string, format: uri, description: 'Public URL: https://{app_name}.myappx.live' }
+        resources:
+          type: object
+          properties:
+            cpu_cores: { type: number }
+            memory_mb: { type: integer }
+        host_port: { type: integer, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        last_active_at: { type: string, format: date-time }
+        failure_count: { type: integer }
+        metadata: { type: object }
+
+    Node:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        hostname: { type: string }
+        tailscale_ip: { type: string }
+        capacity_mb: { type: integer }
+        used_mb: { type: integer }
+        capacity_cpu: { type: number }
+        status: { type: string, enum: [healthy, unhealthy, draining, removed] }
+        last_seen_at: { type: string, format: date-time }
+        registered_at: { type: string, format: date-time }
+        agent_version: { type: string }
+        running_sandboxes: { type: integer }
+
+    Route:
+      type: object
+      properties:
+        app_name: { type: string }
+        sandbox_id: { type: string, format: uuid }
+        upstream: { type: string, example: '100.64.1.5:43210' }
+        updated_at: { type: string, format: date-time }
+
+    AgentCommand:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        type:
+          type: string
+          enum: [start_sandbox, stop_sandbox, restart_sandbox, get_logs, prune]
+        sandbox_id: { type: string, format: uuid, nullable: true }
+        payload: { type: object }
+        issued_at: { type: string, format: date-time }
+        timeout_seconds: { type: integer, default: 60 }
+
+    Error:
+      type: object
+      description: RFC 7807 Problem Details
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri, description: 'Problem type URI', example: 'urn:forge:error:conflict' }
+        title: { type: string, description: 'Short human-readable summary', example: 'app_name already exists' }
+        status: { type: integer, description: 'HTTP status code', example: 409 }
+        detail: { type: string, description: 'Detailed human-readable explanation' }
+        instance: { type: string, format: uri, description: 'URI identifying the specific occurrence' }

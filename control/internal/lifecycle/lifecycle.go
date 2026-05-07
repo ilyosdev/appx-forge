@@ -1,0 +1,845 @@
+// Package lifecycle orchestrates sandbox lifecycle operations: create, destroy,
+// restart, handle command acknowledgments, and process container events.
+package lifecycle
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/appx/forge/control/internal/scheduler"
+	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/shared-go/models"
+)
+
+// Sentinel errors for lifecycle operations.
+var (
+	// ErrConflict is returned when a sandbox with the same app_name already exists.
+	ErrConflict = errors.New("lifecycle: app_name already exists")
+
+	// ErrNoCapacity is returned when no node has sufficient resources.
+	ErrNoCapacity = errors.New("lifecycle: no node has sufficient capacity")
+
+	// ErrNotFound is returned when a sandbox is not found.
+	ErrNotFound = errors.New("lifecycle: sandbox not found")
+
+	// ErrInvalidTransition is returned when a state transition is not valid.
+	ErrInvalidTransition = errors.New("lifecycle: invalid state transition")
+
+	// ErrInvalidState is returned when a sandbox is not in the expected state.
+	ErrInvalidState = errors.New("lifecycle: sandbox not in expected state")
+)
+
+// Store abstracts the database operations needed by the lifecycle service.
+type Store interface {
+	CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
+	DeleteSandbox(ctx context.Context, id pgtype.UUID) error
+	GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
+	GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error)
+	GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	ListHealthyNodes(ctx context.Context) ([]store.Node, error)
+	AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
+	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
+	UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
+	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
+	AckCommand(ctx context.Context, arg store.AckCommandParams) error
+	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+}
+
+// RouteNotifier is called by the lifecycle service when sandbox state changes
+// require proxy route updates. Errors are logged as warnings and never propagated
+// -- routing is best-effort, corrected by the drift detector.
+type RouteNotifier interface {
+	OnSandboxRunning(ctx context.Context, appName string, sandboxID string, upstream string) error
+	OnSandboxStopped(ctx context.Context, appName string) error
+}
+
+// ── Request/Result Types ─────────────────────────────────────────────
+
+// CreateRequest contains the parameters for creating a new sandbox.
+type CreateRequest struct {
+	AppName            string
+	UserID             string
+	Image              string
+	Resources          Resources
+	Env                map[string]string
+	IdleTimeoutSeconds int32
+	Metadata           map[string]interface{}
+}
+
+// Resources specifies the resource limits for a sandbox.
+type Resources struct {
+	CPUCores float64 `json:"cpu_cores"`
+	MemoryMB int32   `json:"memory_mb"`
+}
+
+// SandboxResult contains the result of a sandbox operation.
+type SandboxResult struct {
+	ID        uuid.UUID  `json:"id"`
+	AppName   string     `json:"app_name"`
+	UserID    string     `json:"user_id"`
+	State     string     `json:"state"`
+	URL       string     `json:"url"`
+	NodeID    *uuid.UUID `json:"node_id,omitempty"`
+	Image     string     `json:"image"`
+	CreatedAt string     `json:"created_at,omitempty"`
+}
+
+// ── Service ──────────────────────────────────────────────────────────
+
+// LifecycleService orchestrates sandbox lifecycle operations.
+type LifecycleService struct {
+	store         Store
+	logger        *slog.Logger
+	routeNotifier RouteNotifier
+	restartMgr    *RestartManager
+}
+
+// New creates a new LifecycleService.
+func New(s Store, logger *slog.Logger) *LifecycleService {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &LifecycleService{store: s, logger: logger}
+}
+
+// SetRouteNotifier injects the route notifier after construction.
+// This avoids widening the New() signature for optional dependencies.
+func (ls *LifecycleService) SetRouteNotifier(rn RouteNotifier) {
+	ls.routeNotifier = rn
+}
+
+// SetRestartManager injects the restart manager after construction.
+// When set, HandleEvent delegates container_exited events in restarting state
+// to the restart manager for exponential backoff recovery.
+func (ls *LifecycleService) SetRestartManager(rm *RestartManager) {
+	ls.restartMgr = rm
+}
+
+// ── CreateSandbox ────────────────────────────────────────────────────
+
+// CreateSandbox creates a new sandbox, schedules it to a node, and dispatches
+// a start_sandbox command. It returns the sandbox result with a computed URL.
+func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest) (*SandboxResult, error) {
+	// Generate sandbox UUID
+	sandboxUUID := uuid.New()
+	pgID := pgtype.UUID{Bytes: sandboxUUID, Valid: true}
+
+	// Marshal resources and env to JSON
+	resourcesJSON, err := json.Marshal(req.Resources)
+	if err != nil {
+		return nil, fmt.Errorf("marshal resources: %w", err)
+	}
+
+	envJSON, err := json.Marshal(req.Env)
+	if err != nil {
+		return nil, fmt.Errorf("marshal env: %w", err)
+	}
+
+	metadataJSON := []byte(`{}`)
+	if req.Metadata != nil {
+		metadataJSON, err = json.Marshal(req.Metadata)
+		if err != nil {
+			return nil, fmt.Errorf("marshal metadata: %w", err)
+		}
+	}
+
+	idleTimeout := req.IdleTimeoutSeconds
+	if idleTimeout == 0 {
+		idleTimeout = 1800
+	}
+
+	// Soft-recycle: if a prior row exists for this app_name and is in a terminal-ish
+	// state (destroyed or failed), delete it so the unique constraint lets us recreate.
+	// Active states (pending/starting/running/restarting/stopped/destroying) still return
+	// ErrConflict — the caller must destroy first if they really want to replace a live sandbox.
+	if existing, lookupErr := ls.store.GetSandboxByAppName(ctx, req.AppName); lookupErr == nil {
+		state := models.SandboxState(existing.State)
+		if state == models.StateDestroyed || state == models.StateFailed {
+			if derr := ls.store.DeleteSandbox(ctx, existing.ID); derr != nil {
+				return nil, fmt.Errorf("recycle destroyed sandbox: %w", derr)
+			}
+			ls.logger.Info("recycled prior sandbox row",
+				"app_name", req.AppName,
+				"prior_state", existing.State,
+				"prior_id", uuid.UUID(existing.ID.Bytes).String(),
+			)
+		} else {
+			return nil, ErrConflict
+		}
+	} else if !errors.Is(lookupErr, pgx.ErrNoRows) {
+		// Unknown lookup error — surface it, do NOT silently proceed.
+		return nil, fmt.Errorf("lookup existing sandbox: %w", lookupErr)
+	}
+
+	// Create PENDING sandbox row
+	_, err = ls.store.CreateSandbox(ctx, store.CreateSandboxParams{
+		ID:                 pgID,
+		AppName:            req.AppName,
+		UserID:             req.UserID,
+		Image:              req.Image,
+		Resources:          resourcesJSON,
+		Env:                envJSON,
+		IdleTimeoutSeconds: idleTimeout,
+		Metadata:           metadataJSON,
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), "unique") || strings.Contains(err.Error(), "duplicate") {
+			return nil, ErrConflict
+		}
+		return nil, fmt.Errorf("create sandbox: %w", err)
+	}
+
+	// List healthy nodes for scheduling
+	nodes, err := ls.store.ListHealthyNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list healthy nodes: %w", err)
+	}
+
+	// Convert to scheduler candidates
+	candidates := make([]scheduler.NodeCandidate, len(nodes))
+	for i, n := range nodes {
+		candidates[i] = scheduler.NodeCandidate{
+			ID:         uuid.UUID(n.ID.Bytes),
+			CapacityMB: n.CapacityMb,
+			UsedMB:     n.UsedMb,
+			Status:     n.Status,
+		}
+	}
+
+	requiredMB := req.Resources.MemoryMB
+	if requiredMB == 0 {
+		requiredMB = 512
+	}
+
+	selectedNodeID, err := scheduler.Schedule(candidates, requiredMB)
+	if err != nil {
+		return nil, ErrNoCapacity
+	}
+
+	pgNodeID := pgtype.UUID{Bytes: selectedNodeID, Valid: true}
+
+	// Assign sandbox to node (transitions pending -> starting)
+	assigned, err := ls.store.AssignSandboxToNode(ctx, store.AssignSandboxToNodeParams{
+		NodeID: pgNodeID,
+		ID:     pgID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("assign sandbox to node: %w", err)
+	}
+
+	// Create start_sandbox command
+	cmdPayload, err := json.Marshal(map[string]interface{}{
+		"app_name":  req.AppName,
+		"image":     req.Image,
+		"resources": req.Resources,
+		"env":       req.Env,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal command payload: %w", err)
+	}
+
+	cmdID := uuid.New()
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         pgNodeID,
+		SandboxID:      pgID,
+		CommandType:    string(models.CmdStartSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create start command: %w", err)
+	}
+
+	// Record scheduled event
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgID,
+		NodeID:    pgNodeID,
+		EventType: string(models.EventScheduled),
+		Actor:     "control-plane",
+		PrevState: pgtype.Text{String: string(models.StatePending), Valid: true},
+		NextState: pgtype.Text{String: string(models.StateStarting), Valid: true},
+		Payload:   cmdPayload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record scheduled event", "error", err, "sandbox_id", sandboxUUID)
+	}
+
+	nodeIDVal := selectedNodeID
+	return &SandboxResult{
+		ID:      sandboxUUID,
+		AppName: assigned.AppName,
+		UserID:  assigned.UserID,
+		State:   assigned.State,
+		URL:     fmt.Sprintf("https://%s.myappx.live", req.AppName),
+		NodeID:  &nodeIDVal,
+		Image:   req.Image,
+	}, nil
+}
+
+// ── HandleAck ────────────────────────────────────────────────────────
+
+// HandleAck processes a command acknowledgment from an agent.
+// It transitions the sandbox state based on the command type and ack status.
+func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sandboxID uuid.UUID, cmdType string, status string, ackResult json.RawMessage) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	pgCmdID := pgtype.UUID{Bytes: cmdID, Valid: true}
+
+	// Get current sandbox state
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Map (cmdType, status) to state machine event
+	var event models.SandboxEvent
+	needsTransition := true
+
+	switch {
+	case cmdType == string(models.CmdStartSandbox) && status == "success":
+		event = models.EventStarted
+	case cmdType == string(models.CmdStartSandbox) && status == "failure":
+		event = models.EventStartFailed
+	case cmdType == string(models.CmdStopSandbox) && status == "success":
+		// Idle-reaper already transitioned running→stopped before dispatching the
+		// stop command. When the ack arrives the sandbox is in StateStopped, not
+		// StateDestroying, so EventDestroyed is invalid. Only use EventDestroyed
+		// for the explicit destroy flow (sandbox is StateDestroying).
+		if models.SandboxState(sandbox.State) == models.StateDestroying {
+			event = models.EventDestroyed
+		} else {
+			needsTransition = false
+		}
+	case cmdType == string(models.CmdRestartSandbox) && status == "success":
+		// Restart success: no state change, container restarted at Docker level
+		needsTransition = false
+	default:
+		ls.logger.Warn("unhandled ack combination", "cmd_type", cmdType, "status", status)
+		needsTransition = false
+	}
+
+	if needsTransition {
+		currentState := models.SandboxState(sandbox.State)
+		nextState, valid := models.NextState(currentState, event)
+
+		if !valid {
+			// Race: HandleEvent (e.g. container_started) may have already
+			// advanced the state before this ack arrived. If we're already
+			// at the target state, treat as a no-op instead of failing.
+			alreadyAtTarget := false
+			switch event {
+			case models.EventStarted:
+				alreadyAtTarget = currentState == models.StateRunning
+			case models.EventStartFailed:
+				alreadyAtTarget = currentState == models.StateFailed
+			case models.EventDestroyed:
+				alreadyAtTarget = currentState == models.StateDestroyed
+			}
+			if !alreadyAtTarget {
+				return fmt.Errorf("%w: %s + %s from %s", ErrInvalidTransition, cmdType, status, sandbox.State)
+			}
+			ls.logger.Info("ack transition skipped: state already advanced",
+				"sandbox_id", sandboxID,
+				"current_state", currentState,
+				"cmd_type", cmdType,
+			)
+			nextState = currentState
+		} else {
+			_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+				State:   string(nextState),
+				ID:      pgSandboxID,
+				State_2: sandbox.State,
+			})
+			if err != nil {
+				// Optimistic-lock miss: another handler (typically the
+				// container_started event from the same agent) advanced
+				// the row between our read and write. Re-read; if the
+				// row's current state is already what this ack would set
+				// (or further along in the same direction), treat as
+				// idempotent no-op instead of bubbling a 500 to the
+				// agent — same shape as the `!valid` branch above.
+				if errors.Is(err, pgx.ErrNoRows) {
+					if refreshed, ferr := ls.store.GetSandbox(ctx, pgSandboxID); ferr == nil {
+						currentNow := models.SandboxState(refreshed.State)
+						if currentNow == nextState ||
+							(event == models.EventStarted && currentNow == models.StateRunning) ||
+							(event == models.EventStartFailed && currentNow == models.StateFailed) ||
+							(event == models.EventDestroyed && currentNow == models.StateDestroyed) {
+							ls.logger.Info("ack transition skipped: state already advanced (concurrent)",
+								"sandbox_id", sandboxID,
+								"current_state", currentNow,
+								"cmd_type", cmdType,
+							)
+							sandbox = refreshed
+							nextState = currentNow
+						} else {
+							return fmt.Errorf("transition state: %w", err)
+						}
+					} else {
+						return fmt.Errorf("transition state: %w", err)
+					}
+				} else {
+					return fmt.Errorf("transition state: %w", err)
+				}
+			}
+		}
+
+		// Persist container_id and host_port from agent ack result.
+		// The agent sends these in the start_sandbox success ack payload.
+		// Re-fetch the sandbox row afterwards so downstream notifications
+		// (route upsert) see the updated host_port. Without this, restarts
+		// push the STALE pre-restart port into Caddy and drift -- which only
+		// compares app_names -- never heals it.
+		if event == models.EventStarted {
+			ls.persistRuntimeInfo(ctx, pgSandboxID, sandboxID, ackResult)
+			if refreshed, err := ls.store.GetSandbox(ctx, pgSandboxID); err == nil {
+				sandbox = refreshed
+			}
+		}
+
+		// Record event
+		_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+			SandboxID: pgSandboxID,
+			NodeID:    sandbox.NodeID,
+			EventType: string(event),
+			Actor:     "agent",
+			PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+			NextState: pgtype.Text{String: string(nextState), Valid: true},
+			Payload:   safePayload(ackResult),
+		})
+		if err != nil {
+			ls.logger.Warn("failed to record ack event", "error", err, "sandbox_id", sandboxID)
+		}
+
+		// Notify route manager of state changes (best-effort, errors logged)
+		if ls.routeNotifier != nil {
+			switch nextState {
+			case models.StateRunning:
+				ls.notifyRouteAdd(ctx, sandbox, sandboxID)
+			case models.StateDestroyed:
+				ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+			}
+		}
+
+		// Reset restart failure count on successful start (handles restart recovery).
+		if ls.restartMgr != nil && nextState == models.StateRunning && sandbox.FailureCount > 0 {
+			if err := ls.restartMgr.HandleRestarted(ctx, pgSandboxID); err != nil {
+				ls.logger.Warn("restart manager HandleRestarted failed",
+					"error", err,
+					"sandbox_id", sandboxID,
+				)
+			}
+		}
+	}
+
+	// Ack the command
+	ackStatus := "completed"
+	if status == "failure" {
+		ackStatus = "failed"
+	}
+	err = ls.store.AckCommand(ctx, store.AckCommandParams{
+		ID:     pgCmdID,
+		Status: ackStatus,
+		Result: ackResult,
+	})
+	if err != nil {
+		return fmt.Errorf("ack command: %w", err)
+	}
+
+	return nil
+}
+
+// ── HandleEvent ──────────────────────────────────────────────────────
+
+// HandleEvent processes a container event reported by an agent.
+// It maps the agent event type to a state machine event and transitions accordingly.
+func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, sandboxID uuid.UUID, eventType string, payload json.RawMessage) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	pgNodeID := pgtype.UUID{Bytes: nodeID, Valid: true}
+
+	// Get current sandbox state
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Map agent event_type to state machine event
+	var event models.SandboxEvent
+	switch eventType {
+	case "container_started":
+		event = models.EventStarted
+	case "container_exited":
+		event = models.EventContainerExited
+	case "container_oom":
+		event = models.EventContainerExited // Same transition as exit
+	default:
+		ls.logger.Warn("unhandled event type", "event_type", eventType, "sandbox_id", sandboxID)
+		return nil
+	}
+
+	// Validate transition via state machine
+	currentState := models.SandboxState(sandbox.State)
+	nextState, valid := models.NextState(currentState, event)
+	if !valid {
+		ls.logger.Warn("invalid state transition for event",
+			"sandbox_id", sandboxID,
+			"current_state", sandbox.State,
+			"event", event,
+		)
+		return nil // Not an error -- just ignore invalid transitions
+	}
+
+	// Transition state
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(nextState),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Record event
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    pgNodeID,
+		EventType: eventType,
+		Actor:     "agent",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: string(nextState), Valid: true},
+		Payload:   safePayload(payload),
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	// Notify route manager when sandbox leaves running state (best-effort).
+	// Only container_exited triggers route removal here -- container_started
+	// does NOT trigger route add (only HandleAck for start_sandbox does).
+	if ls.routeNotifier != nil && currentState == models.StateRunning {
+		switch nextState {
+		case models.StateRestarting, models.StateStopped, models.StateFailed:
+			ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+		}
+	}
+
+	// Delegate to restart manager when transitioning to restarting state.
+	// The restart manager handles failure counting and exponential backoff.
+	if ls.restartMgr != nil && nextState == models.StateRestarting {
+		result, err := ls.restartMgr.HandleCrash(ctx, sandbox)
+		if err != nil {
+			ls.logger.Warn("restart manager HandleCrash failed",
+				"error", err,
+				"sandbox_id", sandboxID,
+			)
+		} else if result.ShouldRestart {
+			ls.logger.Info("restart scheduled",
+				"sandbox_id", sandboxID,
+				"delay", result.Delay,
+			)
+		}
+	}
+
+	return nil
+}
+
+// ── DestroySandbox ───────────────────────────────────────────────────
+
+// DestroySandbox transitions a sandbox to DESTROYING and dispatches a stop_sandbox command.
+func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Validate transition via state machine
+	currentState := models.SandboxState(sandbox.State)
+
+	// Phase 32 Wave 2 Bug 3 — idempotent short-circuit. The state machine
+	// permits destroy_request as a self-loop on destroying/destroyed (so
+	// downstream callers using NextState directly don't see invalid-transition
+	// errors), but the handler itself should skip the redundant DB UPDATE
+	// and the spurious stop_sandbox command. The reschedule-on-node-flap
+	// path was producing 24 errors/sec at 14:35:03-05 from re-attempted
+	// destroys against terminal rows; this short-circuit silences them.
+	if currentState == models.StateDestroying || currentState == models.StateDestroyed {
+		ls.logger.Info("destroy skipped: sandbox already in terminal teardown",
+			"sandbox_id", sandboxID,
+			"current_state", currentState,
+		)
+		return nil
+	}
+
+	nextState, valid := models.NextState(currentState, models.EventDestroyRequest)
+	if !valid {
+		return fmt.Errorf("%w: cannot destroy sandbox in state %s", ErrInvalidTransition, sandbox.State)
+	}
+
+	// Transition to destroying
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(nextState),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Create stop_sandbox command targeted at sandbox's node
+	cmdID := uuid.New()
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"container_id": sandbox.ContainerID.String,
+	})
+
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sandbox.NodeID,
+		SandboxID:      pgSandboxID,
+		CommandType:    string(models.CmdStopSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return fmt.Errorf("create stop command: %w", err)
+	}
+
+	// Record event
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: string(models.EventDestroyRequest),
+		Actor:     "control-plane",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: string(nextState), Valid: true},
+		Payload:   cmdPayload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record destroy event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	return nil
+}
+
+// ── WakeSandbox ──────────────────────────────────────────────────────
+
+// WakeSandbox re-starts a stopped sandbox by firing EventScheduled and
+// dispatching a new start_sandbox command. Only valid from StateStopped.
+func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	if sandbox.State != string(models.StateStopped) {
+		return fmt.Errorf("%w: sandbox must be stopped to wake, current state: %s", ErrInvalidState, sandbox.State)
+	}
+
+	// Transition stopped → starting via EventScheduled
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(models.StateStarting),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Decode resources and env to re-issue the start command
+	var resources Resources
+	if len(sandbox.Resources) > 0 {
+		_ = json.Unmarshal(sandbox.Resources, &resources)
+	}
+	var env map[string]string
+	if len(sandbox.Env) > 0 {
+		_ = json.Unmarshal(sandbox.Env, &env)
+	}
+
+	cmdPayload, err := json.Marshal(map[string]interface{}{
+		"app_name":  sandbox.AppName,
+		"image":     sandbox.Image,
+		"resources": resources,
+		"env":       env,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal command payload: %w", err)
+	}
+
+	cmdID := uuid.New()
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sandbox.NodeID,
+		SandboxID:      pgSandboxID,
+		CommandType:    string(models.CmdStartSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return fmt.Errorf("create start command: %w", err)
+	}
+
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: string(models.EventScheduled),
+		Actor:     "control-plane-wake",
+		PrevState: pgtype.Text{String: string(models.StateStopped), Valid: true},
+		NextState: pgtype.Text{String: string(models.StateStarting), Valid: true},
+		Payload:   cmdPayload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record wake event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	ls.logger.Info("waking stopped sandbox", "sandbox_id", sandboxID, "app_name", sandbox.AppName)
+	return nil
+}
+
+// ── RestartSandbox ───────────────────────────────────────────────────
+
+// RestartSandbox creates a restart_sandbox command for a running sandbox.
+// No state transition occurs -- the restart is handled at the Docker level.
+func (ls *LifecycleService) RestartSandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	// Must be in running state
+	if sandbox.State != string(models.StateRunning) {
+		return fmt.Errorf("%w: sandbox must be running to restart, current state: %s", ErrInvalidState, sandbox.State)
+	}
+
+	// Create restart_sandbox command
+	cmdID := uuid.New()
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"container_id": sandbox.ContainerID.String,
+	})
+
+	_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sandbox.NodeID,
+		SandboxID:      pgSandboxID,
+		CommandType:    string(models.CmdRestartSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	if err != nil {
+		return fmt.Errorf("create restart command: %w", err)
+	}
+
+	// Record event (informational, no state change)
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: "restart_requested",
+		Actor:     "control-plane",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: sandbox.State, Valid: true},
+		Payload:   cmdPayload,
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record restart event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	return nil
+}
+
+// ── Route Notification Helpers ──────────────────────────────────────
+
+// notifyRouteAdd builds the upstream address from node + sandbox data and
+// calls OnSandboxRunning. Errors are logged as warnings, never propagated.
+func (ls *LifecycleService) notifyRouteAdd(ctx context.Context, sandbox store.Sandbox, sandboxID uuid.UUID) {
+	if !sandbox.NodeID.Valid || !sandbox.HostPort.Valid {
+		ls.logger.Warn("cannot notify route add: missing node_id or host_port",
+			"sandbox_id", sandboxID,
+			"node_id_valid", sandbox.NodeID.Valid,
+			"host_port_valid", sandbox.HostPort.Valid,
+		)
+		return
+	}
+
+	node, err := ls.store.GetNodeByID(ctx, sandbox.NodeID)
+	if err != nil {
+		ls.logger.Warn("failed to get node for route notification",
+			"error", err,
+			"sandbox_id", sandboxID,
+			"node_id", uuid.UUID(sandbox.NodeID.Bytes).String(),
+		)
+		return
+	}
+
+	upstream := fmt.Sprintf("%s:%d", node.TailscaleIp.String(), sandbox.HostPort.Int32)
+	if err := ls.routeNotifier.OnSandboxRunning(ctx, sandbox.AppName, sandboxID.String(), upstream); err != nil {
+		ls.logger.Warn("route add notification failed",
+			"error", err,
+			"app_name", sandbox.AppName,
+			"sandbox_id", sandboxID,
+			"upstream", upstream,
+		)
+	}
+}
+
+// notifyRouteRemove calls OnSandboxStopped. Errors are logged, never propagated.
+func (ls *LifecycleService) notifyRouteRemove(ctx context.Context, appName string, sandboxID uuid.UUID) {
+	if err := ls.routeNotifier.OnSandboxStopped(ctx, appName); err != nil {
+		ls.logger.Warn("route remove notification failed",
+			"error", err,
+			"app_name", appName,
+			"sandbox_id", sandboxID,
+		)
+	}
+}
+
+// persistRuntimeInfo extracts container_id and host_port from an ack result
+// and persists them to the sandbox row. Best-effort: errors are logged.
+func (ls *LifecycleService) persistRuntimeInfo(ctx context.Context, pgSandboxID pgtype.UUID, sandboxID uuid.UUID, ackResult json.RawMessage) {
+	if len(ackResult) == 0 {
+		return
+	}
+	var info struct {
+		ContainerID string `json:"container_id"`
+		HostPort    int32  `json:"host_port"`
+	}
+	if err := json.Unmarshal(ackResult, &info); err != nil {
+		ls.logger.Warn("failed to parse ack runtime info", "error", err, "sandbox_id", sandboxID)
+		return
+	}
+	if info.ContainerID == "" && info.HostPort == 0 {
+		return
+	}
+	if err := ls.store.UpdateSandboxRuntime(ctx, store.UpdateSandboxRuntimeParams{
+		ContainerID: pgtype.Text{String: info.ContainerID, Valid: info.ContainerID != ""},
+		HostPort:    pgtype.Int4{Int32: info.HostPort, Valid: info.HostPort != 0},
+		ID:          pgSandboxID,
+	}); err != nil {
+		ls.logger.Warn("failed to persist sandbox runtime info",
+			"error", err,
+			"sandbox_id", sandboxID,
+			"container_id", info.ContainerID,
+			"host_port", info.HostPort,
+		)
+	}
+}
+
+// safePayload returns p if non-nil, or an empty JSON object otherwise.
+// Prevents NOT NULL constraint violations on the events.payload column.
+func safePayload(p []byte) []byte {
+	if len(p) == 0 {
+		return []byte(`{}`)
+	}
+	return p
+}

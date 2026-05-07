@@ -1,0 +1,23 @@
+{
+  "name": "@appx/forge-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Forge control plane API",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/node": "^22.0.0",
+    "jest": "^30.0.0",
+    "ts-jest": "^29.0.0",
+    "@types/jest": "^30.0.0",
+    "nock": "^14.0.0"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "admin": {
+    "listen": "0.0.0.0:2019"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":8443"],
+          "routes": []
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,80 @@
+---
+# Role: forge-agent
+# Installs the forge-agent binary, configures it as a systemd service,
+# and verifies it starts and registers with the control plane.
+
+- name: Copy forge-agent binary
+  ansible.builtin.copy:
+    src: "{{ forge_agent_binary_path }}"
+    dest: /usr/local/bin/forge-agent
+    owner: root
+    group: root
+    mode: "0755"
+  when: forge_agent_binary_path is defined and forge_agent_binary_url is not defined
+
+- name: Download forge-agent binary
+  ansible.builtin.get_url:
+    url: "{{ forge_agent_binary_url }}"
+    dest: /usr/local/bin/forge-agent
+    owner: root
+    group: root
+    mode: "0755"
+  when: forge_agent_binary_url is defined
+
+- name: Create /var/lib/forge directory
+  ansible.builtin.file:
+    path: /var/lib/forge
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create sandbox code directory
+  ansible.builtin.file:
+    path: "{{ forge_code_dir | default('/var/lib/forge/sandboxes') }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Template forge-agent.service
+  ansible.builtin.template:
+    src: forge-agent.service.j2
+    dest: /etc/systemd/system/forge-agent.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart forge-agent
+
+- name: Template forge-agent.env
+  ansible.builtin.template:
+    src: forge-agent.env.j2
+    dest: /etc/forge/agent.env
+    owner: root
+    group: root
+    # T-06-12: agent.env contains control URL -- restrict permissions
+    mode: "0600"
+  notify: Restart forge-agent
+
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Enable and start forge-agent
+  ansible.builtin.systemd:
+    name: forge-agent
+    enabled: true
+    state: started
+
+- name: Wait for forge-agent to be running
+  ansible.builtin.command:
+    cmd: systemctl is-active forge-agent
+  register: agent_status
+  until: agent_status.stdout == "active"
+  retries: 15
+  delay: 2
+  changed_when: false
+
+- name: Show forge-agent status
+  ansible.builtin.debug:
+    msg: "forge-agent is {{ agent_status.stdout }}"

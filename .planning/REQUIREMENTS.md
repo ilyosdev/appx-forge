@@ -9,127 +9,127 @@ Requirements for production cutover (replacing Railover). Each maps to roadmap p
 
 ### Infrastructure Validation
 
-- [ ] **INFRA-01**: Tailscale UDP connectivity verified between Contabo VDS nodes (direct peering, not DERP relay)
-- [ ] **INFRA-02**: Docker Engine 27.x installed and confirmed on target nodes
-- [ ] **INFRA-03**: Kernel inotify watch limit set to support 80+ containers with Metro file watchers
-- [ ] **INFRA-04**: Cloudflare wildcard DNS configured for `*.myappx.live` pointing at proxy node(s)
+- [x] **INFRA-01**: Tailscale UDP connectivity verified between Contabo VDS nodes (direct peering, not DERP relay)
+- [x] **INFRA-02**: Docker Engine 27.x installed and confirmed on target nodes
+- [x] **INFRA-03**: Kernel inotify watch limit set to support 80+ containers with Metro file watchers
+- [x] **INFRA-04**: Cloudflare wildcard DNS configured for `*.myappx.live` pointing at proxy node(s)
 
 ### Contracts & Schema
 
-- [ ] **CNTR-01**: OpenAPI 3.1 spec defines all v1 endpoints (sandbox CRUD, node registration, agent commands, routes)
-- [ ] **CNTR-02**: Agent protocol documented (registration, long-poll commands, command ack, event reporting)
-- [ ] **CNTR-03**: File push protocol documented (control plane redirect, signed URL, agent direct endpoint)
-- [ ] **CNTR-04**: Proxy routing protocol documented (Caddy Admin API shape, drift detection)
-- [ ] **CNTR-05**: Postgres schema with migrations (nodes, sandboxes, events, commands tables)
-- [ ] **CNTR-06**: Sandbox state machine implemented with compare-and-swap (`UPDATE WHERE state = $expected`)
+- [x] **CNTR-01**: OpenAPI 3.1 spec defines all v1 endpoints (sandbox CRUD, node registration, agent commands, routes)
+- [x] **CNTR-02**: Agent protocol documented (registration, long-poll commands, command ack, event reporting)
+- [x] **CNTR-03**: File push protocol documented (control plane redirect, signed URL, agent direct endpoint)
+- [x] **CNTR-04**: Proxy routing protocol documented (Caddy Admin API shape, drift detection)
+- [x] **CNTR-05**: Postgres schema with migrations (nodes, sandboxes, events, commands tables)
+- [x] **CNTR-06**: Sandbox state machine implemented with compare-and-swap (`UPDATE WHERE state = $expected`)
 
 ### Control Plane
 
-- [ ] **CTRL-01**: Go HTTP API serves all OpenAPI-defined endpoints via chi router
-- [ ] **CTRL-02**: Sandbox create endpoint accepts spec, writes PENDING row, triggers scheduling
-- [ ] **CTRL-03**: Bin-packing scheduler picks node with most free RAM, excludes draining/unhealthy nodes
-- [ ] **CTRL-04**: Command dispatch via long-poll: agent polls, control plane holds up to 30s, returns commands
-- [ ] **CTRL-05**: Command acknowledgment: agent reports success/failure, control plane updates sandbox state
-- [ ] **CTRL-06**: Node registration: agent registers on boot, receives agent_token and heartbeat interval
-- [ ] **CTRL-07**: Heartbeat processing: update node last_seen_at, mark unhealthy after 3 missed (45s)
-- [ ] **CTRL-08**: Event ingestion: agent reports container events (started, exited, OOM), control plane transitions state
-- [ ] **CTRL-09**: File push redirect: returns 307 to agent's direct endpoint with HMAC-signed URL (60s expiry)
-- [ ] **CTRL-10**: Route management: add/remove Caddy routes via Admin API on sandbox state changes
-- [ ] **CTRL-11**: Routing drift detector: every 60s diff Caddy state vs Postgres, fix discrepancies (routes only, never containers)
-- [ ] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
-- [ ] **CTRL-13**: Auto-restart with backoff: on container crash, restart up to 3 times with exponential backoff, then mark FAILED
-- [ ] **CTRL-14**: Bearer token auth on all endpoints (except /healthz and /metrics)
-- [ ] **CTRL-15**: Prometheus metrics endpoint (/metrics): sandbox count by state, node utilization, request latency
-- [ ] **CTRL-16**: Health endpoint (/healthz): self-check + Postgres connectivity
+- [x] **CTRL-01**: Go HTTP API serves all OpenAPI-defined endpoints via chi router
+- [x] **CTRL-02**: Sandbox create endpoint accepts spec, writes PENDING row, triggers scheduling
+- [x] **CTRL-03**: Bin-packing scheduler picks node with most free RAM, excludes draining/unhealthy nodes
+- [x] **CTRL-04**: Command dispatch via long-poll: agent polls, control plane holds up to 30s, returns commands
+- [x] **CTRL-05**: Command acknowledgment: agent reports success/failure, control plane updates sandbox state
+- [x] **CTRL-06**: Node registration: agent registers on boot, receives agent_token and heartbeat interval
+- [x] **CTRL-07**: Heartbeat processing: update node last_seen_at, mark unhealthy after 3 missed (45s)
+- [x] **CTRL-08**: Event ingestion: agent reports container events (started, exited, OOM), control plane transitions state
+- [x] **CTRL-09**: File push redirect: returns 307 to agent's direct endpoint with HMAC-signed URL (60s expiry)
+- [x] **CTRL-10**: Route management: add/remove Caddy routes via Admin API on sandbox state changes
+- [x] **CTRL-11**: Routing drift detector: every 60s diff Caddy state vs Postgres, fix discrepancies (routes only, never containers)
+- [x] **CTRL-12**: Idle reaping: stop sandboxes idle > 30min (configurable), remove routes
+- [x] **CTRL-13**: Auto-restart with backoff: on container crash, restart up to 3 times with exponential backoff, then mark FAILED
+- [x] **CTRL-14**: Bearer token auth on all endpoints (except /healthz and /metrics)
+- [x] **CTRL-15**: Prometheus metrics endpoint (/metrics): sandbox count by state, node utilization, request latency
+- [x] **CTRL-16**: Health endpoint (/healthz): self-check + Postgres connectivity
 
 ### Agent
 
-- [ ] **AGNT-01**: Single Go binary runs as systemd service on each node
-- [ ] **AGNT-02**: Registers with control plane on boot, receives agent_token
-- [ ] **AGNT-03**: Sends heartbeat every 15s with used_mb and running container count
-- [ ] **AGNT-04**: Long-polls control plane for commands (start_sandbox, stop_sandbox, restart_sandbox, get_logs, prune)
-- [ ] **AGNT-05**: Creates Docker containers via Docker SDK: port binding, bind mount for code, resource limits, seccomp, capability dropping
-- [ ] **AGNT-06**: Watches Docker events stream for die/oom events, reports to control plane immediately
-- [ ] **AGNT-07**: Reconnects Docker event stream with `Since` timestamp on disconnect (no missed events)
-- [ ] **AGNT-08**: File push HTTP endpoint: validates signed URL, writes files to bind-mount directory
-- [ ] **AGNT-09**: Port allocator: assigns host ports from range 40000-50000, avoids conflicts
-- [ ] **AGNT-10**: Pre-pulls sandbox image on registration and periodically checks for new versions
-- [ ] **AGNT-11**: Log retrieval: wraps docker logs API, supports tail and follow modes
-- [ ] **AGNT-12**: Container directory setup with correct UID/GID for bind mounts
+- [x] **AGNT-01**: Single Go binary runs as systemd service on each node
+- [x] **AGNT-02**: Registers with control plane on boot, receives agent_token
+- [x] **AGNT-03**: Sends heartbeat every 15s with used_mb and running container count
+- [x] **AGNT-04**: Long-polls control plane for commands (start_sandbox, stop_sandbox, restart_sandbox, get_logs, prune)
+- [x] **AGNT-05**: Creates Docker containers via Docker SDK: port binding, bind mount for code, resource limits, seccomp, capability dropping
+- [x] **AGNT-06**: Watches Docker events stream for die/oom events, reports to control plane immediately
+- [x] **AGNT-07**: Reconnects Docker event stream with `Since` timestamp on disconnect (no missed events)
+- [x] **AGNT-08**: File push HTTP endpoint: validates signed URL, writes files to bind-mount directory
+- [x] **AGNT-09**: Port allocator: assigns host ports from range 40000-50000, avoids conflicts
+- [x] **AGNT-10**: Pre-pulls sandbox image on registration and periodically checks for new versions
+- [x] **AGNT-11**: Log retrieval: wraps docker logs API, supports tail and follow modes
+- [x] **AGNT-12**: Container directory setup with correct UID/GID for bind mounts
 
 ### Proxy & Routing
 
-- [ ] **PRXY-01**: Caddy runs with base config, Cloudflare Origin CA cert for TLS termination
-- [ ] **PRXY-02**: Control plane adds/removes routes via Caddy Admin API (host matcher + reverse proxy upstream)
-- [ ] **PRXY-03**: WebSocket upgrade works through Caddy (HMR for Metro)
-- [ ] **PRXY-04**: Route updates batched with 500ms debounce to minimize Caddy config reloads (WebSocket drop mitigation)
-- [ ] **PRXY-05**: Cloudflare DNS wildcard `*.myappx.live` points at Caddy public IP(s)
+- [x] **PRXY-01**: Caddy runs with base config, Cloudflare Origin CA cert for TLS termination
+- [x] **PRXY-02**: Control plane adds/removes routes via Caddy Admin API (host matcher + reverse proxy upstream)
+- [x] **PRXY-03**: WebSocket upgrade works through Caddy (HMR for Metro)
+- [x] **PRXY-04**: Route updates batched with 500ms debounce to minimize Caddy config reloads (WebSocket drop mitigation)
+- [x] **PRXY-05**: Cloudflare DNS wildcard `*.myappx.live` points at Caddy public IP(s)
 
 ### CLI
 
-- [ ] **CLI-01**: `forge node list` -- show all nodes with status, capacity, sandbox count
-- [ ] **CLI-02**: `forge node add` -- register a new node
-- [ ] **CLI-03**: `forge node drain` -- stop scheduling, let existing sandboxes idle-reap
-- [ ] **CLI-04**: `forge node remove` -- remove node (only if sandbox count is 0)
-- [ ] **CLI-05**: `forge sandbox list` -- filter by app, node, state
-- [ ] **CLI-06**: `forge sandbox inspect` -- full sandbox details
-- [ ] **CLI-07**: `forge sandbox logs` -- with --follow and --tail
-- [ ] **CLI-08**: `forge sandbox restart` -- force restart
-- [ ] **CLI-09**: `forge sandbox destroy` -- destroy sandbox
-- [ ] **CLI-10**: `forge routes list` -- show active routes
-- [ ] **CLI-11**: `forge routes verify` -- diff Caddy vs Postgres
-- [ ] **CLI-12**: `forge events` -- filter by sandbox, since
-- [ ] **CLI-13**: `forge healthcheck` -- control plane health
+- [x] **CLI-01**: `forge node list` -- show all nodes with status, capacity, sandbox count
+- [x] **CLI-02**: `forge node add` -- register a new node
+- [x] **CLI-03**: `forge node drain` -- stop scheduling, let existing sandboxes idle-reap
+- [x] **CLI-04**: `forge node remove` -- remove node (only if sandbox count is 0)
+- [x] **CLI-05**: `forge sandbox list` -- filter by app, node, state
+- [x] **CLI-06**: `forge sandbox inspect` -- full sandbox details
+- [x] **CLI-07**: `forge sandbox logs` -- with --follow and --tail
+- [x] **CLI-08**: `forge sandbox restart` -- force restart
+- [x] **CLI-09**: `forge sandbox destroy` -- destroy sandbox
+- [x] **CLI-10**: `forge routes list` -- show active routes
+- [x] **CLI-11**: `forge routes verify` -- diff Caddy vs Postgres
+- [x] **CLI-12**: `forge events` -- filter by sandbox, since
+- [x] **CLI-13**: `forge healthcheck` -- control plane health
 
 ### TypeScript SDK
 
-- [ ] **SDK-01**: ForgeClient class with baseUrl + apiKey config
-- [ ] **SDK-02**: `sandboxes.create()` -- create sandbox, return Sandbox object with URL
-- [ ] **SDK-03**: `sandboxes.get()` -- get sandbox by ID or app:name
-- [ ] **SDK-04**: `sandboxes.list()` -- filter by user, state, app_name
-- [ ] **SDK-05**: `sandboxes.destroy()` -- destroy sandbox
-- [ ] **SDK-06**: `sandboxes.restart()` -- force restart
-- [ ] **SDK-07**: `sandboxes.pushFiles()` -- push files (follows 307 redirect to agent)
-- [ ] **SDK-08**: `sandboxes.logs()` -- get logs
-- [ ] **SDK-09**: Types generated from OpenAPI spec via openapi-typescript-codegen
+- [x] **SDK-01**: ForgeClient class with baseUrl + apiKey config
+- [x] **SDK-02**: `sandboxes.create()` -- create sandbox, return Sandbox object with URL
+- [x] **SDK-03**: `sandboxes.get()` -- get sandbox by ID or app:name
+- [x] **SDK-04**: `sandboxes.list()` -- filter by user, state, app_name
+- [x] **SDK-05**: `sandboxes.destroy()` -- destroy sandbox
+- [x] **SDK-06**: `sandboxes.restart()` -- force restart
+- [x] **SDK-07**: `sandboxes.pushFiles()` -- push files (follows 307 redirect to agent)
+- [x] **SDK-08**: `sandboxes.logs()` -- get logs
+- [x] **SDK-09**: Types generated from OpenAPI spec via openapi-typescript-codegen
 
 ### Sandbox Image
 
-- [ ] **IMG-01**: Dockerfile produces <500MB image with Metro/Expo pre-installed
-- [ ] **IMG-02**: Runs on port 8081, accepts code via bind-mount at /app/code
-- [ ] **IMG-03**: Pre-installed node_modules for common Expo dependencies
-- [ ] **IMG-04**: Documents required env vars (APP_NAME, PORT)
-- [ ] **IMG-05**: Cold start to Metro responding in <10s
+- [x] **IMG-01**: Dockerfile produces <500MB image with Metro/Expo pre-installed
+- [x] **IMG-02**: Runs on port 8081, accepts code via bind-mount at /app/code
+- [x] **IMG-03**: Pre-installed node_modules for common Expo dependencies
+- [x] **IMG-04**: Documents required env vars (APP_NAME, PORT)
+- [x] **IMG-05**: Cold start to Metro responding in <10s
 
 ### Security
 
-- [ ] **SEC-01**: Seccomp profile restricts sandbox containers to ~40 syscalls
-- [ ] **SEC-02**: Capability dropping: `--cap-drop ALL` + CHOWN/SETUID/SETGID only
-- [ ] **SEC-03**: `no-new-privileges:true` on all sandbox containers
-- [ ] **SEC-04**: PID limit (256) on sandbox containers
-- [ ] **SEC-05**: Agent token scoped per node (not global API key)
-- [ ] **SEC-06**: File push signed URLs with HMAC-SHA256 + 60s expiry
+- [x] **SEC-01**: Seccomp profile restricts sandbox containers to ~40 syscalls
+- [x] **SEC-02**: Capability dropping: `--cap-drop ALL` + CHOWN/SETUID/SETGID only
+- [x] **SEC-03**: `no-new-privileges:true` on all sandbox containers
+- [x] **SEC-04**: PID limit (256) on sandbox containers
+- [x] **SEC-05**: Agent token scoped per node (not global API key)
+- [x] **SEC-06**: File push signed URLs with HMAC-SHA256 + 60s expiry
 
 ### Deployment & Ops
 
-- [ ] **OPS-01**: Ansible playbook bootstraps new node (Docker, Tailscale, agent systemd service)
-- [ ] **OPS-02**: docker-compose.dev.yml for local development (Postgres + control + 1 agent)
-- [ ] **OPS-03**: Runbook: add new node to fleet
-- [ ] **OPS-04**: Runbook: recover failed sandbox
-- [ ] **OPS-05**: Runbook: debug stuck container
+- [x] **OPS-01**: Ansible playbook bootstraps new node (Docker, Tailscale, agent systemd service)
+- [x] **OPS-02**: docker-compose.dev.yml for local development (Postgres + control + 1 agent)
+- [x] **OPS-03**: Runbook: add new node to fleet
+- [x] **OPS-04**: Runbook: recover failed sandbox
+- [x] **OPS-05**: Runbook: debug stuck container
 
 ### appx-api Integration
 
-- [ ] **INT-01**: appx-api imports forge-sdk-ts, replaces RailoverService calls with ForgeClient
-- [ ] **INT-02**: Delete RailoverService, ContainerReconcilerService, ContainerCircuitBreakerService from backend
-- [ ] **INT-03**: Update container-state.types.ts to align with Forge sandbox states
-- [ ] **INT-04**: Integration tests: appx-api creates sandbox via SDK, pushes files, verifies URL works
+- [x] **INT-01**: appx-api imports forge-sdk-ts, replaces RailoverService calls with ForgeClient
+- [x] **INT-02**: Delete RailoverService, ContainerReconcilerService, ContainerCircuitBreakerService from backend
+- [x] **INT-03**: Update container-state.types.ts to align with Forge sandbox states
+- [x] **INT-04**: Integration tests: appx-api creates sandbox via SDK, pushes files, verifies URL works
 
 ### Multi-Node
 
-- [ ] **MULTI-01**: Scheduler distributes sandboxes across 3+ nodes
-- [ ] **MULTI-02**: Node failure detection: missed heartbeats -> mark unhealthy -> reschedule RUNNING sandboxes
-- [ ] **MULTI-03**: Reschedule completes within 90s of node failure detection
+- [x] **MULTI-01**: Scheduler distributes sandboxes across 3+ nodes
+- [x] **MULTI-02**: Node failure detection: missed heartbeats -> mark unhealthy -> reschedule RUNNING sandboxes
+- [x] **MULTI-03**: Reschedule completes within 90s of node failure detection
 
 ## v2 Requirements
 
@@ -172,94 +172,94 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| INFRA-01 | Phase 1 | Pending |
-| INFRA-02 | Phase 1 | Pending |
-| INFRA-03 | Phase 1 | Pending |
-| INFRA-04 | Phase 1 | Pending |
-| CNTR-01 | Phase 1 | Pending |
-| CNTR-02 | Phase 1 | Pending |
-| CNTR-03 | Phase 1 | Pending |
-| CNTR-04 | Phase 1 | Pending |
-| CNTR-05 | Phase 1 | Pending |
-| CNTR-06 | Phase 1 | Pending |
-| IMG-01 | Phase 1 | Pending |
-| IMG-02 | Phase 1 | Pending |
-| IMG-03 | Phase 1 | Pending |
-| IMG-04 | Phase 1 | Pending |
-| IMG-05 | Phase 1 | Pending |
-| AGNT-01 | Phase 2 | Pending |
-| AGNT-02 | Phase 2 | Pending |
-| AGNT-03 | Phase 2 | Pending |
-| AGNT-04 | Phase 2 | Pending |
-| AGNT-05 | Phase 2 | Pending |
-| AGNT-06 | Phase 2 | Pending |
-| AGNT-07 | Phase 2 | Pending |
-| AGNT-08 | Phase 2 | Pending |
-| AGNT-09 | Phase 2 | Pending |
-| AGNT-10 | Phase 2 | Pending |
-| AGNT-11 | Phase 2 | Pending |
-| AGNT-12 | Phase 2 | Pending |
-| CTRL-01 | Phase 3 | Pending |
-| CTRL-02 | Phase 3 | Pending |
-| CTRL-03 | Phase 3 | Pending |
-| CTRL-04 | Phase 3 | Pending |
-| CTRL-05 | Phase 3 | Pending |
-| CTRL-06 | Phase 3 | Pending |
-| CTRL-07 | Phase 3 | Pending |
-| CTRL-08 | Phase 3 | Pending |
-| CTRL-09 | Phase 3 | Pending |
-| CTRL-10 | Phase 4 | Pending |
-| CTRL-11 | Phase 5 | Pending |
-| CTRL-12 | Phase 5 | Pending |
-| CTRL-13 | Phase 5 | Pending |
-| CTRL-14 | Phase 3 | Pending |
-| CTRL-15 | Phase 5 | Pending |
-| CTRL-16 | Phase 3 | Pending |
-| PRXY-01 | Phase 4 | Pending |
-| PRXY-02 | Phase 4 | Pending |
-| PRXY-03 | Phase 4 | Pending |
-| PRXY-04 | Phase 4 | Pending |
-| PRXY-05 | Phase 4 | Pending |
-| CLI-01 | Phase 6 | Pending |
-| CLI-02 | Phase 6 | Pending |
-| CLI-03 | Phase 6 | Pending |
-| CLI-04 | Phase 6 | Pending |
-| CLI-05 | Phase 6 | Pending |
-| CLI-06 | Phase 6 | Pending |
-| CLI-07 | Phase 6 | Pending |
-| CLI-08 | Phase 6 | Pending |
-| CLI-09 | Phase 6 | Pending |
-| CLI-10 | Phase 6 | Pending |
-| CLI-11 | Phase 6 | Pending |
-| CLI-12 | Phase 6 | Pending |
-| CLI-13 | Phase 6 | Pending |
-| SDK-01 | Phase 6 | Pending |
-| SDK-02 | Phase 6 | Pending |
-| SDK-03 | Phase 6 | Pending |
-| SDK-04 | Phase 6 | Pending |
-| SDK-05 | Phase 6 | Pending |
-| SDK-06 | Phase 6 | Pending |
-| SDK-07 | Phase 6 | Pending |
-| SDK-08 | Phase 6 | Pending |
-| SDK-09 | Phase 6 | Pending |
-| SEC-01 | Phase 5 | Pending |
-| SEC-02 | Phase 5 | Pending |
-| SEC-03 | Phase 5 | Pending |
-| SEC-04 | Phase 5 | Pending |
-| SEC-05 | Phase 5 | Pending |
-| SEC-06 | Phase 5 | Pending |
-| OPS-01 | Phase 6 | Pending |
-| OPS-02 | Phase 3 | Pending |
-| OPS-03 | Phase 6 | Pending |
-| OPS-04 | Phase 6 | Pending |
-| OPS-05 | Phase 6 | Pending |
-| INT-01 | Phase 6 | Pending |
-| INT-02 | Phase 6 | Pending |
-| INT-03 | Phase 6 | Pending |
-| INT-04 | Phase 6 | Pending |
-| MULTI-01 | Phase 7 | Pending |
-| MULTI-02 | Phase 7 | Pending |
-| MULTI-03 | Phase 7 | Pending |
+| INFRA-01 | Phase 1 | Complete |
+| INFRA-02 | Phase 1 | Complete |
+| INFRA-03 | Phase 1 | Complete |
+| INFRA-04 | Phase 1 | Complete |
+| CNTR-01 | Phase 1 | Complete |
+| CNTR-02 | Phase 1 | Complete |
+| CNTR-03 | Phase 1 | Complete |
+| CNTR-04 | Phase 1 | Complete |
+| CNTR-05 | Phase 1 | Complete |
+| CNTR-06 | Phase 1 | Complete |
+| IMG-01 | Phase 1 | Complete |
+| IMG-02 | Phase 1 | Complete |
+| IMG-03 | Phase 1 | Complete |
+| IMG-04 | Phase 1 | Complete |
+| IMG-05 | Phase 1 | Complete |
+| AGNT-01 | Phase 2 | Complete |
+| AGNT-02 | Phase 2 | Complete |
+| AGNT-03 | Phase 2 | Complete |
+| AGNT-04 | Phase 2 | Complete |
+| AGNT-05 | Phase 2 | Complete |
+| AGNT-06 | Phase 2 | Complete |
+| AGNT-07 | Phase 2 | Complete |
+| AGNT-08 | Phase 2 | Complete |
+| AGNT-09 | Phase 2 | Complete |
+| AGNT-10 | Phase 2 | Complete |
+| AGNT-11 | Phase 2 | Complete |
+| AGNT-12 | Phase 2 | Complete |
+| CTRL-01 | Phase 3 | Complete |
+| CTRL-02 | Phase 3 | Complete |
+| CTRL-03 | Phase 3 | Complete |
+| CTRL-04 | Phase 3 | Complete |
+| CTRL-05 | Phase 3 | Complete |
+| CTRL-06 | Phase 3 | Complete |
+| CTRL-07 | Phase 3 | Complete |
+| CTRL-08 | Phase 3 | Complete |
+| CTRL-09 | Phase 3 | Complete |
+| CTRL-10 | Phase 4 | Complete |
+| CTRL-11 | Phase 5 | Complete |
+| CTRL-12 | Phase 5 | Complete |
+| CTRL-13 | Phase 5 | Complete |
+| CTRL-14 | Phase 3 | Complete |
+| CTRL-15 | Phase 5 | Complete |
+| CTRL-16 | Phase 3 | Complete |
+| PRXY-01 | Phase 4 | Complete |
+| PRXY-02 | Phase 4 | Complete |
+| PRXY-03 | Phase 4 | Complete |
+| PRXY-04 | Phase 4 | Complete |
+| PRXY-05 | Phase 4 | Complete |
+| CLI-01 | Phase 6 | Complete |
+| CLI-02 | Phase 6 | Complete |
+| CLI-03 | Phase 6 | Complete |
+| CLI-04 | Phase 6 | Complete |
+| CLI-05 | Phase 6 | Complete |
+| CLI-06 | Phase 6 | Complete |
+| CLI-07 | Phase 6 | Complete |
+| CLI-08 | Phase 6 | Complete |
+| CLI-09 | Phase 6 | Complete |
+| CLI-10 | Phase 6 | Complete |
+| CLI-11 | Phase 6 | Complete |
+| CLI-12 | Phase 6 | Complete |
+| CLI-13 | Phase 6 | Complete |
+| SDK-01 | Phase 6 | Complete |
+| SDK-02 | Phase 6 | Complete |
+| SDK-03 | Phase 6 | Complete |
+| SDK-04 | Phase 6 | Complete |
+| SDK-05 | Phase 6 | Complete |
+| SDK-06 | Phase 6 | Complete |
+| SDK-07 | Phase 6 | Complete |
+| SDK-08 | Phase 6 | Complete |
+| SDK-09 | Phase 6 | Complete |
+| SEC-01 | Phase 5 | Complete |
+| SEC-02 | Phase 5 | Complete |
+| SEC-03 | Phase 5 | Complete |
+| SEC-04 | Phase 5 | Complete |
+| SEC-05 | Phase 5 | Complete |
+| SEC-06 | Phase 5 | Complete |
+| OPS-01 | Phase 6 | Complete |
+| OPS-02 | Phase 3 | Complete |
+| OPS-03 | Phase 6 | Complete |
+| OPS-04 | Phase 6 | Complete |
+| OPS-05 | Phase 6 | Complete |
+| INT-01 | Phase 6 | Complete |
+| INT-02 | Phase 6 | Complete |
+| INT-03 | Phase 6 | Complete |
+| INT-04 | Phase 6 | Complete |
+| MULTI-01 | Phase 7 | Complete |
+| MULTI-02 | Phase 7 | Complete |
+| MULTI-03 | Phase 7 | Complete |
 
 **Coverage:**
 - v1 requirements: 88 total

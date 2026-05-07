@@ -1,0 +1,29 @@
+---
+# Forge Node Bootstrap Playbook
+#
+# Bootstraps a fresh Contabo VDS (or any Debian/Ubuntu server) with:
+#   1. Common packages + kernel tuning (inotify for Metro)
+#   2. Docker Engine 27.x (pinned, NOT 28.x or 29.x)
+#   3. Tailscale mesh networking
+#   4. forge-agent systemd service
+#
+# Usage:
+#   ansible-playbook -i inventory.yml playbook.yml
+#
+# Prerequisites:
+#   - SSH access to target node(s) as root
+#   - Tailscale auth key (reusable, ephemeral)
+#   - forge-agent binary built for linux/amd64
+#   - Control plane running and reachable via Tailscale
+#
+# SECURITY: Real inventory.yml should never be committed.
+# Use Ansible Vault for secrets or keep inventory.yml in .gitignore.
+
+- name: Bootstrap Forge node
+  hosts: all
+  become: true
+  roles:
+    - common
+    - docker
+    - tailscale
+    - forge-agent

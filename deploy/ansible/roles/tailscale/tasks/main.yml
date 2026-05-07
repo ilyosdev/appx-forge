@@ -1,0 +1,72 @@
+---
+# Role: tailscale
+# Installs Tailscale, joins the tailnet, and registers the Tailscale IP
+# as a fact for forge-agent configuration.
+
+- name: Add Tailscale apt key
+  ansible.builtin.get_url:
+    url: "https://pkgs.tailscale.com/stable/ubuntu/{{ ansible_distribution_release }}.noarmor.gpg"
+    dest: /etc/apt/keyrings/tailscale.gpg
+    mode: "0644"
+    force: false
+
+- name: Add Tailscale apt repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/etc/apt/keyrings/tailscale.gpg]
+      https://pkgs.tailscale.com/stable/ubuntu
+      {{ ansible_distribution_release }} main
+    filename: tailscale
+    state: present
+
+- name: Install Tailscale
+  ansible.builtin.apt:
+    name: tailscale
+    state: present
+    update_cache: true
+
+- name: Join tailnet
+  ansible.builtin.command:
+    cmd: "tailscale up --auth-key={{ tailscale_auth_key }} --accept-routes"
+  register: tailscale_up
+  changed_when: "'Success' in tailscale_up.stdout or tailscale_up.rc == 0"
+  # Idempotent -- if already connected, this is a no-op
+  failed_when: tailscale_up.rc != 0
+
+- name: Wait for Tailscale to connect
+  ansible.builtin.command:
+    cmd: tailscale status --json
+  register: ts_status
+  until: ts_status.rc == 0
+  retries: 15
+  delay: 2
+  changed_when: false
+
+- name: Get Tailscale IP
+  ansible.builtin.command:
+    cmd: tailscale ip -4
+  register: tailscale_ip_result
+  changed_when: false
+
+- name: Register Tailscale IP as fact
+  ansible.builtin.set_fact:
+    forge_tailscale_ip: "{{ tailscale_ip_result.stdout | trim }}"
+
+- name: Show Tailscale IP
+  ansible.builtin.debug:
+    msg: "Node Tailscale IP: {{ forge_tailscale_ip }}"
+
+- name: Verify Tailscale connectivity
+  ansible.builtin.command:
+    cmd: tailscale netcheck
+  register: netcheck_result
+  changed_when: false
+  failed_when: false
+
+- name: Warn if UDP connectivity not confirmed
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: UDP connectivity not confirmed by tailscale netcheck.
+      May use DERP relay (adds 30-80ms latency).
+      Fix: allow inbound UDP port 41641 in Contabo firewall.
+  when: "'UDP: true' not in netcheck_result.stdout"
