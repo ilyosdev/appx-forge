@@ -533,6 +533,155 @@ func TestCreateSandbox_NoAvailableNodes(t *testing.T) {
 	}
 }
 
+// ── Phase 32 Wave 2 Bug 1: orphan cleanup ──────────────────────────
+//
+// CreateSandbox previously inserted a PENDING sandbox row, then ran
+// scheduler + AssignSandboxToNode as separate operations. If any step
+// after CreateSandbox failed (no capacity, AssignSandboxToNode error,
+// transient DB error), the row was left orphaned with node_id IS NULL.
+// Production state on 2026-05-07 had 4233 such orphan rows.
+//
+// These tests lock in the cleanup contract: when CreateSandbox cannot
+// finish the schedule + assign sequence, the PENDING row MUST be
+// deleted before returning the error to the caller.
+
+func TestCreateSandbox_NoOrphanOnAssignFailure(t *testing.T) {
+	nodeID := uuid.New()
+	var createdID pgtype.UUID
+	var deletedID pgtype.UUID
+	var deleteCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createdID = arg.ID
+			return store.Sandbox{ID: arg.ID, AppName: arg.AppName, State: "pending"}, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{makeNode(nodeID, 24000, 0)}, nil
+		},
+		assignSandboxFn: func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
+			// Simulate node going unhealthy / DB transient error mid-scheduling.
+			return store.Sandbox{}, errors.New("simulated assign failure")
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			deletedID = id
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName:   "orphan-app",
+		UserID:    "user-123",
+		Image:     "appx/sandbox:v1",
+		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
+	})
+
+	if err == nil {
+		t.Fatal("expected error from AssignSandboxToNode failure")
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected DeleteSandbox to be called once to clean up the PENDING row, got %d calls", deleteCalls)
+	}
+	if deletedID != createdID {
+		t.Fatalf("expected DeleteSandbox to be called with the freshly created sandbox ID %v, got %v", createdID, deletedID)
+	}
+}
+
+func TestCreateSandbox_NoOrphanOnNoCapacity(t *testing.T) {
+	// scheduler.Schedule returns ErrNoCapacity when no node has enough memory.
+	// The PENDING row created moments earlier must be cleaned up so
+	// node_id IS NULL orphans don't accumulate.
+	var createdID pgtype.UUID
+	var deletedID pgtype.UUID
+	var deleteCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createdID = arg.ID
+			return store.Sandbox{ID: arg.ID, AppName: arg.AppName, State: "pending"}, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			// Single node with no spare capacity → scheduler returns ErrNoCapacity.
+			return []store.Node{makeNode(uuid.New(), 1024, 1024)}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			deletedID = id
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName:   "no-capacity-app",
+		UserID:    "user-123",
+		Image:     "appx/sandbox:v1",
+		Resources: Resources{CPUCores: 0.5, MemoryMB: 4096},
+	})
+
+	if !errors.Is(err, ErrNoCapacity) {
+		t.Fatalf("expected ErrNoCapacity, got %v", err)
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected DeleteSandbox to be called once to clean up the PENDING row, got %d calls", deleteCalls)
+	}
+	if deletedID != createdID {
+		t.Fatalf("expected DeleteSandbox to be called with the freshly created sandbox ID %v, got %v", createdID, deletedID)
+	}
+}
+
+func TestCreateSandbox_NoOrphanOnListNodesFailure(t *testing.T) {
+	// Even a transient ListHealthyNodes failure between CreateSandbox and
+	// scheduling must not leave the PENDING row behind.
+	var createdID pgtype.UUID
+	var deletedID pgtype.UUID
+	var deleteCalls int
+
+	ms := &mockStore{
+		getSandboxByAppNameFn: func(ctx context.Context, appName string) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+		createSandboxFn: func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
+			createdID = arg.ID
+			return store.Sandbox{ID: arg.ID, AppName: arg.AppName, State: "pending"}, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return nil, errors.New("simulated transient db error")
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalls++
+			deletedID = id
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName:   "list-fail-app",
+		UserID:    "user-123",
+		Image:     "appx/sandbox:v1",
+		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
+	})
+
+	if err == nil {
+		t.Fatal("expected error from ListHealthyNodes failure")
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("expected DeleteSandbox to be called once to clean up the PENDING row, got %d calls", deleteCalls)
+	}
+	if deletedID != createdID {
+		t.Fatalf("expected DeleteSandbox to be called with the freshly created sandbox ID %v, got %v", createdID, deletedID)
+	}
+}
+
 // ── HandleAck Tests ─────────────────────────────────────────────────
 
 func TestHandleAck_StartSandboxSuccess(t *testing.T) {
