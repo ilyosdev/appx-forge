@@ -562,6 +562,42 @@ func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.U
 		return fmt.Errorf("get sandbox: %w", err)
 	}
 
+	// Phase 32 Wave 2 Bug 2 — orphan sandbox short-circuit.
+	//
+	// If the sandbox has no node assigned (node_id IS NULL), there is no
+	// agent to receive a stop_sandbox command. The previous code path
+	// passed pgtype.UUID{Valid: false} into commands.node_id which is
+	// declared NOT NULL → Postgres rejected the INSERT and the failure
+	// bubbled up as a 500 to the agent ack loop. Instead, mark the row
+	// destroyed directly so the orphan reaper can garbage-collect it.
+	if !sandbox.NodeID.Valid {
+		_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+			State:   string(models.StateDestroyed),
+			ID:      pgSandboxID,
+			State_2: sandbox.State,
+		})
+		if err != nil {
+			return fmt.Errorf("transition orphan to destroyed: %w", err)
+		}
+		// Best-effort event record for the orphan path (no node id available).
+		_, evtErr := ls.store.RecordEvent(ctx, store.RecordEventParams{
+			SandboxID: pgSandboxID,
+			NodeID:    pgtype.UUID{Valid: false},
+			EventType: string(models.EventDestroyRequest),
+			Actor:     "control-plane",
+			PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+			NextState: pgtype.Text{String: string(models.StateDestroyed), Valid: true},
+			Payload:   []byte(`{"reason":"orphan_short_circuit"}`),
+		})
+		if evtErr != nil {
+			ls.logger.Warn("failed to record orphan-destroy event",
+				"error", evtErr, "sandbox_id", sandboxID)
+		}
+		ls.logger.Info("destroyed orphan sandbox without command dispatch",
+			"sandbox_id", sandboxID, "prev_state", sandbox.State)
+		return nil
+	}
+
 	// Validate transition via state machine
 	currentState := models.SandboxState(sandbox.State)
 	nextState, valid := models.NextState(currentState, models.EventDestroyRequest)

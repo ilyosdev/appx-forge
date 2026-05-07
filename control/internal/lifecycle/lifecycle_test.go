@@ -840,6 +840,67 @@ func TestDestroySandbox_HappyPath(t *testing.T) {
 	}
 }
 
+// Phase 32 Wave 2 Bug 2 — orphan sandbox short-circuit.
+//
+// When a sandbox has no node_id (Valid=false), DestroySandbox previously
+// passed pgtype.UUID{Valid:false} into commands.node_id, which is
+// declared NOT NULL → Postgres rejected with
+// "null value in column \"node_id\"". Each rejection bubbled up as a
+// 500 to the agent ack loop. Today's storm produced 32+ such errors.
+//
+// The fix short-circuits: if NodeID is invalid, skip CreateCommand
+// entirely and mark state=destroyed directly (no node exists to
+// receive the command anyway).
+func TestDestroySandbox_OrphanShortCircuit(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	var capturedTransition store.TransitionSandboxStateParams
+	createCommandCalled := false
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			// Orphan sandbox: NodeID.Valid == false.
+			return store.Sandbox{
+				ID:      pgSandboxID,
+				State:   "pending",
+				AppName: "orphan-app",
+				NodeID:  pgtype.UUID{Valid: false},
+			}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			capturedTransition = arg
+			return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			createCommandCalled = true
+			return store.Command{ID: arg.ID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.DestroySandbox(context.Background(), sandboxID)
+
+	if err != nil {
+		t.Fatalf("expected success on orphan, got %v", err)
+	}
+
+	// Must NOT issue a stop_sandbox command — no node to receive it.
+	if createCommandCalled {
+		t.Fatal("expected CreateCommand NOT to be called on orphan sandbox")
+	}
+
+	// Must transition directly to destroyed.
+	if capturedTransition.State != "destroyed" {
+		t.Fatalf("expected transition to 'destroyed', got %q", capturedTransition.State)
+	}
+	// Guard: the transition must be from pending (the orphan's prior state)
+	// so Postgres' optimistic-concurrency WHERE state = $3 still applies.
+	if capturedTransition.State_2 != "pending" {
+		t.Fatalf("expected transition guard from 'pending', got %q", capturedTransition.State_2)
+	}
+}
+
 // ── RestartSandbox Tests ────────────────────────────────────────────
 
 func TestRestartSandbox_HappyPath(t *testing.T) {
