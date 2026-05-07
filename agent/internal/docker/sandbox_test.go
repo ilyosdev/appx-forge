@@ -133,6 +133,34 @@ func TestCreateContainerConfig(t *testing.T) {
 	}
 }
 
+// TestCreateContainerLabels — Phase 32 Wave 2 Bug 7.
+//
+// The agent's heartbeat snapshot (ListContainers in client.go) filters by
+// the forge.app_name label. Without this label set on creation, every
+// Forge-created container is invisible to the snapshot, and control's
+// reconciler eventually destroys "missing" sandboxes within seconds of
+// reaching running state.
+func TestCreateContainerLabels(t *testing.T) {
+	mock := &mockDockerSDK{}
+	client := newTestClient(mock)
+	spec := defaultSpec(t)
+
+	_, err := client.CreateContainer(context.Background(), spec)
+	if err != nil {
+		t.Fatalf("CreateContainer failed: %v", err)
+	}
+
+	cfg := mock.captured.opts.Config
+	if cfg == nil {
+		t.Fatal("Config is nil")
+	}
+
+	if got := cfg.Labels["forge.app_name"]; got != spec.AppName {
+		t.Errorf("Config.Labels[forge.app_name] = %q, want %q (bug7: label must match spec.AppName so heartbeat snapshot can find this container)",
+			got, spec.AppName)
+	}
+}
+
 // TestCreateContainerPortBindings verifies HostConfig port bindings.
 func TestCreateContainerPortBindings(t *testing.T) {
 	mock := &mockDockerSDK{}
