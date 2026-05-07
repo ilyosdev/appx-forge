@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -127,10 +128,41 @@ func (ls *LifecycleService) SetRestartManager(rm *RestartManager) {
 
 // CreateSandbox creates a new sandbox, schedules it to a node, and dispatches
 // a start_sandbox command. It returns the sandbox result with a computed URL.
-func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest) (*SandboxResult, error) {
+//
+// Phase 32 Wave 2 Bug 1: if the row is created but a subsequent step fails
+// (no capacity, AssignSandboxToNode error, transient DB error during
+// scheduling), we delete the freshly-inserted PENDING row before returning.
+// Otherwise the row is left with node_id IS NULL and accumulates as garbage
+// — production state on 2026-05-07 had 4233 such orphans.
+func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest) (result *SandboxResult, retErr error) {
 	// Generate sandbox UUID
 	sandboxUUID := uuid.New()
 	pgID := pgtype.UUID{Bytes: sandboxUUID, Valid: true}
+
+	// rowCreated is flipped to true once we've inserted the PENDING row.
+	// The deferred cleanup runs ONLY if (a) the row was actually inserted
+	// and (b) we're returning a non-nil error. Successful returns and
+	// pre-insert failures (recycle / pre-check / marshal errors) are skipped.
+	rowCreated := false
+	defer func() {
+		if retErr == nil || !rowCreated {
+			return
+		}
+		// Use a fresh context: the caller's ctx may have been canceled,
+		// which would prevent the cleanup DELETE from running and leave
+		// the orphan we're trying to avoid. The DB call is fast and
+		// bounded — a brief background context is the right choice.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if delErr := ls.store.DeleteSandbox(cleanupCtx, pgID); delErr != nil {
+			ls.logger.Warn("failed to clean up orphan PENDING sandbox row after create error",
+				"error", delErr,
+				"original_error", retErr,
+				"sandbox_id", sandboxUUID,
+				"app_name", req.AppName,
+			)
+		}
+	}()
 
 	// Marshal resources and env to JSON
 	resourcesJSON, err := json.Marshal(req.Resources)
@@ -196,6 +228,10 @@ func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest
 		}
 		return nil, fmt.Errorf("create sandbox: %w", err)
 	}
+	// Row is now in the DB. From this point on, any error return must
+	// trigger orphan cleanup via the deferred handler at the top of the
+	// function (Phase 32 Wave 2 Bug 1).
+	rowCreated = true
 
 	// List healthy nodes for scheduling
 	nodes, err := ls.store.ListHealthyNodes(ctx)
