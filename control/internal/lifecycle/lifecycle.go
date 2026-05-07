@@ -151,9 +151,15 @@ func (ls *LifecycleService) SetStateWebhookNotifier(wn StateWebhookNotifier) {
 }
 
 // notifyStateWebhook is a fire-and-forget helper that POSTs the state
-// change to the configured webhook (if any). Phase 33-B currently only
-// fires for transitions INTO running — backend's ContainerPoolService
-// uses this signal to flip provisioning rows to warm without polling.
+// change to the configured webhook (if any).
+//
+// Phase 33-B: emit on transitions INTO running so backend's
+// ContainerPoolService can flip provisioning rows to warm without polling.
+//
+// Phase 33-E: also emit on transitions INTO failed and destroyed so
+// backend learns about provisioning failures the same event-driven way.
+// Closes the gap where backend's pool service had to poll
+// forgeService.getSandbox to discover that a sandbox vanished or failed.
 //
 // The webhook runs in a goroutine so the lifecycle handler doesn't block
 // on slow HTTP. Caller passes the freshly-loaded sandbox row (already
@@ -167,15 +173,19 @@ func (ls *LifecycleService) notifyStateWebhook(
 	if ls.webhookNotifier == nil {
 		return
 	}
-	// Currently only running transitions are emitted. Add Failed/Destroyed
-	// here in a follow-up phase if backend needs early-fail signals.
-	if nextState != models.StateRunning {
+	// Phase 33-E — emit on running, failed, destroyed. These are the
+	// states backend actually reacts to. Restarting / stopped happen
+	// often during normal lifecycle and would just be noise.
+	switch nextState {
+	case models.StateRunning, models.StateFailed, models.StateDestroyed:
+		// emit
+	default:
 		return
 	}
 	// Suppress no-op transitions (alreadyAtTarget escape hatch in
 	// HandleAck sets nextState=currentState). Only fire on the actual
-	// transition INTO running, never on running→running confirmations.
-	if prevState == models.StateRunning {
+	// state transition.
+	if prevState == nextState {
 		return
 	}
 	payload := StateChangePayload{
@@ -722,19 +732,19 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 		}
 	}
 
-	// Phase 33-B — emit state-change webhook on first transition into
-	// running. Both HandleAck (start_sandbox+success) and HandleEvent
-	// (container_started) can produce this transition; either path
-	// arriving first wins, the other becomes a no-op via webhook
-	// idempotency on the listener side. We re-fetch the row so the
-	// webhook payload carries container_id and host_port (HandleEvent
-	// itself doesn't update them — those flow in via the start ack).
-	if currentState != models.StateRunning && nextState == models.StateRunning {
-		if refreshed, err := ls.store.GetSandbox(ctx, pgSandboxID); err == nil {
-			ls.notifyStateWebhook(refreshed, sandboxID, currentState, nextState)
-		} else {
-			ls.notifyStateWebhook(sandbox, sandboxID, currentState, nextState)
-		}
+	// Phase 33-B — emit state-change webhook on transition into running.
+	// Phase 33-E — also emit on transitions into failed and destroyed
+	// (the helper itself filters; we just call it on any transition).
+	// Both HandleAck and HandleEvent can produce these transitions;
+	// either path arriving first wins, the other becomes a no-op via
+	// the prevState==nextState guard inside notifyStateWebhook. We
+	// re-fetch the row so the webhook payload carries container_id and
+	// host_port (HandleEvent itself doesn't update them — those flow in
+	// via the start ack).
+	if refreshed, err := ls.store.GetSandbox(ctx, pgSandboxID); err == nil {
+		ls.notifyStateWebhook(refreshed, sandboxID, currentState, nextState)
+	} else {
+		ls.notifyStateWebhook(sandbox, sandboxID, currentState, nextState)
 	}
 
 	// Delegate to restart manager when transitioning to restarting state.
@@ -801,6 +811,10 @@ func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.U
 		}
 		ls.logger.Info("destroyed orphan sandbox without command dispatch",
 			"sandbox_id", sandboxID, "prev_state", sandbox.State)
+		// Phase 33-E — orphan short-circuit also fires the destroyed
+		// webhook so backend learns the sandbox is gone the same way
+		// it learns about running transitions.
+		ls.notifyStateWebhook(sandbox, sandboxID, models.SandboxState(sandbox.State), models.StateDestroyed)
 		return nil
 	}
 
