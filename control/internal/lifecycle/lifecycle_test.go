@@ -1667,3 +1667,80 @@ func TestLifecycle_Webhook_NilNotifier_DoesNotPanic(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// Phase 33-E — start_sandbox + failure ack on a sandbox in starting
+// state transitions to failed. The webhook must fire so backend's
+// listener can stop polling and react immediately to the failure.
+func TestLifecycle_Webhook_HandleAck_StartSandboxFailure_FiresOnFailed(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "starting", AppName: "pool-fail",
+				UserID: "user-fail", NodeID: pgNodeID,
+			}, nil
+		},
+	}
+
+	wn := &mockStateWebhookNotifier{}
+	svc := New(ms, nil)
+	svc.SetStateWebhookNotifier(wn)
+
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"start_sandbox", "failure",
+		json.RawMessage(`{"error":"container start failed"}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wn.waitForCalls(t, 1, 2*time.Second)
+	calls := wn.snapshot()
+	if calls[0].State != "failed" {
+		t.Errorf("state = %q, want failed", calls[0].State)
+	}
+	if calls[0].PrevState != "starting" {
+		t.Errorf("prev_state = %q, want starting", calls[0].PrevState)
+	}
+}
+
+// Phase 33-E — orphan DestroySandbox fires the destroyed webhook
+// (orphan short-circuit transitions row directly to destroyed without
+// dispatching stop_sandbox). Backend's listener uses this to drop the
+// app_deployments row even when no agent ack ever lands.
+func TestLifecycle_Webhook_DestroySandbox_OrphanFiresOnDestroyed(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			// node_id NULL → orphan short-circuit path
+			return store.Sandbox{
+				ID: pgSandboxID, State: "pending", AppName: "pool-orphan",
+				UserID: "user-orphan",
+				NodeID: pgtype.UUID{Valid: false},
+			}, nil
+		},
+	}
+
+	wn := &mockStateWebhookNotifier{}
+	svc := New(ms, nil)
+	svc.SetStateWebhookNotifier(wn)
+
+	err := svc.DestroySandbox(context.Background(), sandboxID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wn.waitForCalls(t, 1, 2*time.Second)
+	calls := wn.snapshot()
+	if calls[0].State != "destroyed" {
+		t.Errorf("state = %q, want destroyed", calls[0].State)
+	}
+	if calls[0].AppName != "pool-orphan" {
+		t.Errorf("app_name = %q, want pool-orphan", calls[0].AppName)
+	}
+}
