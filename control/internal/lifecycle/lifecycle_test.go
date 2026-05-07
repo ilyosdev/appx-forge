@@ -847,6 +847,158 @@ func TestHandleAck_StartSandboxSuccess_PersistsRuntimeInfo(t *testing.T) {
 	}
 }
 
+// Phase 32 Wave 2 Bug 6 — start_sandbox+success ack arrives in StateDestroying.
+// Race: backend's eager verify-after-create marks sandbox ERROR before agent
+// has executed the start; control transitions row to destroying. The start
+// ack (with valid container_id) lands in destroying. Without the bug6
+// branch, HandleAck would return ErrInvalidTransition (HTTP 500) and the
+// cmd row stays "dispatched" forever while a container leaks on the agent.
+//
+// Expectation: HandleAck returns nil, persists runtime info, dispatches a
+// cleanup stop_sandbox carrying the just-revealed container_id, and acks
+// the original cmd as completed (no state change — sandbox stays
+// destroying).
+func TestHandleAck_StartSandboxSuccess_DuringDestroying_Bug6(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := pgtype.UUID{Bytes: nodeID, Valid: true}
+
+	// First GetSandbox: row is destroying without container_id (because the
+	// original stop dispatched while container_id was empty). Second
+	// GetSandbox (after persistRuntimeInfo): row now has container_id.
+	getCalls := 0
+	var capturedRuntime store.UpdateSandboxRuntimeParams
+	transitionCalled := false
+	var capturedCleanupCmd store.CreateCommandParams
+	cleanupCmdCalls := 0
+	var capturedAck store.AckCommandParams
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			getCalls++
+			if getCalls == 1 {
+				return store.Sandbox{
+					ID: pgSandboxID, State: "destroying", AppName: "test-app",
+					NodeID: pgNodeID,
+				}, nil
+			}
+			return store.Sandbox{
+				ID: pgSandboxID, State: "destroying", AppName: "test-app",
+				NodeID:      pgNodeID,
+				ContainerID: pgtype.Text{String: "ctr-late-success", Valid: true},
+				HostPort:    pgtype.Int4{Int32: 41234, Valid: true},
+			}, nil
+		},
+		updateSandboxRuntimeFn: func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
+			capturedRuntime = arg
+			return nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			transitionCalled = true
+			return store.Sandbox{}, nil
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			capturedCleanupCmd = arg
+			cleanupCmdCalls++
+			return store.Command{ID: arg.ID, CommandType: arg.CommandType}, nil
+		},
+		ackCommandFn: func(ctx context.Context, arg store.AckCommandParams) error {
+			capturedAck = arg
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"start_sandbox", "success",
+		json.RawMessage(`{"container_id":"ctr-late-success","host_port":41234}`))
+
+	if err != nil {
+		t.Fatalf("expected nil error (bug6 tolerance), got: %v", err)
+	}
+	if transitionCalled {
+		t.Fatal("expected no state transition (sandbox stays destroying)")
+	}
+	if capturedRuntime.ContainerID.String != "ctr-late-success" {
+		t.Fatalf("expected runtime container_id 'ctr-late-success', got %q", capturedRuntime.ContainerID.String)
+	}
+	if cleanupCmdCalls != 1 {
+		t.Fatalf("expected 1 cleanup stop_sandbox dispatched, got %d", cleanupCmdCalls)
+	}
+	if capturedCleanupCmd.CommandType != "stop_sandbox" {
+		t.Fatalf("expected cleanup CommandType 'stop_sandbox', got %q", capturedCleanupCmd.CommandType)
+	}
+	if capturedCleanupCmd.NodeID != pgNodeID {
+		t.Fatal("expected cleanup cmd targeted at sandbox's node")
+	}
+	var payload struct {
+		ContainerID string `json:"container_id"`
+	}
+	if err := json.Unmarshal(capturedCleanupCmd.Payload, &payload); err != nil {
+		t.Fatalf("cleanup cmd payload unmarshal: %v", err)
+	}
+	if payload.ContainerID != "ctr-late-success" {
+		t.Fatalf("expected cleanup payload container_id 'ctr-late-success', got %q", payload.ContainerID)
+	}
+	if capturedAck.Status != "completed" {
+		t.Fatalf("expected original cmd ack status 'completed', got %q", capturedAck.Status)
+	}
+}
+
+// Bug6 sibling — start_sandbox+success arriving in destroyed (terminal)
+// should also tolerate without 500. No cleanup cmd needed if container_id
+// already empty (sandbox was destroyed before the start could complete on
+// any container).
+func TestHandleAck_StartSandboxSuccess_DuringDestroyed_Bug6(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	transitionCalled := false
+	cleanupDispatched := false
+	var capturedAck store.AckCommandParams
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "destroyed", AppName: "test-app",
+				ContainerID: pgtype.Text{String: "ctr-final", Valid: true},
+				NodeID:      pgtype.UUID{Bytes: uuid.New(), Valid: true},
+			}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			transitionCalled = true
+			return store.Sandbox{}, nil
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			cleanupDispatched = true
+			return store.Command{}, nil
+		},
+		ackCommandFn: func(ctx context.Context, arg store.AckCommandParams) error {
+			capturedAck = arg
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"start_sandbox", "success",
+		json.RawMessage(`{"container_id":"ctr-final","host_port":40000}`))
+
+	if err != nil {
+		t.Fatalf("expected nil error in destroyed state (bug6), got: %v", err)
+	}
+	if transitionCalled {
+		t.Fatal("expected no state transition from destroyed")
+	}
+	if !cleanupDispatched {
+		t.Fatal("expected cleanup stop_sandbox dispatched (container_id known)")
+	}
+	if capturedAck.Status != "completed" {
+		t.Fatalf("expected ack 'completed', got %q", capturedAck.Status)
+	}
+}
+
 // ── HandleEvent Tests ───────────────────────────────────────────────
 
 func TestHandleEvent_ContainerExitedOnRunning(t *testing.T) {
