@@ -245,16 +245,117 @@ func runMigrations(databaseURL string) error {
 
 // ── Heartbeat Monitor ──────────────────────────────────────────────────
 
+// Phase 32 Wave 2 Bug 4 — flap debounce.
+//
+// Before this fix, monitorHeartbeats marked a node unhealthy and called
+// RescheduleNode on the FIRST tick where last_seen exceeded the threshold.
+// That made any single skipped heartbeat (agent under load running a slow
+// docker list_containers, transient network blip, host CPU saturation)
+// cascade into a reschedule storm. Production logs on 2026-05-07 showed
+// nodes flapping healthy↔unhealthy every 2-3 minutes.
+//
+// We now require defaultUnhealthyConfirmTicks consecutive over-threshold
+// ticks before triggering reschedule. At interval=15s and confirm=4 that's
+// roughly a 1-minute floor on top of the existing 45s threshold (~3 min
+// total since the last good heartbeat). A single healthy heartbeat at any
+// point clears the streak.
+const (
+	// defaultUnhealthyConfirmTicks is the number of consecutive
+	// over-threshold ticks required before a node is flipped to unhealthy
+	// and its sandboxes are rescheduled.
+	defaultUnhealthyConfirmTicks = 4
+)
+
+// heartbeatDecision is the per-node verdict produced by evaluateHeartbeats
+// for a single tick. The monitor goroutine consumes these to drive the
+// store update + reschedule. shouldMarkUnhealthy is the only field the
+// caller acts on; the rest exists for structured logging.
+type heartbeatDecision struct {
+	nodeID              pgtype.UUID
+	hostname            string
+	elapsed             time.Duration
+	missedCount         int
+	streak              int
+	shouldMarkUnhealthy bool
+}
+
+// evaluateHeartbeats is a pure function: given the current node list and an
+// in-memory streak map, it returns one decision per node that is currently
+// `healthy` and whose last_seen has crossed the threshold. The streaks map
+// is mutated in place — increment on miss, reset on healthy heartbeat,
+// cleared on the tick that flags the node for reschedule (so the monitor
+// doesn't keep re-firing while the DB flip / reschedule call is in flight).
+//
+// Returning the decisions instead of doing the I/O lets us unit-test the
+// debounce logic without spinning up Postgres.
+func evaluateHeartbeats(
+	nodes []store.Node,
+	streaks map[[16]byte]int,
+	now time.Time,
+	threshold time.Duration,
+	intervalSeconds int,
+	confirmTicks int,
+) []heartbeatDecision {
+	if confirmTicks < 1 {
+		confirmTicks = 1 // safety: never disable debounce entirely
+	}
+	if intervalSeconds < 1 {
+		intervalSeconds = 1 // avoid div-by-zero in missedCount
+	}
+
+	var decisions []heartbeatDecision
+	for _, n := range nodes {
+		if n.Status != "healthy" {
+			continue
+		}
+		if !n.LastSeenAt.Valid {
+			continue
+		}
+
+		elapsed := now.Sub(n.LastSeenAt.Time)
+		if elapsed <= threshold {
+			// Healthy heartbeat landed within the window — clear any
+			// accumulated streak so a future flap starts from zero.
+			delete(streaks, n.ID.Bytes)
+			continue
+		}
+
+		streak := streaks[n.ID.Bytes] + 1
+		streaks[n.ID.Bytes] = streak
+
+		d := heartbeatDecision{
+			nodeID:      n.ID,
+			hostname:    n.Hostname,
+			elapsed:     elapsed,
+			missedCount: int(elapsed.Seconds()) / intervalSeconds,
+			streak:      streak,
+		}
+		if streak >= confirmTicks {
+			d.shouldMarkUnhealthy = true
+			// Wipe the streak so the next tick doesn't immediately
+			// re-trigger reschedule against the now-unhealthy row.
+			delete(streaks, n.ID.Bytes)
+		}
+		decisions = append(decisions, d)
+	}
+	return decisions
+}
+
 // monitorHeartbeats runs a background loop that marks nodes as unhealthy when
 // they miss too many heartbeats. It checks all nodes every HeartbeatIntervalSeconds.
 // When a node is marked unhealthy, it triggers the rescheduler to move running
 // sandboxes to healthy nodes.
+//
+// Per-node unhealthy streaks are kept in an in-memory map keyed by node UUID
+// bytes (process-local, lifecycle matches the goroutine — see Bug 4 above).
 func monitorHeartbeats(ctx context.Context, q *store.Queries, cfg *config.Config, logger *slog.Logger, rescheduler *lifecycle.Rescheduler) {
 	interval := time.Duration(cfg.HeartbeatIntervalSeconds) * time.Second
 	threshold := time.Duration(cfg.HeartbeatIntervalSeconds*cfg.HeartbeatMissThreshold) * time.Second
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	streaks := make(map[[16]byte]int)
 
 	for {
 		select {
@@ -271,49 +372,54 @@ func monitorHeartbeats(ctx context.Context, q *store.Queries, cfg *config.Config
 				continue
 			}
 
-			now := time.Now()
-			for _, n := range nodes {
-				if n.Status != "healthy" {
-					continue
-				}
-				if !n.LastSeenAt.Valid {
-					continue
-				}
+			decisions := evaluateHeartbeats(
+				nodes, streaks, time.Now(),
+				threshold, cfg.HeartbeatIntervalSeconds, defaultUnhealthyConfirmTicks,
+			)
 
-				elapsed := now.Sub(n.LastSeenAt.Time)
-				if elapsed > threshold {
-					missedCount := int(elapsed.Seconds()) / cfg.HeartbeatIntervalSeconds
-					logger.Warn("node marked unhealthy",
-						"node_id", formatNodeID(n.ID),
-						"hostname", n.Hostname,
-						"missed_heartbeats", missedCount,
-						"last_seen", n.LastSeenAt.Time.Format(time.RFC3339),
+			for _, d := range decisions {
+				if !d.shouldMarkUnhealthy {
+					logger.Debug("node over heartbeat threshold but within debounce window",
+						"node_id", formatNodeID(d.nodeID),
+						"hostname", d.hostname,
+						"missed_heartbeats", d.missedCount,
+						"streak", d.streak,
+						"confirm_ticks", defaultUnhealthyConfirmTicks,
 					)
+					continue
+				}
 
-					if err := q.UpdateNodeStatus(ctx, store.UpdateNodeStatusParams{
-						ID:     n.ID,
-						Status: "unhealthy",
-					}); err != nil {
-						logger.Error("heartbeat monitor: failed to update node status",
-							"error", err,
-							"node_id", formatNodeID(n.ID),
-						)
-					} else {
-						// Trigger reschedule for the newly-unhealthy node
-						result, rErr := rescheduler.RescheduleNode(ctx, n.ID)
-						if rErr != nil {
-							logger.Error("reschedule failed for unhealthy node",
-								"error", rErr,
-								"node_id", formatNodeID(n.ID),
-							)
-						} else if result.Count > 0 {
-							logger.Info("rescheduled sandboxes from unhealthy node",
-								"node_id", formatNodeID(n.ID),
-								"rescheduled", result.Count,
-								"failed", result.Failed,
-							)
-						}
-					}
+				logger.Warn("node marked unhealthy",
+					"node_id", formatNodeID(d.nodeID),
+					"hostname", d.hostname,
+					"missed_heartbeats", d.missedCount,
+					"streak", d.streak,
+				)
+
+				if err := q.UpdateNodeStatus(ctx, store.UpdateNodeStatusParams{
+					ID:     d.nodeID,
+					Status: "unhealthy",
+				}); err != nil {
+					logger.Error("heartbeat monitor: failed to update node status",
+						"error", err,
+						"node_id", formatNodeID(d.nodeID),
+					)
+					continue
+				}
+
+				// Trigger reschedule for the newly-unhealthy node.
+				result, rErr := rescheduler.RescheduleNode(ctx, d.nodeID)
+				if rErr != nil {
+					logger.Error("reschedule failed for unhealthy node",
+						"error", rErr,
+						"node_id", formatNodeID(d.nodeID),
+					)
+				} else if result.Count > 0 {
+					logger.Info("rescheduled sandboxes from unhealthy node",
+						"node_id", formatNodeID(d.nodeID),
+						"rescheduled", result.Count,
+						"failed", result.Failed,
+					)
 				}
 			}
 		}
