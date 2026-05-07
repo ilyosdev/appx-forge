@@ -3,12 +3,25 @@ package health
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/appx/forge/agent/internal/controlclient"
 	"github.com/appx/forge/agent/internal/docker"
 )
+
+// heartbeatTickTimeout bounds a single heartbeat tick — specifically the
+// snapshotter.Snapshot call, which under the hood hits Docker's
+// containerList endpoint. On an overloaded host (swap-thrashing dockerd,
+// high CPU pressure) ListContainers can block for tens of seconds; without
+// a per-tick deadline that block propagates into the heartbeat loop and
+// the control plane sees us as gone.
+//
+// Phase 32 Wave 2 Bug 5 — pair this with the control-side debounce window
+// (Bug 4): a few skipped ticks no longer cascade into reschedule.
+const heartbeatTickTimeout = 5 * time.Second
 
 // HeartbeatClient defines the interface for sending heartbeats to the control plane.
 type HeartbeatClient interface {
@@ -42,6 +55,12 @@ type HeartbeatSender struct {
 	snapshotter SnapshotProvider
 	interval    time.Duration
 	logger      *slog.Logger
+
+	// skippedTicks counts heartbeat ticks dropped because snapshot timed
+	// out (Phase 32 Wave 2 Bug 5). Exposed via SkippedTicks() so operators
+	// and the metrics endpoint can surface "agent alive but Docker slow"
+	// — a distinct signal from "agent crashed" or "node down".
+	skippedTicks atomic.Uint64
 }
 
 // NewHeartbeatSender creates a new HeartbeatSender.
@@ -81,6 +100,15 @@ func (h *HeartbeatSender) Start(ctx context.Context) {
 	}
 }
 
+// SkippedTicks returns the cumulative number of heartbeat ticks dropped
+// because the per-tick snapshot deadline expired. A non-zero, growing
+// value means the agent is alive but Docker is too slow to enumerate
+// containers within the tick budget — typically swap pressure or
+// dockerd CPU starvation on the host. (Phase 32 Wave 2 Bug 5.)
+func (h *HeartbeatSender) SkippedTicks() uint64 {
+	return h.skippedTicks.Load()
+}
+
 // sendHeartbeat collects resources, snapshots containers, and sends a single
 // heartbeat. On snapshot failure, the heartbeat is SKIPPED entirely rather
 // than sent with an empty container list. Sending an empty list would, over
@@ -88,9 +116,38 @@ func (h *HeartbeatSender) Start(ctx context.Context) {
 // it to mass-mark every Forge sandbox as 'agent_lost' — trading correctness
 // for liveness. Skipping ticks lets the control plane's existing
 // missed-heartbeat alarm surface the real signal: this node is in trouble.
+//
+// Phase 32 Wave 2 Bug 5 — each tick also gets a per-call timeout
+// (heartbeatTickTimeout). On a host where dockerd has stalled, ListContainers
+// can block for tens of seconds; without this bound the heartbeat loop
+// itself stalls and the control plane sees the node as gone. On timeout
+// we still skip (relying on the control-side debounce window from Bug 4)
+// but increment skippedTicks so operators see "agent alive, Docker slow"
+// as a distinct signal from "agent crashed".
 func (h *HeartbeatSender) sendHeartbeat(ctx context.Context) {
-	snapshots, err := h.snapshotter.Snapshot(ctx)
+	tickCtx, cancel := context.WithTimeout(ctx, heartbeatTickTimeout)
+	defer cancel()
+
+	snapshots, err := h.snapshotter.Snapshot(tickCtx)
 	if err != nil {
+		// Distinguish "Docker stalled past our tick budget" from "Docker
+		// returned a real error" — only the former implies the daemon
+		// is healthy enough to eventually recover. We check both the
+		// per-tick deadline AND the parent context: if the parent was
+		// cancelled (agent shutting down), drop quietly without
+		// counting a skip — that's a normal stop, not a Docker stall.
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			h.skippedTicks.Add(1)
+			h.logger.Warn(
+				"heartbeat snapshot deadline exceeded; SKIPPING this tick (agent alive, Docker slow)",
+				"timeout", heartbeatTickTimeout,
+				"skipped_total", h.skippedTicks.Load(),
+			)
+			return
+		}
 		h.logger.Warn("heartbeat snapshot failed; SKIPPING this tick to avoid sending an empty list (would trip T7 reconciler's mass-destroy grace window if Docker stays down)", "error", err)
 		return
 	}

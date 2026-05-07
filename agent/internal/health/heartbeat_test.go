@@ -302,6 +302,103 @@ func TestHeartbeatSender_IncludesContainerList(t *testing.T) {
 	}
 }
 
+// Phase 32 Wave 2 Bug 5 — sendHeartbeat must bound the snapshot call so a
+// stalled Docker daemon (overloaded host, swap-thrashing, hung dockerd)
+// cannot block heartbeats indefinitely. Without a per-tick deadline,
+// snapshotter.Snapshot inherits the long-lived Start() context and blocks
+// until Docker eventually responds — which on a degraded host can be
+// minutes. The control plane's missed-heartbeat alarm then trips the node
+// unhealthy, cascading into mass reschedule.
+//
+// Fix: each tick gets a 5s budget. If Snapshot doesn't return in time, the
+// tick is skipped (relying on Bug 4's control-side debounce window) and a
+// structured counter is incremented so operators can see "agent is alive
+// but Docker is too slow to snapshot."
+type slowSnapshotter struct {
+	delay time.Duration
+}
+
+func (s *slowSnapshotter) Snapshot(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+	select {
+	case <-time.After(s.delay):
+		return []docker.ContainerSnapshot{}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestHeartbeatSender_DockerSlowDoesNotHangPastTimeout(t *testing.T) {
+	// Snapshot would take 30s; sendHeartbeat must return at the 5s mark.
+	slow := &slowSnapshotter{delay: 30 * time.Second}
+	client := &mockHeartbeatClient{}
+	collector := &mockCollector{}
+	sender := NewHeartbeatSender(client, collector, slow, time.Hour, newTestLogger())
+
+	start := time.Now()
+	sender.sendHeartbeat(context.Background())
+	elapsed := time.Since(start)
+
+	// 5s timeout + small scheduling jitter; allow up to 6.5s.
+	if elapsed > 6500*time.Millisecond {
+		t.Fatalf("sendHeartbeat blocked for %v; expected <6.5s with %v timeout",
+			elapsed, heartbeatTickTimeout)
+	}
+	// Must also have actually waited ~5s (proves the bound is real, not
+	// a cancel-immediately bug).
+	if elapsed < 4500*time.Millisecond {
+		t.Fatalf("sendHeartbeat returned in %v; expected ~%v wait before timeout",
+			elapsed, heartbeatTickTimeout)
+	}
+
+	// Tick was skipped — no heartbeat hit the wire.
+	if got := len(client.getCalls()); got != 0 {
+		t.Errorf("expected 0 heartbeat calls on snapshot timeout, got %d", got)
+	}
+	// Counter records the skip.
+	if got := sender.SkippedTicks(); got != 1 {
+		t.Errorf("expected SkippedTicks=1 after one timeout, got %d", got)
+	}
+}
+
+func TestHeartbeatSender_FastSnapshotRecordsNoSkip(t *testing.T) {
+	client := &mockHeartbeatClient{}
+	collector := &mockCollector{usedMB: 1, runningContainers: 0}
+	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, time.Hour, newTestLogger())
+
+	sender.sendHeartbeat(context.Background())
+
+	if got := len(client.getCalls()); got != 1 {
+		t.Errorf("expected 1 heartbeat call on fast snapshot, got %d", got)
+	}
+	if got := sender.SkippedTicks(); got != 0 {
+		t.Errorf("expected SkippedTicks=0 on fast path, got %d", got)
+	}
+}
+
+func TestHeartbeatSender_ParentContextCancelStillReturns(t *testing.T) {
+	// If the parent context is cancelled mid-snapshot, sendHeartbeat must
+	// not wait the full 5s — it should propagate the cancel and return.
+	slow := &slowSnapshotter{delay: 10 * time.Second}
+	client := &mockHeartbeatClient{}
+	collector := &mockCollector{}
+	sender := NewHeartbeatSender(client, collector, slow, time.Hour, newTestLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	sender.sendHeartbeat(ctx)
+	elapsed := time.Since(start)
+
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("sendHeartbeat blocked for %v after parent cancel; expected fast return",
+			elapsed)
+	}
+}
+
 // Phase 30 T4 — snapshot failure SKIPS the tick instead of sending an empty
 // container list. Sending an empty list would, over a multi-tick failure
 // (>60s), trip T7 reconciler's grace window and mass-mark every Forge
