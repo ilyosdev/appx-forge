@@ -4,11 +4,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -107,6 +112,28 @@ func main() {
 	restartMgr := lifecycle.NewRestartManager(adapter, logger)
 	lc.SetRestartManager(restartMgr)
 	logger.Info("restart manager wired")
+
+	// Phase 33-B — state-change webhook notifier. Posts JSON to the
+	// configured backend URL on every transition into running so the
+	// pool service can flip provisioning rows to warm without polling.
+	// HMAC-signed via FORGE_WEBHOOK_SECRET. Skipped entirely when
+	// FORGE_WEBHOOK_URL is empty (backwards compat for environments
+	// without a listener).
+	if cfg.WebhookURL != "" {
+		webhookClient := newStateWebhookClient(
+			cfg.WebhookURL,
+			cfg.WebhookSecret,
+			time.Duration(cfg.WebhookTimeoutSeconds)*time.Second,
+			logger,
+		)
+		lc.SetStateWebhookNotifier(webhookClient)
+		logger.Info("state webhook notifier wired",
+			"url", cfg.WebhookURL,
+			"timeout_seconds", cfg.WebhookTimeoutSeconds,
+		)
+	} else {
+		logger.Info("state webhook notifier skipped (FORGE_WEBHOOK_URL unset)")
+	}
 
 	// ── HTTP Server ────────────────────────────────────────────────────
 	srv := api.NewServer(
@@ -897,4 +924,74 @@ func (c *agentHTTPClient) ContainerExists(ctx context.Context, name string) (boo
 	default:
 		return false, "", fmt.Errorf("agent returned status %d", resp.StatusCode)
 	}
+}
+
+// ── stateWebhookClient ───────────────────────────────────────────────
+//
+// Phase 33-B implementation of lifecycle.StateWebhookNotifier. POSTs the
+// state-change payload as JSON to the configured backend URL with an
+// HMAC-SHA256 signature header so the listener can verify authenticity.
+// Errors are returned to the caller (lifecycle.notifyStateWebhook) which
+// already runs us in a goroutine and logs warnings — we don't add our
+// own retry / backoff here.
+
+type stateWebhookClient struct {
+	url     string
+	secret  []byte
+	client  *http.Client
+	logger  *slog.Logger
+}
+
+func newStateWebhookClient(
+	url, secret string,
+	timeout time.Duration,
+	logger *slog.Logger,
+) *stateWebhookClient {
+	return &stateWebhookClient{
+		url:    url,
+		secret: []byte(secret),
+		client: &http.Client{Timeout: timeout},
+		logger: logger,
+	}
+}
+
+// OnSandboxStateChanged satisfies lifecycle.StateWebhookNotifier.
+func (c *stateWebhookClient) OnSandboxStateChanged(
+	ctx context.Context,
+	payload lifecycle.StateChangePayload,
+) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "forge-control/1.0")
+
+	// HMAC-SHA256 over the raw body. Listener computes the same digest
+	// from the request body and constant-time compares.
+	if len(c.secret) > 0 {
+		mac := hmac.New(sha256.New, c.secret)
+		mac.Write(body)
+		req.Header.Set("X-Forge-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Drain the body so the connection is reusable. We don't care about
+	// content (listener returns 204 on success).
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	return fmt.Errorf("listener returned status %d", resp.StatusCode)
 }

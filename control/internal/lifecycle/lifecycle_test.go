@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/netip"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -1452,6 +1454,215 @@ func TestLifecycle_Route_NilRouteNotifier_DoesNotPanic(t *testing.T) {
 	// Should not panic
 	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "start_sandbox", "success",
 		json.RawMessage(`{"container_id":"abc123","host_port":8081}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// ── Mock StateWebhookNotifier (Phase 33-B) ────────────────────────
+
+type mockStateWebhookNotifier struct {
+	mu    sync.Mutex
+	calls []StateChangePayload
+}
+
+func (m *mockStateWebhookNotifier) OnSandboxStateChanged(_ context.Context, payload StateChangePayload) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, payload)
+	return nil
+}
+
+func (m *mockStateWebhookNotifier) snapshot() []StateChangePayload {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]StateChangePayload, len(m.calls))
+	copy(out, m.calls)
+	return out
+}
+
+// waitForCalls blocks until len(snapshot()) >= want or timeout. The
+// webhook fires inside a goroutine inside notifyStateWebhook, so plain
+// assertions right after HandleAck race the goroutine — wait until the
+// expected delivery count lands or the test's deadline is hit.
+func (m *mockStateWebhookNotifier) waitForCalls(t *testing.T, want int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if len(m.snapshot()) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d webhook calls; got %d", want, len(m.snapshot()))
+}
+
+// Phase 33-B Bug A — HandleAck on start_sandbox success transitioning
+// starting → running fires the state webhook with the freshly-persisted
+// container_id and host_port from the ack payload.
+func TestLifecycle_Webhook_HandleAck_StartSandboxSuccess_FiresOnRunning(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	// Two GetSandbox calls — first sees `starting`, second (after
+	// persistRuntimeInfo refresh) sees the row with container_id+host_port.
+	getCalls := 0
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			getCalls++
+			if getCalls == 1 {
+				return store.Sandbox{
+					ID: pgSandboxID, State: "starting", AppName: "pool-1",
+					UserID: "user-1", NodeID: pgNodeID,
+				}, nil
+			}
+			return store.Sandbox{
+				ID: pgSandboxID, State: "starting", AppName: "pool-1",
+				UserID: "user-1", NodeID: pgNodeID,
+				ContainerID: pgtype.Text{String: "ctr-9999", Valid: true},
+				HostPort:    pgtype.Int4{Int32: 41234, Valid: true},
+			}, nil
+		},
+		getNodeByIDFn: func(ctx context.Context, id pgtype.UUID) (store.Node, error) {
+			return store.Node{ID: pgNodeID, TailscaleIp: netip.MustParseAddr("100.64.0.1")}, nil
+		},
+	}
+
+	wn := &mockStateWebhookNotifier{}
+	svc := New(ms, nil)
+	svc.SetStateWebhookNotifier(wn)
+
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"start_sandbox", "success",
+		json.RawMessage(`{"container_id":"ctr-9999","host_port":41234}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wn.waitForCalls(t, 1, 2*time.Second)
+	calls := wn.snapshot()
+
+	if calls[0].State != "running" {
+		t.Errorf("state = %q, want running", calls[0].State)
+	}
+	if calls[0].PrevState != "starting" {
+		t.Errorf("prev_state = %q, want starting", calls[0].PrevState)
+	}
+	if calls[0].AppName != "pool-1" {
+		t.Errorf("app_name = %q, want pool-1", calls[0].AppName)
+	}
+	if calls[0].SandboxID != sandboxID.String() {
+		t.Errorf("sandbox_id = %q, want %s", calls[0].SandboxID, sandboxID.String())
+	}
+	if calls[0].ContainerID != "ctr-9999" {
+		t.Errorf("container_id = %q, want ctr-9999", calls[0].ContainerID)
+	}
+	if calls[0].HostPort != 41234 {
+		t.Errorf("host_port = %d, want 41234", calls[0].HostPort)
+	}
+}
+
+// Bug B — HandleAck where state already advanced (alreadyAtTarget escape
+// hatch) should NOT fire a duplicate webhook. The lifecycle's nextState
+// equals currentState in that branch, so the webhook helper's running
+// condition wouldn't even be checked, but the explicit assertion guards
+// against future refactors that might leak a second delivery.
+func TestLifecycle_Webhook_HandleAck_AlreadyRunning_NoDuplicateFire(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "running", AppName: "pool-2",
+				UserID: "user-2",
+			}, nil
+		},
+	}
+
+	wn := &mockStateWebhookNotifier{}
+	svc := New(ms, nil)
+	svc.SetStateWebhookNotifier(wn)
+
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"start_sandbox", "success",
+		json.RawMessage(`{"container_id":"ctr-existing","host_port":40000}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Brief pause to let any goroutine settle. State is already running,
+	// so we expect zero webhook calls — currentState == nextState in the
+	// alreadyAtTarget branch suppresses the running-transition trigger.
+	time.Sleep(50 * time.Millisecond)
+	if got := len(wn.snapshot()); got != 0 {
+		t.Errorf("expected 0 webhook calls (state already running), got %d", got)
+	}
+}
+
+// Bug C — HandleEvent on container_started with the row in `starting`
+// transitions to running and fires the webhook. Both HandleAck and
+// HandleEvent paths can produce the same transition; either path winning
+// emits a webhook.
+func TestLifecycle_Webhook_HandleEvent_ContainerStarted_FiresOnRunning(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "starting", AppName: "pool-3",
+				UserID: "user-3", NodeID: pgNodeID,
+				ContainerID: pgtype.Text{String: "ctr-event", Valid: true},
+				HostPort:    pgtype.Int4{Int32: 42000, Valid: true},
+			}, nil
+		},
+	}
+
+	wn := &mockStateWebhookNotifier{}
+	svc := New(ms, nil)
+	svc.SetStateWebhookNotifier(wn)
+
+	err := svc.HandleEvent(context.Background(), nodeID, sandboxID, "container_started", json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wn.waitForCalls(t, 1, 2*time.Second)
+	calls := wn.snapshot()
+	if calls[0].State != "running" {
+		t.Errorf("state = %q, want running", calls[0].State)
+	}
+	if calls[0].AppName != "pool-3" {
+		t.Errorf("app_name = %q, want pool-3", calls[0].AppName)
+	}
+}
+
+// Bug D — webhook is fully optional. With no SetStateWebhookNotifier
+// call (notifier nil), HandleAck must not panic and must not block.
+func TestLifecycle_Webhook_NilNotifier_DoesNotPanic(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "starting", AppName: "pool-4",
+				UserID: "user-4",
+			}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	// No SetStateWebhookNotifier call.
+
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"start_sandbox", "success",
+		json.RawMessage(`{"container_id":"ctr","host_port":1}`))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
