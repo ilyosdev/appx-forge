@@ -564,6 +564,22 @@ func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.U
 
 	// Validate transition via state machine
 	currentState := models.SandboxState(sandbox.State)
+
+	// Phase 32 Wave 2 Bug 3 — idempotent short-circuit. The state machine
+	// permits destroy_request as a self-loop on destroying/destroyed (so
+	// downstream callers using NextState directly don't see invalid-transition
+	// errors), but the handler itself should skip the redundant DB UPDATE
+	// and the spurious stop_sandbox command. The reschedule-on-node-flap
+	// path was producing 24 errors/sec at 14:35:03-05 from re-attempted
+	// destroys against terminal rows; this short-circuit silences them.
+	if currentState == models.StateDestroying || currentState == models.StateDestroyed {
+		ls.logger.Info("destroy skipped: sandbox already in terminal teardown",
+			"sandbox_id", sandboxID,
+			"current_state", currentState,
+		)
+		return nil
+	}
+
 	nextState, valid := models.NextState(currentState, models.EventDestroyRequest)
 	if !valid {
 		return fmt.Errorf("%w: cannot destroy sandbox in state %s", ErrInvalidTransition, sandbox.State)

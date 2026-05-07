@@ -58,6 +58,10 @@ var ValidTransitions = map[SandboxState]map[SandboxEvent]SandboxState{
 	},
 	StateDestroying: {
 		EventDestroyed: StateDestroyed,
+		// Phase 32 Wave 2 Bug 3 — idempotent: re-attempting destroy while
+		// already destroying is a no-op self-loop (reschedule-on-node-flap
+		// can re-issue destroy on rows already in terminal teardown).
+		EventDestroyRequest: StateDestroying,
 	},
 	StateFailed: {
 		EventRestartAttempt: StateStarting,
@@ -67,6 +71,13 @@ var ValidTransitions = map[SandboxState]map[SandboxEvent]SandboxState{
 		// this transition closes the OOM-restart race where the new
 		// container is healthy but the DB says failed.
 		EventStarted: StateRunning,
+	},
+	// Phase 32 Wave 2 Bug 3 — terminal idempotent no-op: re-attempting
+	// destroy on an already-destroyed row is a self-loop, not an error.
+	// IsTerminal() still reports StateDestroyed as terminal because the
+	// only outgoing edge is to itself.
+	StateDestroyed: {
+		EventDestroyRequest: StateDestroyed,
 	},
 }
 

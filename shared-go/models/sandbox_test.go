@@ -15,9 +15,16 @@ func TestAllStatesHaveTransitions(t *testing.T) {
 }
 
 func TestDestroyedIsTerminal(t *testing.T) {
-	transitions, hasTransitions := ValidTransitions[StateDestroyed]
-	if hasTransitions && len(transitions) > 0 {
-		t.Error("StateDestroyed should be terminal (no outgoing transitions)")
+	// StateDestroyed is semantically terminal: no transition may leave it.
+	// As of Phase 32 Wave 2 Bug 3, idempotent destroy_request self-loops
+	// are permitted (StateDestroyed → StateDestroyed) so re-issued destroys
+	// don't surface "invalid state transition" errors. Any non-self-loop
+	// outgoing edge is still a contract violation.
+	transitions := ValidTransitions[StateDestroyed]
+	for event, target := range transitions {
+		if target != StateDestroyed {
+			t.Errorf("StateDestroyed has non-self-loop outgoing edge: event %q → %q", event, target)
+		}
 	}
 }
 
@@ -104,6 +111,8 @@ func TestValidTransitionsAccepted(t *testing.T) {
 		{StateFailed, EventStarted, StateRunning}, // restart recovery ack race
 		{StateRestarting, EventRestartAttempt, StateStarting},
 		{StateStopped, EventScheduled, StateStarting},
+		{StateDestroying, EventDestroyRequest, StateDestroying}, // Phase 32 Wave 2 Bug 3 — idempotent
+		{StateDestroyed, EventDestroyRequest, StateDestroyed},   // Phase 32 Wave 2 Bug 3 — idempotent terminal
 	}
 	for _, tt := range tests {
 		next, ok := NextState(tt.state, tt.event)
@@ -129,6 +138,35 @@ func TestIsTerminal(t *testing.T) {
 		if IsTerminal(state) {
 			t.Errorf("state %q should not be terminal", state)
 		}
+	}
+}
+
+func TestNextState_DestroyIdempotent(t *testing.T) {
+	// Phase 32 Wave 2 Bug 3 — destroy must be idempotent on already-destroyed
+	// or destroying sandboxes. Mirrors the cc0c16f start_sandbox no-op pattern.
+	// Production storm at 14:35:03-05 produced 24 errors/sec from the
+	// reschedule-on-node-flap path re-attempting destroys on terminal rows.
+	cases := []struct {
+		name       string
+		from       SandboxState
+		event      SandboxEvent
+		expectedTo SandboxState
+		expectOK   bool
+	}{
+		{"destroyed + destroy request → no-op", StateDestroyed, EventDestroyRequest, StateDestroyed, true},
+		{"destroying + destroy request → no-op", StateDestroying, EventDestroyRequest, StateDestroying, true},
+		{"failed + destroy request → destroyed", StateFailed, EventDestroyRequest, StateDestroyed, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			to, ok := NextState(tc.from, tc.event)
+			if ok != tc.expectOK {
+				t.Fatalf("ok=%v want %v", ok, tc.expectOK)
+			}
+			if to != tc.expectedTo {
+				t.Fatalf("to=%s want %s", to, tc.expectedTo)
+			}
+		})
 	}
 }
 
