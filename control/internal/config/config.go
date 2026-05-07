@@ -29,6 +29,16 @@ type Config struct {
 	// query. Kept short because the call is on the GET /sandboxes
 	// critical path; agent unreachable falls through to cached row.
 	AgentRequestTimeoutSeconds int `envconfig:"FORGE_AGENT_REQUEST_TIMEOUT_SECONDS" default:"3"`
+
+	// Phase 33-B — sandbox state-change webhook. Empty URL disables the
+	// webhook entirely (backwards compat for environments without a
+	// listener configured). When set, control plane POSTs JSON to this
+	// URL on every sandbox state transition that crosses into running,
+	// and HMAC-signs the body with WebhookSecret. Failures are logged
+	// and never propagated — the listener is treated as best-effort.
+	WebhookURL                string `envconfig:"FORGE_WEBHOOK_URL" default:""`
+	WebhookSecret             string `envconfig:"FORGE_WEBHOOK_SECRET" default:""`
+	WebhookTimeoutSeconds     int    `envconfig:"FORGE_WEBHOOK_TIMEOUT_SECONDS" default:"3"`
 }
 
 // Load parses environment variables into a Config struct. Returns an error

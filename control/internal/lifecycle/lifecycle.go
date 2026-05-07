@@ -62,6 +62,31 @@ type RouteNotifier interface {
 	OnSandboxStopped(ctx context.Context, appName string) error
 }
 
+// Phase 33-B — StateWebhookNotifier is called when a sandbox transitions
+// into a state that downstream consumers care about (currently: running).
+// The implementation POSTs JSON to a configured URL with HMAC signing.
+//
+// Like RouteNotifier, this is best-effort — errors are logged but never
+// propagated. Backend consumers MUST tolerate missed events (e.g. via
+// existing polling fallbacks) until Phase 33-C drops the polling path.
+type StateWebhookNotifier interface {
+	OnSandboxStateChanged(ctx context.Context, payload StateChangePayload) error
+}
+
+// StateChangePayload is the JSON body posted to the configured webhook URL.
+// Field names use snake_case to match the rest of the Forge JSON API.
+type StateChangePayload struct {
+	SandboxID   string `json:"sandbox_id"`
+	AppName     string `json:"app_name"`
+	UserID      string `json:"user_id,omitempty"`
+	State       string `json:"state"`
+	PrevState   string `json:"prev_state"`
+	HostPort    int32  `json:"host_port,omitempty"`
+	ContainerID string `json:"container_id,omitempty"`
+	NodeID      string `json:"node_id,omitempty"`
+	Timestamp   string `json:"ts"`
+}
+
 // ── Request/Result Types ─────────────────────────────────────────────
 
 // CreateRequest contains the parameters for creating a new sandbox.
@@ -97,10 +122,11 @@ type SandboxResult struct {
 
 // LifecycleService orchestrates sandbox lifecycle operations.
 type LifecycleService struct {
-	store         Store
-	logger        *slog.Logger
-	routeNotifier RouteNotifier
-	restartMgr    *RestartManager
+	store           Store
+	logger          *slog.Logger
+	routeNotifier   RouteNotifier
+	webhookNotifier StateWebhookNotifier
+	restartMgr      *RestartManager
 }
 
 // New creates a new LifecycleService.
@@ -115,6 +141,73 @@ func New(s Store, logger *slog.Logger) *LifecycleService {
 // This avoids widening the New() signature for optional dependencies.
 func (ls *LifecycleService) SetRouteNotifier(rn RouteNotifier) {
 	ls.routeNotifier = rn
+}
+
+// SetStateWebhookNotifier injects the Phase 33-B state-change webhook
+// notifier after construction. Optional — when unset, lifecycle never
+// posts state-change webhooks (backwards compat).
+func (ls *LifecycleService) SetStateWebhookNotifier(wn StateWebhookNotifier) {
+	ls.webhookNotifier = wn
+}
+
+// notifyStateWebhook is a fire-and-forget helper that POSTs the state
+// change to the configured webhook (if any). Phase 33-B currently only
+// fires for transitions INTO running — backend's ContainerPoolService
+// uses this signal to flip provisioning rows to warm without polling.
+//
+// The webhook runs in a goroutine so the lifecycle handler doesn't block
+// on slow HTTP. Caller passes the freshly-loaded sandbox row (already
+// has node_id / container_id / host_port for `running` transitions).
+func (ls *LifecycleService) notifyStateWebhook(
+	sandbox store.Sandbox,
+	sandboxID uuid.UUID,
+	prevState models.SandboxState,
+	nextState models.SandboxState,
+) {
+	if ls.webhookNotifier == nil {
+		return
+	}
+	// Currently only running transitions are emitted. Add Failed/Destroyed
+	// here in a follow-up phase if backend needs early-fail signals.
+	if nextState != models.StateRunning {
+		return
+	}
+	// Suppress no-op transitions (alreadyAtTarget escape hatch in
+	// HandleAck sets nextState=currentState). Only fire on the actual
+	// transition INTO running, never on running→running confirmations.
+	if prevState == models.StateRunning {
+		return
+	}
+	payload := StateChangePayload{
+		SandboxID: sandboxID.String(),
+		AppName:   sandbox.AppName,
+		UserID:    sandbox.UserID,
+		State:     string(nextState),
+		PrevState: string(prevState),
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if sandbox.ContainerID.Valid {
+		payload.ContainerID = sandbox.ContainerID.String
+	}
+	if sandbox.HostPort.Valid {
+		payload.HostPort = sandbox.HostPort.Int32
+	}
+	if sandbox.NodeID.Valid {
+		payload.NodeID = uuid.UUID(sandbox.NodeID.Bytes).String()
+	}
+
+	go func(p StateChangePayload) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := ls.webhookNotifier.OnSandboxStateChanged(ctx, p); err != nil {
+			ls.logger.Warn("state webhook delivery failed",
+				"error", err,
+				"sandbox_id", p.SandboxID,
+				"app_name", p.AppName,
+				"state", p.State,
+			)
+		}
+	}(payload)
 }
 
 // SetRestartManager injects the restart manager after construction.
@@ -522,6 +615,11 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 			}
 		}
 
+		// Phase 33-B — emit state-change webhook for downstream consumers
+		// (backend ContainerPoolService flips provisioning→warm on this).
+		// Fire-and-forget; webhook impl runs the POST in its own goroutine.
+		ls.notifyStateWebhook(sandbox, sandboxID, models.SandboxState(currentState), nextState)
+
 		// Reset restart failure count on successful start (handles restart recovery).
 		if ls.restartMgr != nil && nextState == models.StateRunning && sandbox.FailureCount > 0 {
 			if err := ls.restartMgr.HandleRestarted(ctx, pgSandboxID); err != nil {
@@ -621,6 +719,21 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 		switch nextState {
 		case models.StateRestarting, models.StateStopped, models.StateFailed:
 			ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+		}
+	}
+
+	// Phase 33-B — emit state-change webhook on first transition into
+	// running. Both HandleAck (start_sandbox+success) and HandleEvent
+	// (container_started) can produce this transition; either path
+	// arriving first wins, the other becomes a no-op via webhook
+	// idempotency on the listener side. We re-fetch the row so the
+	// webhook payload carries container_id and host_port (HandleEvent
+	// itself doesn't update them — those flow in via the start ack).
+	if currentState != models.StateRunning && nextState == models.StateRunning {
+		if refreshed, err := ls.store.GetSandbox(ctx, pgSandboxID); err == nil {
+			ls.notifyStateWebhook(refreshed, sandboxID, currentState, nextState)
+		} else {
+			ls.notifyStateWebhook(sandbox, sandboxID, currentState, nextState)
 		}
 	}
 
