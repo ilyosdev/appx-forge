@@ -379,14 +379,71 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 			case models.EventDestroyed:
 				alreadyAtTarget = currentState == models.StateDestroyed
 			}
-			if !alreadyAtTarget {
+
+			// Phase 32 Wave 2 Bug 6 — tolerate start_sandbox+success
+			// arriving when the sandbox is already in destroying/destroyed.
+			//
+			// Race: backend's eager verify-after-create marks the sandbox
+			// ERROR before the agent's start_sandbox cmd has been picked up;
+			// control transitions the row to destroying and dispatches
+			// stop_sandbox. The original stop_sandbox fails because
+			// container_id was empty at dispatch time. The start finally
+			// completes on the agent and acks success — but the row is
+			// already destroying. Without this branch we'd return 500 to
+			// the agent (cmd row stays "dispatched" forever) and leak a
+			// running container that nothing tracks.
+			//
+			// Tolerance: persist container_id from the ack so the orphan is
+			// addressable, dispatch a fresh stop_sandbox with the real ID
+			// so the agent can clean up, and soft-ack the original cmd as
+			// completed (no state change — sandbox stays in
+			// destroying/destroyed).
+			tolerateStaleStart := event == models.EventStarted &&
+				(currentState == models.StateDestroying || currentState == models.StateDestroyed)
+
+			if !alreadyAtTarget && !tolerateStaleStart {
 				return fmt.Errorf("%w: %s + %s from %s", ErrInvalidTransition, cmdType, status, sandbox.State)
 			}
-			ls.logger.Info("ack transition skipped: state already advanced",
-				"sandbox_id", sandboxID,
-				"current_state", currentState,
-				"cmd_type", cmdType,
-			)
+
+			if tolerateStaleStart {
+				ls.persistRuntimeInfo(ctx, pgSandboxID, sandboxID, ackResult)
+				if refreshed, ferr := ls.store.GetSandbox(ctx, pgSandboxID); ferr == nil &&
+					refreshed.ContainerID.Valid && refreshed.ContainerID.String != "" {
+					cleanupCmdID := uuid.New()
+					cmdPayload, _ := json.Marshal(map[string]interface{}{
+						"container_id": refreshed.ContainerID.String,
+					})
+					if _, cerr := ls.store.CreateCommand(ctx, store.CreateCommandParams{
+						ID:             pgtype.UUID{Bytes: cleanupCmdID, Valid: true},
+						NodeID:         refreshed.NodeID,
+						SandboxID:      pgSandboxID,
+						CommandType:    string(models.CmdStopSandbox),
+						Payload:        cmdPayload,
+						TimeoutSeconds: 60,
+					}); cerr != nil {
+						ls.logger.Warn("bug6: failed to dispatch cleanup stop_sandbox",
+							"error", cerr,
+							"sandbox_id", sandboxID,
+						)
+					} else {
+						ls.logger.Info("bug6: dispatched cleanup stop_sandbox for orphan container",
+							"sandbox_id", sandboxID,
+							"container_id", refreshed.ContainerID.String,
+							"cleanup_cmd_id", cleanupCmdID,
+						)
+					}
+				}
+				ls.logger.Info("ack tolerated: start_sandbox+success arrived during destroy (Phase 32 Wave 2 Bug 6)",
+					"sandbox_id", sandboxID,
+					"current_state", currentState,
+				)
+			} else {
+				ls.logger.Info("ack transition skipped: state already advanced",
+					"sandbox_id", sandboxID,
+					"current_state", currentState,
+					"cmd_type", cmdType,
+				)
+			}
 			nextState = currentState
 		} else {
 			_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
