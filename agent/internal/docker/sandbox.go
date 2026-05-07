@@ -45,10 +45,20 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 	}
 
 	// 3. Build container config.
+	//
+	// Phase 32 Wave 2 Bug 7 — set the forge.app_name label so the agent's
+	// heartbeat snapshot (ListContainers in client.go) can find this
+	// container. Without the label, the snapshot's filter excludes
+	// every Forge-created container; control's reconciler then sees
+	// running sandboxes as "missing on agent" and destroys them within
+	// seconds of reaching running state.
 	cfg := &container.Config{
 		Image:        spec.Image,
 		Env:          env,
 		ExposedPorts: network.PortSet{containerPortParsed: {}},
+		Labels: map[string]string{
+			"forge.app_name": spec.AppName,
+		},
 	}
 
 	// 4. Build host config with security hardening and resource limits.
