@@ -61,6 +61,14 @@ type HeartbeatSender struct {
 	// and the metrics endpoint can surface "agent alive but Docker slow"
 	// — a distinct signal from "agent crashed" or "node down".
 	skippedTicks atomic.Uint64
+
+	// Phase 33-Real-6 — last successful snapshot's running-container
+	// count. Used by liveness-only heartbeats so the control plane's
+	// load-aware pool throttle still sees a non-zero number when
+	// Docker is chronically slow (which is the case where the throttle
+	// matters most). Stored as int64 with atomic loads; -1 sentinel
+	// means "never had a successful snapshot since boot".
+	lastRunningContainers atomic.Int64
 }
 
 // NewHeartbeatSender creates a new HeartbeatSender.
@@ -71,13 +79,18 @@ func NewHeartbeatSender(
 	interval time.Duration,
 	logger *slog.Logger,
 ) *HeartbeatSender {
-	return &HeartbeatSender{
+	hs := &HeartbeatSender{
 		client:      client,
 		collector:   collector,
 		snapshotter: snapshotter,
 		interval:    interval,
 		logger:      logger,
 	}
+	// -1 sentinel: "no successful snapshot yet". Liveness-only path
+	// falls back to collector.Collect() (still placeholder 0) when this
+	// is unset, matching the previous behavior.
+	hs.lastRunningContainers.Store(-1)
+	return hs
 }
 
 // Start runs the heartbeat loop. It blocks until ctx is cancelled.
@@ -166,7 +179,15 @@ func (h *HeartbeatSender) sendHeartbeat(ctx context.Context) {
 				"skipped_snapshots_total", h.skippedTicks.Load(),
 			)
 		}
-		usedMB, runningContainers := h.collector.Collect()
+		usedMB, _ := h.collector.Collect()
+		// Phase 33-Real-6 — use cached count from last successful
+		// snapshot so the control-plane pool throttle still sees a
+		// representative number even while we're stuck on the liveness
+		// path. Falls back to 0 when no snapshot has succeeded yet.
+		runningContainers := 0
+		if cached := h.lastRunningContainers.Load(); cached >= 0 {
+			runningContainers = int(cached)
+		}
 		req := controlclient.HeartbeatRequest{
 			UsedMB:            usedMB,
 			RunningContainers: runningContainers,
@@ -189,6 +210,10 @@ func (h *HeartbeatSender) sendHeartbeat(ctx context.Context) {
 			runningContainers++
 		}
 	}
+	// Cache the freshly-computed count so subsequent liveness-only
+	// heartbeats (Docker stalled past the tick budget) can still report
+	// a meaningful number to the control-plane pool throttle.
+	h.lastRunningContainers.Store(int64(runningContainers))
 
 	containers := make([]controlclient.ContainerInfo, 0, len(snapshots))
 	for _, s := range snapshots {

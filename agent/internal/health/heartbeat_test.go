@@ -119,11 +119,29 @@ func TestHeartbeatSender_CallsAtInterval(t *testing.T) {
 	}
 }
 
+// Phase 33-Real-6 — running_containers now comes from the snapshot
+// the agent already collects (was placeholder collector value); usedMB
+// remains from collector for now. This test exercises both signals.
 func TestHeartbeatSender_PassesCurrentResourceUsage(t *testing.T) {
 	client := &mockHeartbeatClient{}
-	collector := &mockCollector{usedMB: 8500, runningContainers: 12}
+	collector := &mockCollector{usedMB: 8500, runningContainers: 999} // collector value should be ignored for count
+	snap := &mutableSnapshotter{}
+	snap.set([]docker.ContainerSnapshot{
+		{AppName: "a", State: "running"},
+		{AppName: "b", State: "running"},
+		{AppName: "c", State: "running"},
+		{AppName: "d", State: "running"},
+		{AppName: "e", State: "running"},
+		{AppName: "f", State: "running"},
+		{AppName: "g", State: "running"},
+		{AppName: "h", State: "running"},
+		{AppName: "i", State: "running"},
+		{AppName: "j", State: "running"},
+		{AppName: "k", State: "running"},
+		{AppName: "l", State: "running"}, // 12 running
+	})
 
-	sender := NewHeartbeatSender(client, collector, emptySnapshotter{}, 15*time.Millisecond, newTestLogger())
+	sender := NewHeartbeatSender(client, collector, snap, 15*time.Millisecond, newTestLogger())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -133,8 +151,25 @@ func TestHeartbeatSender_PassesCurrentResourceUsage(t *testing.T) {
 	// Wait for at least 1 heartbeat
 	time.Sleep(30 * time.Millisecond)
 
-	// Change values
-	collector.setValues(9000, 15)
+	// Change values: collector usedMB + snapshot count
+	collector.setValues(9000, 999)
+	snap.set([]docker.ContainerSnapshot{
+		{AppName: "a", State: "running"},
+		{AppName: "b", State: "running"},
+		{AppName: "c", State: "running"},
+		{AppName: "d", State: "running"},
+		{AppName: "e", State: "running"},
+		{AppName: "f", State: "running"},
+		{AppName: "g", State: "running"},
+		{AppName: "h", State: "running"},
+		{AppName: "i", State: "running"},
+		{AppName: "j", State: "running"},
+		{AppName: "k", State: "running"},
+		{AppName: "l", State: "running"},
+		{AppName: "m", State: "running"},
+		{AppName: "n", State: "running"},
+		{AppName: "o", State: "running"}, // 15 running
+	})
 
 	// Wait for another heartbeat
 	time.Sleep(30 * time.Millisecond)
@@ -162,6 +197,27 @@ func TestHeartbeatSender_PassesCurrentResourceUsage(t *testing.T) {
 	if last.RunningContainers != 15 {
 		t.Errorf("last call running_containers: got %d, want %d", last.RunningContainers, 15)
 	}
+}
+
+// mutableSnapshotter lets the test swap the returned slice mid-flight
+// to verify the heartbeat picks up updated counts on subsequent ticks.
+type mutableSnapshotter struct {
+	mu   sync.Mutex
+	snap []docker.ContainerSnapshot
+}
+
+func (m *mutableSnapshotter) Snapshot(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]docker.ContainerSnapshot, len(m.snap))
+	copy(out, m.snap)
+	return out, nil
+}
+
+func (m *mutableSnapshotter) set(s []docker.ContainerSnapshot) {
+	m.mu.Lock()
+	m.snap = s
+	m.mu.Unlock()
 }
 
 func TestHeartbeatSender_ContinuesOnError(t *testing.T) {
