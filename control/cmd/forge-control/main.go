@@ -36,6 +36,7 @@ import (
 	"github.com/appx/forge/control/internal/routing"
 	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/shared-go/models"
 )
 
 func main() {
@@ -131,6 +132,59 @@ func main() {
 			"url", cfg.WebhookURL,
 			"timeout_seconds", cfg.WebhookTimeoutSeconds,
 		)
+
+		// Phase 33-H2 — Startup state replay. forge-control's webhook
+		// delivery is fire-and-forget (lifecycle.go:notifyStateWebhook
+		// spawns a goroutine and never persists). If the process crashes
+		// between sandbox state transition and goroutine completion, the
+		// running event is lost and backend's app_deployments row stays
+		// in PROVISIONING/ERROR until sweepStuckProvisioning catches it
+		// 5 minutes later. On startup, list all running sandboxes and
+		// post one self-state webhook each — backend's listener is
+		// idempotent (already-WARM rows early-return), so this is safe
+		// to run on every boot. Sequential delivery; ~20 sandboxes ×
+		// timeout-bounded HTTP = bounded startup overhead.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			running, err := queries.ListSandboxesByState(ctx, string(models.StateRunning))
+			if err != nil {
+				logger.Warn("startup webhook replay: list failed", "error", err)
+				return
+			}
+			logger.Info("startup webhook replay starting", "count", len(running))
+			delivered := 0
+			for _, sb := range running {
+				payload := lifecycle.StateChangePayload{
+					SandboxID: uuid.UUID(sb.ID.Bytes).String(),
+					AppName:   sb.AppName,
+					UserID:    sb.UserID,
+					State:     string(models.StateRunning),
+					// PrevState equal to State signals self-replay to any
+					// payload-aware consumer; backend's listener filters
+					// only on State so this is metadata-only.
+					PrevState: string(models.StateRunning),
+					Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+				}
+				if sb.ContainerID.Valid {
+					payload.ContainerID = sb.ContainerID.String
+				}
+				if sb.HostPort.Valid {
+					payload.HostPort = sb.HostPort.Int32
+				}
+				if sb.NodeID.Valid {
+					payload.NodeID = uuid.UUID(sb.NodeID.Bytes).String()
+				}
+				if err := webhookClient.OnSandboxStateChanged(ctx, payload); err != nil {
+					logger.Warn("startup webhook replay: delivery failed",
+						"error", err, "app_name", payload.AppName)
+					continue
+				}
+				delivered++
+			}
+			logger.Info("startup webhook replay complete",
+				"delivered", delivered, "total", len(running))
+		}()
 	} else {
 		logger.Info("state webhook notifier skipped (FORGE_WEBHOOK_URL unset)")
 	}
