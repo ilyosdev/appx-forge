@@ -137,53 +137,72 @@ func main() {
 		// delivery is fire-and-forget (lifecycle.go:notifyStateWebhook
 		// spawns a goroutine and never persists). If the process crashes
 		// between sandbox state transition and goroutine completion, the
-		// running event is lost and backend's app_deployments row stays
-		// in PROVISIONING/ERROR until sweepStuckProvisioning catches it
-		// 5 minutes later. On startup, list all running sandboxes and
-		// post one self-state webhook each — backend's listener is
-		// idempotent (already-WARM rows early-return), so this is safe
-		// to run on every boot. Sequential delivery; ~20 sandboxes ×
-		// timeout-bounded HTTP = bounded startup overhead.
+		// event is lost and backend's app_deployments row stays in the
+		// pre-transition state until sweepStuckProvisioning or the user
+		// retries.
+		//
+		// On startup, replay the same three states the runtime emits:
+		// running (so PROVISIONING→WARM and ERROR→RUNNING recover),
+		// failed (so PROVISIONING/WARM/RUNNING→ERROR), and destroyed
+		// (so any non-terminal row→DESTROYED). Backend's listener is
+		// idempotent: already-terminal rows early-return.
+		//
+		// Phase 33-Audit-3: extended from running-only to {running,
+		// failed, destroyed} so crashes during failed/destroyed
+		// transitions don't permanently strand backend state.
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
-			running, err := queries.ListSandboxesByState(ctx, string(models.StateRunning))
-			if err != nil {
-				logger.Warn("startup webhook replay: list failed", "error", err)
-				return
+			states := []models.SandboxState{
+				models.StateRunning,
+				models.StateFailed,
+				models.StateDestroyed,
 			}
-			logger.Info("startup webhook replay starting", "count", len(running))
-			delivered := 0
-			for _, sb := range running {
-				payload := lifecycle.StateChangePayload{
-					SandboxID: uuid.UUID(sb.ID.Bytes).String(),
-					AppName:   sb.AppName,
-					UserID:    sb.UserID,
-					State:     string(models.StateRunning),
-					// PrevState equal to State signals self-replay to any
-					// payload-aware consumer; backend's listener filters
-					// only on State so this is metadata-only.
-					PrevState: string(models.StateRunning),
-					Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
-				}
-				if sb.ContainerID.Valid {
-					payload.ContainerID = sb.ContainerID.String
-				}
-				if sb.HostPort.Valid {
-					payload.HostPort = sb.HostPort.Int32
-				}
-				if sb.NodeID.Valid {
-					payload.NodeID = uuid.UUID(sb.NodeID.Bytes).String()
-				}
-				if err := webhookClient.OnSandboxStateChanged(ctx, payload); err != nil {
-					logger.Warn("startup webhook replay: delivery failed",
-						"error", err, "app_name", payload.AppName)
+			totalDelivered := 0
+			totalCount := 0
+			for _, st := range states {
+				rows, err := queries.ListSandboxesByState(ctx, string(st))
+				if err != nil {
+					logger.Warn("startup webhook replay: list failed",
+						"state", string(st), "error", err)
 					continue
 				}
-				delivered++
+				logger.Info("startup webhook replay batch starting",
+					"state", string(st), "count", len(rows))
+				delivered := 0
+				for _, sb := range rows {
+					payload := lifecycle.StateChangePayload{
+						SandboxID: uuid.UUID(sb.ID.Bytes).String(),
+						AppName:   sb.AppName,
+						UserID:    sb.UserID,
+						State:     string(st),
+						// Self-replay marker; backend filters on State only.
+						PrevState: string(st),
+						Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+					}
+					if sb.ContainerID.Valid {
+						payload.ContainerID = sb.ContainerID.String
+					}
+					if sb.HostPort.Valid {
+						payload.HostPort = sb.HostPort.Int32
+					}
+					if sb.NodeID.Valid {
+						payload.NodeID = uuid.UUID(sb.NodeID.Bytes).String()
+					}
+					if err := webhookClient.OnSandboxStateChanged(ctx, payload); err != nil {
+						logger.Warn("startup webhook replay: delivery failed",
+							"state", string(st), "error", err, "app_name", payload.AppName)
+						continue
+					}
+					delivered++
+				}
+				logger.Info("startup webhook replay batch complete",
+					"state", string(st), "delivered", delivered, "total", len(rows))
+				totalDelivered += delivered
+				totalCount += len(rows)
 			}
-			logger.Info("startup webhook replay complete",
-				"delivered", delivered, "total", len(running))
+			logger.Info("startup webhook replay all batches complete",
+				"delivered", totalDelivered, "total", totalCount)
 		}()
 	} else {
 		logger.Info("state webhook notifier skipped (FORGE_WEBHOOK_URL unset)")
