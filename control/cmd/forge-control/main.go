@@ -195,6 +195,13 @@ func main() {
 						continue
 					}
 					delivered++
+					// Phase 33-Audit-3 — small inter-request delay so a
+					// large terminal-state backlog (forge-db cleanup
+					// retains 6h of destroyed/failed) doesn't crash into
+					// downstream rate limits as a thundering herd. 20ms
+					// between requests caps replay throughput at ~50/s,
+					// well under any reasonable receiver rate limit.
+					time.Sleep(20 * time.Millisecond)
 				}
 				logger.Info("startup webhook replay batch complete",
 					"state", string(st), "delivered", delivered, "total", len(rows))
