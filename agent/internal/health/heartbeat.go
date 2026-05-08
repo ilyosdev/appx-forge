@@ -110,45 +110,71 @@ func (h *HeartbeatSender) SkippedTicks() uint64 {
 }
 
 // sendHeartbeat collects resources, snapshots containers, and sends a single
-// heartbeat. On snapshot failure, the heartbeat is SKIPPED entirely rather
-// than sent with an empty container list. Sending an empty list would, over
-// a multi-tick failure (>60s), trip T7 reconciler's grace window and cause
-// it to mass-mark every Forge sandbox as 'agent_lost' — trading correctness
-// for liveness. Skipping ticks lets the control plane's existing
-// missed-heartbeat alarm surface the real signal: this node is in trouble.
+// heartbeat.
+//
+// Phase 33-Audit-6: when the snapshot times out (Docker slow under load),
+// fall back to a LIVENESS-ONLY heartbeat (Containers=nil) instead of
+// SKIPPING the tick entirely. The control-plane heartbeat handler
+// (`api/nodes.go:handleHeartbeat`) updates last_seen_at unconditionally
+// and only triggers T7 reconciler when `req.Containers != nil`, so a
+// liveness heartbeat:
+//
+//   - keeps the node 'healthy' on the control side (no missed-beat flap)
+//   - does NOT trigger reconcile against an empty list (no mass-destroy
+//     of Forge sandboxes — the T7 protection the prior SKIPPING was
+//     trying to preserve)
+//
+// Previously, SKIPPING ticks under Docker pressure tripped the
+// missed-heartbeat alarm (4-streak / 6-missed → status='unhealthy'),
+// which removed the node from `ListHealthyNodes` and caused user
+// `createApp` calls to 503 with "no nodes available with sufficient
+// capacity" — even though the agent process was alive and Docker was
+// merely momentarily slow. Beta incident 2026-05-08, project
+// cb39efa6-ddd9-489c-b806-14ea3c7021bf.
 //
 // Phase 32 Wave 2 Bug 5 — each tick also gets a per-call timeout
-// (heartbeatTickTimeout). On a host where dockerd has stalled, ListContainers
-// can block for tens of seconds; without this bound the heartbeat loop
-// itself stalls and the control plane sees the node as gone. On timeout
-// we still skip (relying on the control-side debounce window from Bug 4)
-// but increment skippedTicks so operators see "agent alive, Docker slow"
-// as a distinct signal from "agent crashed".
+// (heartbeatTickTimeout). On a host where dockerd has stalled,
+// ListContainers can block for tens of seconds; without this bound
+// the heartbeat loop itself stalls.
 func (h *HeartbeatSender) sendHeartbeat(ctx context.Context) {
 	tickCtx, cancel := context.WithTimeout(ctx, heartbeatTickTimeout)
 	defer cancel()
 
 	snapshots, err := h.snapshotter.Snapshot(tickCtx)
 	if err != nil {
-		// Distinguish "Docker stalled past our tick budget" from "Docker
-		// returned a real error" — only the former implies the daemon
-		// is healthy enough to eventually recover. We check both the
-		// per-tick deadline AND the parent context: if the parent was
-		// cancelled (agent shutting down), drop quietly without
-		// counting a skip — that's a normal stop, not a Docker stall.
+		// Distinguish "agent shutting down" from "Docker stalled" —
+		// parent-context cancellation is a normal stop, drop quietly.
 		if ctx.Err() != nil {
 			return
 		}
+
+		// Docker timeout or transient failure → liveness-only heartbeat.
+		// This is the failure-mode path; we deliberately leave Containers
+		// empty so the reconciler does NOT fire on an unobserved snapshot
+		// (T7 mass-destroy protection still in place).
+		h.skippedTicks.Add(1)
 		if errors.Is(err, context.DeadlineExceeded) {
-			h.skippedTicks.Add(1)
 			h.logger.Warn(
-				"heartbeat snapshot deadline exceeded; SKIPPING this tick (agent alive, Docker slow)",
+				"heartbeat snapshot deadline exceeded; sending LIVENESS-ONLY heartbeat (agent alive, Docker slow)",
 				"timeout", heartbeatTickTimeout,
-				"skipped_total", h.skippedTicks.Load(),
+				"skipped_snapshots_total", h.skippedTicks.Load(),
 			)
-			return
+		} else {
+			h.logger.Warn(
+				"heartbeat snapshot failed; sending LIVENESS-ONLY heartbeat (Containers omitted to avoid tripping T7 mass-destroy)",
+				"error", err,
+				"skipped_snapshots_total", h.skippedTicks.Load(),
+			)
 		}
-		h.logger.Warn("heartbeat snapshot failed; SKIPPING this tick to avoid sending an empty list (would trip T7 reconciler's mass-destroy grace window if Docker stays down)", "error", err)
+		usedMB, runningContainers := h.collector.Collect()
+		req := controlclient.HeartbeatRequest{
+			UsedMB:            usedMB,
+			RunningContainers: runningContainers,
+			// Containers intentionally nil — keeps reconciler silent.
+		}
+		if hbErr := h.client.Heartbeat(ctx, req); hbErr != nil {
+			h.logger.Warn("liveness-only heartbeat send failed", "error", hbErr)
+		}
 		return
 	}
 

@@ -350,11 +350,17 @@ func TestHeartbeatSender_DockerSlowDoesNotHangPastTimeout(t *testing.T) {
 			elapsed, heartbeatTickTimeout)
 	}
 
-	// Tick was skipped — no heartbeat hit the wire.
-	if got := len(client.getCalls()); got != 0 {
-		t.Errorf("expected 0 heartbeat calls on snapshot timeout, got %d", got)
+	// Phase 33-Audit-6 — snapshot timeout sends a liveness-only heartbeat
+	// (Containers field empty) so the control plane keeps the node healthy.
+	// The skipped-snapshot counter still increments to surface "Docker slow"
+	// to operators.
+	calls := client.getCalls()
+	if len(calls) != 1 {
+		t.Errorf("expected exactly 1 liveness heartbeat on snapshot timeout, got %d", len(calls))
+	} else if len(calls[0].Containers) != 0 {
+		t.Errorf("liveness heartbeat must omit Containers; got %d entries", len(calls[0].Containers))
 	}
-	// Counter records the skip.
+	// Counter records the skipped-snapshot.
 	if got := sender.SkippedTicks(); got != 1 {
 		t.Errorf("expected SkippedTicks=1 after one timeout, got %d", got)
 	}
@@ -399,12 +405,19 @@ func TestHeartbeatSender_ParentContextCancelStillReturns(t *testing.T) {
 	}
 }
 
-// Phase 30 T4 — snapshot failure SKIPS the tick instead of sending an empty
-// container list. Sending an empty list would, over a multi-tick failure
-// (>60s), trip T7 reconciler's grace window and mass-mark every Forge
-// sandbox as 'agent_lost'. Skipping ticks lets the control plane's existing
-// missed-heartbeat alarm surface the real signal: this node is in trouble.
-func TestHeartbeatSender_SnapshotErrorSkipsTickInsteadOfSendingEmptyList(t *testing.T) {
+// Phase 33-Audit-6 — snapshot failure now sends a LIVENESS-ONLY heartbeat
+// (Containers field omitted) instead of skipping the tick. The control-plane
+// heartbeat handler updates last_seen_at unconditionally and only triggers
+// the T7 reconciler when Containers is non-nil, so:
+//
+//   - liveness heartbeat keeps the node 'healthy' on the control side
+//     (no missed-beat flap that breaks user provisioning)
+//   - liveness heartbeat does NOT trigger reconcile against an empty list
+//     (T7 mass-destroy protection still in place)
+//
+// Replaces the prior SKIPPING behavior that tripped the missed-heartbeat
+// alarm under sustained Docker pressure (beta incident 2026-05-08).
+func TestHeartbeatSender_SnapshotErrorSendsLivenessOnlyHeartbeat(t *testing.T) {
 	client := &mockHeartbeatClient{}
 	collector := &mockCollector{usedMB: 100, runningContainers: 0}
 	snapshotter := &mockSnapshotter{err: errors.New("docker daemon unreachable")}
@@ -416,20 +429,28 @@ func TestHeartbeatSender_SnapshotErrorSkipsTickInsteadOfSendingEmptyList(t *test
 
 	go sender.Start(ctx)
 
-	// Wait several tick intervals; assert NO heartbeat was sent.
+	// Wait several tick intervals; expect ≥1 liveness heartbeat sent.
 	time.Sleep(60 * time.Millisecond)
 	cancel()
 	time.Sleep(10 * time.Millisecond)
 
 	calls := client.getCalls()
-	if len(calls) != 0 {
-		t.Fatalf("heartbeat should NOT be sent on snapshot failure, but got %d calls (first: %+v)", len(calls), calls[0])
+	if len(calls) == 0 {
+		t.Fatalf("expected at least one liveness heartbeat on snapshot failure; got 0 calls")
 	}
 
-	// Collector should also NOT be called when snapshot fails (snapshot now
-	// runs first; failure short-circuits the rest of the tick).
-	collectCount := int(collector.collectCalls.Load())
-	if collectCount != 0 {
-		t.Errorf("collector.Collect() should not be called when snapshot fails; got %d calls", collectCount)
+	// Every call must be liveness-only — Containers field empty/nil — so
+	// the control-plane reconciler does not fire on an unobserved snapshot.
+	for i, call := range calls {
+		if len(call.Containers) != 0 {
+			t.Errorf("call[%d]: liveness heartbeat must omit Containers (got %d entries)",
+				i, len(call.Containers))
+		}
+	}
+
+	// Skipped-snapshot counter must increment (operators rely on this signal
+	// to distinguish "agent alive, Docker slow" from "agent crashed").
+	if got := sender.SkippedTicks(); got == 0 {
+		t.Errorf("SkippedTicks should have incremented; got %d", got)
 	}
 }

@@ -47,6 +47,18 @@ type SandboxStore interface {
 // short-circuit just avoids the extra UPDATE round-trip.
 const reconcilerGraceWindow = 60 * time.Second
 
+// isTerminalState reports whether a sandbox state is a sink in the state
+// machine — no further transitions are legal except DELETE. Used by the
+// reconciler to skip MarkSandboxVerified UPDATEs that would violate the
+// `sandboxes_state_check` constraint (e.g. failed → running is not legal).
+func isTerminalState(s string) bool {
+	switch s {
+	case "failed", "destroyed", "destroying":
+		return true
+	}
+	return false
+}
+
 // HeartbeatReconciler diffs each rich heartbeat against the per-node DB
 // working set: bumps verified_at + state for confirmed containers, marks
 // agent-lost for DB rows missing from the agent's report past the grace
@@ -83,8 +95,27 @@ func (r *HeartbeatReconciler) Reconcile(ctx context.Context, nodeID pgtype.UUID,
 		agentSet[c.AppName] = c
 	}
 
+	// Phase 33-Audit-7 — build DB-state lookup so the verify pass can skip
+	// rows that have already reached a terminal state. Without this guard,
+	// agent-observed containers for failed/destroyed/destroying rows
+	// trigger a state UPDATE that the sandboxes_state_check constraint
+	// rejects (e.g. failed → running is not a legal transition), spamming
+	// the log every reconcile tick. Beta incident 2026-05-08: 7 failed
+	// rows produced thousands of "MarkSandboxVerified failed" warnings.
+	dbState := make(map[string]string, len(dbRows))
+	for _, row := range dbRows {
+		dbState[row.AppName] = row.State
+	}
+
 	// Bump verified_at for confirmed rows.
 	for _, c := range containers {
+		if isTerminalState(dbState[c.AppName]) {
+			// Container still exists at the agent but the row is terminal;
+			// the lifecycle layer will eventually issue a destroy command.
+			// Verifying back to 'running' here would violate the state
+			// machine — drop silently.
+			continue
+		}
 		if err := r.store.MarkSandboxVerified(ctx, c.AppName, c.State); err != nil {
 			r.logger.Warn("MarkSandboxVerified failed", "app_name", c.AppName, "err", err)
 		}
