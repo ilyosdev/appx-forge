@@ -59,6 +59,32 @@ func isTerminalState(s string) bool {
 	return false
 }
 
+// mapAgentStateToPG translates the raw Docker state the agent observes
+// (`running | paused | restarting | exited | dead | created`) into a value
+// the `sandboxes_state_check` constraint accepts (`pending | starting |
+// running | restarting | stopped | destroying | destroyed | failed`).
+// Returns ("", false) for states that have no clean PG counterpart so the
+// caller can skip the UPDATE entirely (e.g. transient `paused`, which is
+// not a Forge concept). Phase 33-Audit-9: prior code passed `c.State`
+// straight through, producing `state='exited'` UPDATEs that the CHECK
+// constraint rejected and spammed the log.
+func mapAgentStateToPG(agentState string) (string, bool) {
+	switch agentState {
+	case "running", "restarting":
+		return agentState, true
+	case "exited":
+		return "stopped", true
+	case "dead":
+		return "failed", true
+	case "created":
+		return "starting", true
+	case "paused":
+		// No PG equivalent and not a Forge-managed transition; skip verify.
+		return "", false
+	}
+	return "", false
+}
+
 // HeartbeatReconciler diffs each rich heartbeat against the per-node DB
 // working set: bumps verified_at + state for confirmed containers, marks
 // agent-lost for DB rows missing from the agent's report past the grace
@@ -116,8 +142,25 @@ func (r *HeartbeatReconciler) Reconcile(ctx context.Context, nodeID pgtype.UUID,
 			// machine — drop silently.
 			continue
 		}
-		if err := r.store.MarkSandboxVerified(ctx, c.AppName, c.State); err != nil {
-			r.logger.Warn("MarkSandboxVerified failed", "app_name", c.AppName, "err", err)
+		// Phase 33-Audit-9 — translate the raw Docker state agent emits
+		// (`exited` / `dead` / `created` / `paused`) into a value the
+		// sandboxes_state_check constraint will accept. Without this map
+		// the agent's `exited` write becomes `state='exited'` UPDATE,
+		// which the CHECK constraint rejects on every reconcile tick.
+		pgState, ok := mapAgentStateToPG(c.State)
+		if !ok {
+			// State has no PG counterpart (e.g. `paused`); skip verify.
+			// last_seen_at is already bumped by the heartbeat itself, so
+			// the row stays observable to the rest of the system.
+			continue
+		}
+		if err := r.store.MarkSandboxVerified(ctx, c.AppName, pgState); err != nil {
+			r.logger.Warn("MarkSandboxVerified failed",
+				"app_name", c.AppName,
+				"agent_state", c.State,
+				"pg_state", pgState,
+				"err", err,
+			)
 		}
 	}
 
