@@ -125,3 +125,33 @@ func AllEvents() []SandboxEvent {
 func IsTerminal(state SandboxState) bool {
 	return state == StateDestroyed
 }
+
+// FromDockerState maps a raw Docker container State string into the
+// canonical SandboxState vocabulary. The agent observes Docker primitives
+// (`running | paused | restarting | exited | dead | created`) but the
+// rest of the system speaks SandboxState. This translator is the single
+// source of truth for the boundary; agents call it before reporting state
+// up to the control plane so the control side never sees Docker leakage.
+//
+// Returns ("", false) when the Docker state has no canonical counterpart
+// (e.g. `paused` — Forge does not pause containers, an observed paused
+// container is anomalous and should not produce a state UPDATE). Callers
+// should drop the snapshot rather than fabricate a state.
+func FromDockerState(dockerState string) (SandboxState, bool) {
+	switch dockerState {
+	case "running":
+		return StateRunning, true
+	case "restarting":
+		return StateRestarting, true
+	case "exited":
+		return StateStopped, true
+	case "dead":
+		return StateFailed, true
+	case "created":
+		return StateStarting, true
+	case "paused":
+		// No Forge equivalent; agent should not emit this.
+		return "", false
+	}
+	return "", false
+}

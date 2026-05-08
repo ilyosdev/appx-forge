@@ -136,3 +136,16 @@ func (q *Queries) PollPendingCommands(ctx context.Context, nodeID pgtype.UUID) (
 	}
 	return items, nil
 }
+
+// Phase 33-Real-8 — hand-edited DeleteCommandsForSandbox. Purges
+// command rows referencing the sandbox so a subsequent
+// DELETE FROM sandboxes can succeed (commands_sandbox_id_fkey FK has
+// no ON DELETE CASCADE). Keep this in sync with queries/commands.sql.
+const deleteCommandsForSandbox = `-- name: DeleteCommandsForSandbox :exec
+DELETE FROM commands WHERE sandbox_id = $1
+`
+
+func (q *Queries) DeleteCommandsForSandbox(ctx context.Context, sandboxID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteCommandsForSandbox, sandboxID)
+	return err
+}

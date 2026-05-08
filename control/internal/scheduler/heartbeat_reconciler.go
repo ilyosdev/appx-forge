@@ -33,11 +33,26 @@ type SandboxRow struct {
 	CreatedAt time.Time
 }
 
+// TerminalSandboxRow is what the reconciler needs to dispatch a stop
+// command for an orphan container that the agent still observes against
+// a row in terminal state.
+type TerminalSandboxRow struct {
+	ID          pgtype.UUID
+	AppName     string
+	ContainerID string
+}
+
 // SandboxStore is the interface HeartbeatReconciler needs from the store.
 type SandboxStore interface {
 	ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]SandboxRow, error)
 	MarkSandboxVerified(ctx context.Context, appName, state string) error
 	MarkSandboxAgentLost(ctx context.Context, appName string, nodeID pgtype.UUID) error
+
+	// Phase 33-Real-7 — terminal-state rows whose container the agent
+	// still observes. Reconciler dispatches stop_sandbox so the orphan
+	// container is destroyed, replacing the prior silent skip.
+	ListTerminalSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]TerminalSandboxRow, error)
+	DispatchStopSandbox(ctx context.Context, sandboxID pgtype.UUID, nodeID pgtype.UUID, containerID, reason string) error
 }
 
 // reconcilerGraceWindow is how long a freshly-created DB row is allowed to
@@ -59,30 +74,20 @@ func isTerminalState(s string) bool {
 	return false
 }
 
-// mapAgentStateToPG translates the raw Docker state the agent observes
-// (`running | paused | restarting | exited | dead | created`) into a value
-// the `sandboxes_state_check` constraint accepts (`pending | starting |
-// running | restarting | stopped | destroying | destroyed | failed`).
-// Returns ("", false) for states that have no clean PG counterpart so the
-// caller can skip the UPDATE entirely (e.g. transient `paused`, which is
-// not a Forge concept). Phase 33-Audit-9: prior code passed `c.State`
-// straight through, producing `state='exited'` UPDATEs that the CHECK
-// constraint rejected and spammed the log.
-func mapAgentStateToPG(agentState string) (string, bool) {
-	switch agentState {
-	case "running", "restarting":
-		return agentState, true
-	case "exited":
-		return "stopped", true
-	case "dead":
-		return "failed", true
-	case "created":
-		return "starting", true
-	case "paused":
-		// No PG equivalent and not a Forge-managed transition; skip verify.
-		return "", false
+// validPGState reports whether s is one of the eight values the
+// `sandboxes_state_check` constraint accepts. Defense-in-depth guard for
+// the reconciler's verify pass: agent translates Docker primitives at its
+// own boundary (Phase 33-Real-9 — agent/internal/docker/client.go via
+// models.FromDockerState), but a malformed agent payload should not
+// produce a constraint-violation log spam, so we re-check here and skip
+// the UPDATE rather than trust blindly.
+func validPGState(s string) bool {
+	switch s {
+	case "pending", "starting", "running", "restarting",
+		"stopped", "destroying", "destroyed", "failed":
+		return true
 	}
-	return "", false
+	return false
 }
 
 // HeartbeatReconciler diffs each rich heartbeat against the per-node DB
@@ -142,25 +147,20 @@ func (r *HeartbeatReconciler) Reconcile(ctx context.Context, nodeID pgtype.UUID,
 			// machine — drop silently.
 			continue
 		}
-		// Phase 33-Audit-9 — translate the raw Docker state agent emits
-		// (`exited` / `dead` / `created` / `paused`) into a value the
-		// sandboxes_state_check constraint will accept. Without this map
-		// the agent's `exited` write becomes `state='exited'` UPDATE,
-		// which the CHECK constraint rejects on every reconcile tick.
-		pgState, ok := mapAgentStateToPG(c.State)
-		if !ok {
-			// State has no PG counterpart (e.g. `paused`); skip verify.
-			// last_seen_at is already bumped by the heartbeat itself, so
-			// the row stays observable to the rest of the system.
+		// Phase 33-Real-9 — agent now translates Docker primitives to
+		// canonical SandboxState at its own boundary (see
+		// agent/internal/docker/client.go and models.FromDockerState).
+		// Defense in depth: still validate the incoming state matches
+		// the PG enum so a malformed payload skips the UPDATE rather
+		// than crashing the constraint and spamming the log.
+		if !validPGState(c.State) {
+			r.logger.Warn("reconcile: agent reported non-canonical state, skipping verify",
+				"app_name", c.AppName, "state", c.State)
 			continue
 		}
-		if err := r.store.MarkSandboxVerified(ctx, c.AppName, pgState); err != nil {
+		if err := r.store.MarkSandboxVerified(ctx, c.AppName, c.State); err != nil {
 			r.logger.Warn("MarkSandboxVerified failed",
-				"app_name", c.AppName,
-				"agent_state", c.State,
-				"pg_state", pgState,
-				"err", err,
-			)
+				"app_name", c.AppName, "state", c.State, "err", err)
 		}
 	}
 
@@ -183,6 +183,39 @@ func (r *HeartbeatReconciler) Reconcile(ctx context.Context, nodeID pgtype.UUID,
 
 	if driftCount > 0 {
 		r.logger.Info("reconcile drift", "agent_lost", driftCount)
+	}
+
+	// Phase 33-Real-7 — orphan-container cleanup. Replaces the prior
+	// silent skip when the agent reported a container for a row already
+	// in terminal state (failed / destroying / destroyed). Without this
+	// dispatch, the underlying Docker container lived forever — the
+	// MarkSandboxVerified guard (state IN clause) prevented row flap, but
+	// nothing was actually destroying the orphan. Now: list terminal-row
+	// containers on this node, intersect with agent's observed set, and
+	// dispatch stop_sandbox per match. Idempotent on the agent side
+	// (stop on already-stopped container is a no-op).
+	terminalRows, err := r.store.ListTerminalSandboxesForNode(ctx, nodeID)
+	if err != nil {
+		r.logger.Warn("reconcile: list terminal rows failed", "err", err)
+		return nil // non-fatal, drift catcher resumes next tick
+	}
+	dispatched := 0
+	for _, row := range terminalRows {
+		if _, present := agentSet[row.AppName]; !present {
+			continue
+		}
+		if row.ContainerID == "" {
+			continue
+		}
+		if err := r.store.DispatchStopSandbox(ctx, row.ID, nodeID, row.ContainerID, "orphan_terminal_row"); err != nil {
+			r.logger.Warn("reconcile: orphan stop dispatch failed",
+				"app_name", row.AppName, "err", err)
+			continue
+		}
+		dispatched++
+	}
+	if dispatched > 0 {
+		r.logger.Info("reconcile orphan cleanup", "stop_dispatched", dispatched)
 	}
 	return nil
 }

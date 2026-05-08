@@ -52,6 +52,12 @@ type Store interface {
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	AckCommand(ctx context.Context, arg store.AckCommandParams) error
 	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+
+	// Phase 33-Real-8 — purge commands then row for inline pool cleanup
+	// on stop_sandbox+success ack. Eliminates the cron-based stopped-row
+	// accumulation for the dominant case (pool warm sandboxes that never
+	// resume after idle reap).
+	DeleteCommandsForSandbox(ctx context.Context, sandboxID pgtype.UUID) error
 }
 
 // RouteNotifier is called by the lifecycle service when sandbox state changes
@@ -655,7 +661,60 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 		return fmt.Errorf("ack command: %w", err)
 	}
 
+	// Phase 33-Real-8 — inline pool cleanup. When a pool sandbox's
+	// stop_sandbox command acks success, the row is now in `stopped`
+	// state with no chance of resumption (pool sandboxes are not woken
+	// — backend's container_pool service creates a fresh entry instead).
+	// Without inline cleanup the row sits in PG forever waiting on the
+	// daily-cron sweep, accumulating thousands of stopped rows that slow
+	// every reconcile and inflate orphan-detection cost. Delete both
+	// commands and the row inline; project sandboxes (with appx.projectId
+	// metadata) keep the existing `stopped` behavior since they may be
+	// woken later. Best-effort: cleanup failures don't unwind the ack.
+	if cmdType == string(models.CmdStopSandbox) && status == "success" &&
+		isPoolSandbox(sandbox.Metadata) {
+		// Re-fetch sandbox to confirm it's actually in stopped state
+		// (HandleAck may have transitioned it above for destroying flow).
+		fresh, ferr := ls.store.GetSandbox(ctx, pgSandboxID)
+		if ferr == nil &&
+			(models.SandboxState(fresh.State) == models.StateStopped ||
+				models.SandboxState(fresh.State) == models.StateDestroyed) {
+			if err := ls.store.DeleteCommandsForSandbox(ctx, pgSandboxID); err != nil {
+				ls.logger.Warn("real-8 pool cleanup: delete commands failed",
+					"sandbox_id", sandboxID, "err", err)
+			} else if err := ls.store.DeleteSandbox(ctx, pgSandboxID); err != nil {
+				ls.logger.Warn("real-8 pool cleanup: delete sandbox failed",
+					"sandbox_id", sandboxID, "err", err)
+			} else {
+				ls.logger.Info("real-8 pool cleanup: row + commands deleted",
+					"sandbox_id", sandboxID, "app_name", sandbox.AppName)
+			}
+		}
+	}
+
 	return nil
+}
+
+// isPoolSandbox returns true when the sandbox metadata lacks the
+// appx.projectId label, i.e. it was created by backend's container_pool
+// service for warm-cache rotation rather than by a user project. Pool
+// sandboxes do not get woken after idle reap (backend's pool layer
+// creates a fresh row instead), so their PG rows can be deleted inline
+// on stop ack rather than waiting for the daily cleanup cron.
+func isPoolSandbox(metadataJSON []byte) bool {
+	if len(metadataJSON) == 0 {
+		return true // no metadata at all = treat as pool (rare)
+	}
+	var md map[string]interface{}
+	if err := json.Unmarshal(metadataJSON, &md); err != nil {
+		return false // malformed metadata — be conservative, leave row alone
+	}
+	if v, ok := md["appx.projectId"]; ok {
+		if s, isStr := v.(string); isStr && s != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // ── HandleEvent ──────────────────────────────────────────────────────

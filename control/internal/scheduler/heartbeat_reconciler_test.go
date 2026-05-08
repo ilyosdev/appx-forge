@@ -17,14 +17,22 @@ func newPgUUID() pgtype.UUID {
 }
 
 type fakeStore struct {
-	listSandboxes   []SandboxRow
-	listErr         error
-	markedVerified  []verifiedCall
-	markedAgentLost []agentLostCall
+	listSandboxes    []SandboxRow
+	listErr          error
+	markedVerified   []verifiedCall
+	markedAgentLost  []agentLostCall
+	terminalRows     []TerminalSandboxRow
+	terminalErr      error
+	dispatchedStops  []stopDispatchCall
 }
 
 type verifiedCall struct{ AppName, State string }
 type agentLostCall struct{ AppName string }
+type stopDispatchCall struct {
+	AppName     string
+	ContainerID string
+	Reason      string
+}
 
 func (f *fakeStore) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]SandboxRow, error) {
 	if f.listErr != nil {
@@ -40,6 +48,31 @@ func (f *fakeStore) MarkSandboxVerified(ctx context.Context, appName, state stri
 
 func (f *fakeStore) MarkSandboxAgentLost(ctx context.Context, appName string, nodeID pgtype.UUID) error {
 	f.markedAgentLost = append(f.markedAgentLost, agentLostCall{appName})
+	return nil
+}
+
+// Phase 33-Real-7 — fakeStore implementations for orphan stop dispatch.
+func (f *fakeStore) ListTerminalSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]TerminalSandboxRow, error) {
+	if f.terminalErr != nil {
+		return nil, f.terminalErr
+	}
+	return f.terminalRows, nil
+}
+
+func (f *fakeStore) DispatchStopSandbox(ctx context.Context, sandboxID, nodeID pgtype.UUID, containerID, reason string) error {
+	// Find app_name by sandboxID for the test assertions.
+	appName := ""
+	for _, row := range f.terminalRows {
+		if row.ID == sandboxID {
+			appName = row.AppName
+			break
+		}
+	}
+	f.dispatchedStops = append(f.dispatchedStops, stopDispatchCall{
+		AppName:     appName,
+		ContainerID: containerID,
+		Reason:      reason,
+	})
 	return nil
 }
 
@@ -102,5 +135,68 @@ func TestReconcile_RespectsGraceWindowForRecentRows(t *testing.T) {
 	}
 	if len(store.markedAgentLost) != 0 {
 		t.Errorf("grace window violated: %+v", store.markedAgentLost)
+	}
+}
+
+// Phase 33-Real-7 — when a row is in terminal state but the agent still
+// observes the underlying container, the reconciler must dispatch a
+// stop_sandbox so the orphan container is destroyed. Replaces the prior
+// silent skip behavior that left orphan containers running forever.
+func TestReconcile_DispatchesStopForOrphanOnTerminalRow(t *testing.T) {
+	terminalID := newPgUUID()
+	store := &fakeStore{
+		// dbRows is the non-terminal working set; empty here so the
+		// agent-lost reverse loop has nothing to chew on.
+		listSandboxes: []SandboxRow{},
+		// Terminal-state row whose container the agent reports below.
+		terminalRows: []TerminalSandboxRow{
+			{ID: terminalID, AppName: "app-orphan", ContainerID: "ctn-abc123"},
+		},
+	}
+	r := NewHeartbeatReconciler(store, nil)
+
+	// Agent observes the container — orphan condition.
+	err := r.Reconcile(context.Background(), newPgUUID(), []ContainerInfo{
+		{AppName: "app-orphan", State: "running", ContainerID: "ctn-abc123"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(store.dispatchedStops) != 1 {
+		t.Fatalf("expected 1 stop dispatch, got %d (%+v)",
+			len(store.dispatchedStops), store.dispatchedStops)
+	}
+	got := store.dispatchedStops[0]
+	if got.AppName != "app-orphan" {
+		t.Errorf("dispatched for %q, expected app-orphan", got.AppName)
+	}
+	if got.ContainerID != "ctn-abc123" {
+		t.Errorf("dispatched container_id=%q, expected ctn-abc123", got.ContainerID)
+	}
+	if got.Reason != "orphan_terminal_row" {
+		t.Errorf("dispatched reason=%q, expected orphan_terminal_row", got.Reason)
+	}
+}
+
+// Phase 33-Real-7 — when the row is terminal but the agent does NOT
+// report the container (already destroyed), no dispatch should fire.
+func TestReconcile_SkipsStopWhenTerminalContainerAbsent(t *testing.T) {
+	store := &fakeStore{
+		listSandboxes: []SandboxRow{},
+		terminalRows: []TerminalSandboxRow{
+			{ID: newPgUUID(), AppName: "app-gone", ContainerID: "ctn-old"},
+		},
+	}
+	r := NewHeartbeatReconciler(store, nil)
+
+	// Agent does not see the container — it's already gone.
+	err := r.Reconcile(context.Background(), newPgUUID(), []ContainerInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.dispatchedStops) != 0 {
+		t.Errorf("expected 0 dispatches when container absent, got %+v",
+			store.dispatchedStops)
 	}
 }

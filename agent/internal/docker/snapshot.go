@@ -19,9 +19,14 @@ import (
 // ContainerSnapshot is the agent-side representation of a single
 // Forge-managed container, matching the heartbeat protocol shape that the
 // control plane consumes.
+//
+// Phase 33-Real-9 — State is the canonical SandboxState vocabulary
+// (`running | starting | restarting | stopped | failed`), translated from
+// Docker primitives at the boundary in client.go via models.FromDockerState.
+// Control plane trusts the field directly; no further translation needed.
 type ContainerSnapshot struct {
 	AppName     string `json:"app_name"`
-	State       string `json:"state"` // running | paused | restarting | exited | dead
+	State       string `json:"state"`
 	HostPort    int    `json:"host_port"`
 	ContainerID string `json:"container_id"`
 }

@@ -178,7 +178,17 @@ func (h *HeartbeatSender) sendHeartbeat(ctx context.Context) {
 		return
 	}
 
-	usedMB, runningContainers := h.collector.Collect()
+	// Phase 33-Real-6 — derive resource counts from the snapshot we
+	// just paid for instead of issuing a second Docker round-trip in
+	// `Collect()`. Counts only sandboxes the agent considers running,
+	// which is what the control side cares about for capacity decisions.
+	usedMB, _ := h.collector.Collect()
+	runningContainers := 0
+	for _, s := range snapshots {
+		if s.State == "running" || s.State == "starting" || s.State == "restarting" {
+			runningContainers++
+		}
+	}
 
 	containers := make([]controlclient.ContainerInfo, 0, len(snapshots))
 	for _, s := range snapshots {

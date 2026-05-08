@@ -749,6 +749,12 @@ func (a *storeAdapter) GetNodeByID(ctx context.Context, id pgtype.UUID) (store.N
 	return a.q.GetNode(ctx, id)
 }
 
+// Phase 33-Real-8 — purge command rows referencing a sandbox so the
+// row can be deleted without violating commands_sandbox_id_fkey.
+func (a *storeAdapter) DeleteCommandsForSandbox(ctx context.Context, sandboxID pgtype.UUID) error {
+	return a.q.DeleteCommandsForSandbox(ctx, sandboxID)
+}
+
 // ── lifecycle.RestartStore interface ──────────────────────────────────
 
 func (a *storeAdapter) IncrementSandboxFailureCount(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
@@ -855,6 +861,50 @@ func (a *reconcilerStoreAdapter) MarkSandboxAgentLost(ctx context.Context, appNa
 		AppName: appName,
 		NodeID:  nodeID,
 	})
+}
+
+// Phase 33-Real-7 — terminal-row containers the agent still observes.
+func (a *reconcilerStoreAdapter) ListTerminalSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]scheduler.TerminalSandboxRow, error) {
+	rows, err := a.q.ListTerminalSandboxesForNode(ctx, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]scheduler.TerminalSandboxRow, 0, len(rows))
+	for _, r := range rows {
+		if !r.ContainerID.Valid || r.ContainerID.String == "" {
+			continue
+		}
+		out = append(out, scheduler.TerminalSandboxRow{
+			ID:          r.ID,
+			AppName:     r.AppName,
+			ContainerID: r.ContainerID.String,
+		})
+	}
+	return out, nil
+}
+
+// DispatchStopSandbox creates a stop_sandbox command targeted at the
+// node so the agent destroys the orphan container. Mirrors idle_reaper's
+// dispatch pattern (lifecycle/idle_reaper.go) — same payload shape and
+// timeout. Reason is recorded on the command for audit.
+func (a *reconcilerStoreAdapter) DispatchStopSandbox(ctx context.Context, sandboxID, nodeID pgtype.UUID, containerID, reason string) error {
+	cmdPayload, err := json.Marshal(map[string]interface{}{
+		"container_id": containerID,
+		"reason":       reason,
+	})
+	if err != nil {
+		return err
+	}
+	cmdID := uuid.New()
+	_, err = a.q.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         nodeID,
+		SandboxID:      sandboxID,
+		CommandType:    string(models.CmdStopSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	})
+	return err
 }
 
 // ── reconcilerAdapter ──────────────────────────────────────────────────
