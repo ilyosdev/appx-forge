@@ -22,3 +22,11 @@ RETURNING *;
 UPDATE commands
 SET status = $2, acked_at = NOW(), result = $3
 WHERE id = $1;
+
+-- name: DeleteCommandsForSandbox :exec
+-- Phase 33-Real-8 — purge command rows referencing a sandbox before
+-- DELETE FROM sandboxes can succeed (the commands_sandbox_id_fkey FK
+-- has no ON DELETE CASCADE). Used by the post-stop-ack pool cleanup
+-- path that destroys terminal pool sandboxes inline rather than waiting
+-- on cron.
+DELETE FROM commands WHERE sandbox_id = $1;

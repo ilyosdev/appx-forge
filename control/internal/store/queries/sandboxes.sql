@@ -70,10 +70,27 @@ SELECT * FROM sandboxes WHERE node_id = $1 AND state = 'running' ORDER BY create
 DELETE FROM sandboxes WHERE id = $1;
 
 -- name: MarkSandboxVerified :exec
+-- Phase 33-Real-7 — guard against silent terminal-state flip. Without
+-- the state-IN clause, a heartbeat reporting state='running' for an
+-- app_name whose row is failed/destroying/destroyed would silently
+-- resurrect it. Terminal rows must only leave terminal state via the
+-- lifecycle layer's explicit transitions.
 UPDATE sandboxes
 SET verified_at = NOW(), state = $2
 WHERE app_name = $1
-  AND verified_at < NOW();
+  AND verified_at < NOW()
+  AND state IN ('pending','starting','running','restarting','stopped');
+
+-- name: ListTerminalSandboxesForNode :many
+-- Phase 33-Real-7 — returns rows the reconciler must issue stop_sandbox
+-- for: state is terminal but the agent still observes the container,
+-- so the orphan needs explicit destroy dispatch.
+SELECT id, app_name, container_id
+FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('failed', 'destroying', 'destroyed')
+  AND container_id IS NOT NULL
+  AND container_id <> '';
 
 -- name: MarkSandboxAgentLost :exec
 UPDATE sandboxes

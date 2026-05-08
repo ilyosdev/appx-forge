@@ -31,6 +31,7 @@ type mockStore struct {
 	ackCommandFn            func(ctx context.Context, arg store.AckCommandParams) error
 	recordEventFn           func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
 	getNodeByIDFn           func(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	deleteCommandsForSandboxFn func(ctx context.Context, sandboxID pgtype.UUID) error
 }
 
 func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
@@ -43,6 +44,14 @@ func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxPa
 func (m *mockStore) DeleteSandbox(ctx context.Context, id pgtype.UUID) error {
 	if m.deleteSandboxFn != nil {
 		return m.deleteSandboxFn(ctx, id)
+	}
+	return nil
+}
+
+// Phase 33-Real-8 — mock the new commands purge.
+func (m *mockStore) DeleteCommandsForSandbox(ctx context.Context, sandboxID pgtype.UUID) error {
+	if m.deleteCommandsForSandboxFn != nil {
+		return m.deleteCommandsForSandboxFn(ctx, sandboxID)
 	}
 	return nil
 }

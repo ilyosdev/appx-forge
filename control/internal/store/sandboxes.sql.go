@@ -579,10 +579,16 @@ func (q *Queries) UpdateSandboxRuntime(ctx context.Context, arg UpdateSandboxRun
 }
 
 const markSandboxVerified = `-- name: MarkSandboxVerified :exec
+-- Phase 33-Real-7 — guard against silent terminal-state flip. Without
+-- the state-IN clause, a heartbeat reporting state='running' for an
+-- app_name whose row is failed/destroying/destroyed would silently
+-- resurrect it. Terminal rows must only leave terminal state via the
+-- lifecycle layer's explicit transitions.
 UPDATE sandboxes
 SET verified_at = NOW(), state = $2
 WHERE app_name = $1
   AND verified_at < NOW()
+  AND state IN ('pending','starting','running','restarting','stopped')
 `
 
 type MarkSandboxVerifiedParams struct {
@@ -639,6 +645,45 @@ func (q *Queries) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) 
 	for rows.Next() {
 		var i ListSandboxesForNodeRow
 		if err := rows.Scan(&i.AppName, &i.State, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// Phase 33-Real-7 — hand-edited to add ListTerminalSandboxesForNode.
+// The sqlc CLI is not in the local dev workflow; if regeneration ever
+// runs, keep this query in queries/sandboxes.sql so the regenerated
+// output matches.
+const listTerminalSandboxesForNode = `-- name: ListTerminalSandboxesForNode :many
+SELECT id, app_name, container_id
+FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('failed', 'destroying', 'destroyed')
+  AND container_id IS NOT NULL
+  AND container_id <> ''
+`
+
+type ListTerminalSandboxesForNodeRow struct {
+	ID          pgtype.UUID `json:"id"`
+	AppName     string      `json:"app_name"`
+	ContainerID pgtype.Text `json:"container_id"`
+}
+
+func (q *Queries) ListTerminalSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]ListTerminalSandboxesForNodeRow, error) {
+	rows, err := q.db.Query(ctx, listTerminalSandboxesForNode, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTerminalSandboxesForNodeRow{}
+	for rows.Next() {
+		var i ListTerminalSandboxesForNodeRow
+		if err := rows.Scan(&i.ID, &i.AppName, &i.ContainerID); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

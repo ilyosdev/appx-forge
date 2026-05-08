@@ -12,6 +12,8 @@ import (
 
 	"github.com/moby/moby/api/types/network"
 	dockerclient "github.com/moby/moby/client"
+
+	"github.com/appx/forge/shared-go/models"
 )
 
 // Client defines the interface for Docker container operations.
@@ -341,9 +343,19 @@ func (d *dockerClient) ListContainers(ctx context.Context) ([]ContainerSnapshot,
 			}
 		}
 
+		// Phase 33-Real-9 — translate Docker primitive (`running` |
+		// `paused` | `restarting` | `exited` | `dead` | `created`) into
+		// the canonical SandboxState vocabulary at the boundary, so the
+		// control plane never sees Docker leakage. Snapshots whose state
+		// has no Forge equivalent (e.g. `paused`) are dropped — the
+		// agent should never report them.
+		canonical, ok := models.FromDockerState(string(item.State))
+		if !ok {
+			continue
+		}
 		snapshots = append(snapshots, ContainerSnapshot{
 			AppName:     appName,
-			State:       string(item.State),
+			State:       string(canonical),
 			HostPort:    hostPort,
 			ContainerID: item.ID,
 		})
