@@ -55,6 +55,12 @@ type Client interface {
 	// the heartbeat protocol's container list.
 	ListContainers(ctx context.Context) ([]ContainerSnapshot, error)
 
+	// ExecRun runs a one-shot command inside the given container and
+	// returns the captured stdout/stderr (each truncated at a fixed
+	// budget) and exit code. Used by the `exec` command type so the
+	// control plane can run sandboxed shell snippets on behalf of users.
+	ExecRun(ctx context.Context, containerID string, spec ExecSpec) (*ExecResult, error)
+
 	// Close releases the underlying Docker client resources.
 	Close() error
 }
@@ -307,6 +313,14 @@ func (d *dockerClient) EventsStream(ctx context.Context, since time.Time) (<-cha
 // Close releases the underlying Docker client resources.
 func (d *dockerClient) Close() error {
 	return d.raw().Close()
+}
+
+// ExecRun delegates to the exec.go helper. It uses the moby SDK client
+// directly (not d.raw()) because exec is not part of the rawClient
+// mock surface — tests for exec live in exec_test.go and construct a
+// fake execClient.
+func (d *dockerClient) ExecRun(ctx context.Context, containerID string, spec ExecSpec) (*ExecResult, error) {
+	return ExecRun(ctx, d.cli, containerID, spec)
 }
 
 // ListContainers returns all Forge-managed containers (running + stopped)

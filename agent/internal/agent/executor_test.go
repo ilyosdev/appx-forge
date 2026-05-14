@@ -26,6 +26,7 @@ type mockDockerClient struct {
 	removeContainerFn func(ctx context.Context, containerID string) error
 	restartContainerFn func(ctx context.Context, containerID string, timeout time.Duration) error
 	getLogsFn         func(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
+	execRunFn         func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
 
 	// Track calls for assertions
 	createCalls  []docker.SandboxSpec
@@ -33,6 +34,14 @@ type mockDockerClient struct {
 	removeCalls  []string
 	restartCalls []string
 	logCalls     []string
+	execCalls    []execCall
+}
+
+// execCall captures one invocation of mockDockerClient.ExecRun so tests
+// can assert against the resolved container ID and ExecSpec.
+type execCall struct {
+	ContainerID string
+	Spec        docker.ExecSpec
 }
 
 func newMockDockerClient() *mockDockerClient {
@@ -113,6 +122,17 @@ func (m *mockDockerClient) EventsStream(ctx context.Context, since time.Time) (<
 
 func (m *mockDockerClient) ListContainers(_ context.Context) ([]docker.ContainerSnapshot, error) {
 	return []docker.ContainerSnapshot{}, nil
+}
+
+func (m *mockDockerClient) ExecRun(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error) {
+	m.mu.Lock()
+	m.execCalls = append(m.execCalls, execCall{ContainerID: containerID, Spec: spec})
+	fn := m.execRunFn
+	m.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, containerID, spec)
+	}
+	return &docker.ExecResult{ExitCode: 0}, nil
 }
 
 func (m *mockDockerClient) Close() error {

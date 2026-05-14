@@ -40,6 +40,9 @@ func (m *mockClient) EventsStream(_ context.Context, _ time.Time) (<-chan Contai
 func (m *mockClient) ListContainers(_ context.Context) ([]ContainerSnapshot, error) {
 	return []ContainerSnapshot{}, nil
 }
+func (m *mockClient) ExecRun(_ context.Context, _ string, _ ExecSpec) (*ExecResult, error) {
+	return &ExecResult{}, nil
+}
 func (m *mockClient) Close() error { return nil }
 
 // TestMockClientSatisfiesInterface verifies that the mockClient implements Client.

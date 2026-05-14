@@ -94,6 +94,16 @@ type getLogsPayload struct {
 	Follow      bool   `json:"follow"`
 }
 
+// execPayload is the payload for exec commands. The control plane sends
+// a shell command string, optional cwd / env overrides, and a wall-clock
+// timeout (clamped server-side in ExecRun).
+type execPayload struct {
+	Command        string            `json:"command"`
+	Cwd            string            `json:"cwd"`
+	Env            map[string]string `json:"env,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+}
+
 // ── Execute ─────────────────────────────────────────────────────────────
 
 // Execute dispatches a command to the appropriate handler based on type.
@@ -120,6 +130,8 @@ func (e *CommandExecutor) Execute(ctx context.Context, cmd controlclient.Command
 		return e.executeRestartSandbox(ctx, cmd)
 	case "get_logs":
 		return e.executeGetLogs(ctx, cmd)
+	case "exec":
+		return e.executeExec(ctx, cmd)
 	case "prune":
 		return e.executePrune(ctx, cmd)
 	default:
@@ -255,6 +267,65 @@ func (e *CommandExecutor) executeGetLogs(ctx context.Context, cmd controlclient.
 
 	return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
 		"logs": string(logs),
+	})
+}
+
+// executeExec runs a one-shot shell command inside a tracked sandbox
+// container via the Docker exec API and returns the captured streams
+// and exit code in the ack. Defaults: cwd=/app, timeout=120s (capped
+// at 300s in docker.ExecRun). The command is invoked as `sh -c <command>`
+// so the control plane can send shell snippets directly.
+func (e *CommandExecutor) executeExec(ctx context.Context, cmd controlclient.Command) error {
+	var payload execPayload
+	if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("invalid exec payload: %v", err))
+	}
+	if payload.Command == "" {
+		return e.ackFailure(ctx, cmd.ID, "empty command")
+	}
+	if payload.Cwd == "" {
+		payload.Cwd = "/app"
+	}
+	if payload.TimeoutSeconds <= 0 {
+		payload.TimeoutSeconds = 120
+	}
+	if payload.TimeoutSeconds > 300 {
+		payload.TimeoutSeconds = 300
+	}
+
+	// Resolve the sandbox to a container ID. The agent only execs into
+	// sandboxes it currently tracks (no cross-node, no stale rows).
+	e.mu.RLock()
+	info, ok := e.sandboxes[cmd.SandboxID]
+	e.mu.RUnlock()
+	if !ok {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("sandbox %s not running on this node", cmd.SandboxID))
+	}
+
+	cmdArgs := []string{"sh", "-c", payload.Command}
+
+	envSlice := make([]string, 0, len(payload.Env))
+	for k, v := range payload.Env {
+		envSlice = append(envSlice, k+"="+v)
+	}
+
+	result, err := e.docker.ExecRun(ctx, info.ContainerID, docker.ExecSpec{
+		Cmd:            cmdArgs,
+		Env:            envSlice,
+		WorkingDir:     payload.Cwd,
+		TimeoutSeconds: payload.TimeoutSeconds,
+	})
+	if err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("exec error: %v", err))
+	}
+
+	return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
+		"exit_code":        result.ExitCode,
+		"stdout":           string(result.Stdout),
+		"stderr":           string(result.Stderr),
+		"stdout_truncated": result.StdoutTruncated,
+		"stderr_truncated": result.StderrTruncated,
+		"duration_ms":      result.DurationMs,
 	})
 }
 
