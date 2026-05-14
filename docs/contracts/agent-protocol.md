@@ -223,6 +223,44 @@ Agent steps:
 2. `docker image prune -f` (only dangling images).
 3. Ack with `{ "status": "success", "result": { "containers_removed": 3, "images_removed": 1, "space_reclaimed_mb": 512 } }`.
 
+### `exec`
+
+Executes an arbitrary command inside a running sandbox container and returns its output. Dispatched when a caller hits `POST /v1/sandboxes/{id}/exec` on the control plane.
+
+```json
+{
+  "id": "cmd-uuid",
+  "type": "exec",
+  "sandbox_id": "sandbox-uuid",
+  "payload": {
+    "command": "npm test",
+    "cwd": "/app",
+    "env": {
+      "CI": "true"
+    },
+    "timeout_seconds": 120
+  }
+}
+```
+
+Payload fields:
+- `command` (string, required): the command to run inside the container.
+- `cwd` (string, optional): working directory inside the container. Default `/app`.
+- `env` (map of string→string, optional): additional environment variables merged on top of the container's environment.
+- `timeout_seconds` (int, optional): inner execution timeout. Default `120`, capped at `300`.
+
+Agent steps:
+1. Resolve the sandbox's `container_id` from the in-memory map populated at startup and on `start_sandbox`.
+2. Build a `docker exec` invocation with `cwd`, merged `env`, and the provided `command`.
+3. Wrap execution in `context.WithTimeout(payload.timeout_seconds)` (default 120s, capped at 300s).
+4. Capture stdout and stderr as separate streams via `stdcopy.StdCopy`.
+5. Apply per-stream truncation: keep the first 30KB (head) and the last 10KB (tail) of each stream. If truncation occurred, set the corresponding `*_truncated` flag in the result.
+6. Ack with `{ "status": "success", "result": { "exit_code": 0, "stdout": "...", "stderr": "...", "stdout_truncated": false, "stderr_truncated": false, "duration_ms": 842 } }`.
+
+Failure semantics:
+- If the inner timeout fires, the agent still acks `"status": "success"` with `exit_code: -1`, partial stdout/stderr captured up to the timeout, and `stderr` appended with `[execution timed out after N seconds]` (where `N` is the effective timeout).
+- If the container is not running or `docker exec` itself fails before the command starts, the agent acks `"status": "failure"` with an `error` describing the cause (e.g. `"container not running"`).
+
 ## Command Acknowledgment
 
 After executing a command, the agent sends `POST /v1/agents/{id}/commands/{cmd_id}/ack`:

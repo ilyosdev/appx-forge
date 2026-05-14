@@ -252,6 +252,98 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /v1/sandboxes/{id}/exec:
+    post:
+      summary: Submit a shell command to be executed inside the sandbox container
+      description: |
+        Dispatches a command via the control plane to the assigned agent. Agent runs
+        the command via docker exec, captures stdout/stderr with truncation, and ACKs
+        back to control. Result available via GET /v1/sandboxes/{id}/exec/{cmd_id}.
+        Webhook event `exec_completed` fires on terminal status.
+      security:
+        - bearerAuth: []
+        - execJwt: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  description: Shell command to execute (passed to `sh -c`)
+                cwd:
+                  type: string
+                  default: /app
+                env:
+                  type: object
+                  additionalProperties: { type: string }
+                timeout_seconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 300
+                  default: 120
+      responses:
+        '202':
+          description: Command queued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [command_id, status]
+                properties:
+                  command_id: { type: string }
+                  status: { type: string, enum: [queued] }
+        '400': { description: Invalid request }
+        '404': { description: Sandbox not found }
+        '409': { description: Sandbox not in running state }
+        '401': { description: Unauthorized }
+        '403': { description: Exec JWT sandbox_id claim mismatch }
+
+  /v1/sandboxes/{id}/exec/{cmd_id}:
+    get:
+      summary: Read the result of a previously-submitted exec command
+      security:
+        - bearerAuth: []
+        - execJwt: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: cmd_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Result payload
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [queued, running, complete, failed, timeout]
+                  exit_code: { type: integer }
+                  stdout: { type: string }
+                  stderr: { type: string }
+                  stdout_truncated: { type: boolean }
+                  stderr_truncated: { type: boolean }
+                  duration_ms: { type: integer, format: int64 }
+        '404': { description: Command not found or doesn't belong to sandbox }
+        '401': { description: Unauthorized }
+        '403': { description: Exec JWT sandbox_id claim mismatch }
+
   /nodes:
     get:
       summary: List nodes
@@ -434,6 +526,12 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
+
+    execJwt:
+      type: apiKey
+      in: header
+      name: X-Exec-Token
+      description: HS256-signed JWT with sandbox_id claim. Required only when configured; falls through to Bearer otherwise.
 
   schemas:
     SandboxCreate:
