@@ -68,9 +68,18 @@ func ExecJWT(secret string) func(http.Handler) http.Handler {
 				return
 			}
 
-			claimedSandboxID, _ := claims[jwtClaimSandboxID].(string)
+			claimedSandboxIDRaw, exists := claims[jwtClaimSandboxID]
+			if !exists {
+				http.Error(w, "missing sandbox_id claim", http.StatusUnauthorized)
+				return
+			}
+			claimedSandboxID, ok := claimedSandboxIDRaw.(string)
+			if !ok || claimedSandboxID == "" {
+				http.Error(w, "invalid sandbox_id claim", http.StatusUnauthorized)
+				return
+			}
 			pathSandboxID := chi.URLParam(r, "id")
-			if claimedSandboxID == "" || pathSandboxID == "" {
+			if pathSandboxID == "" {
 				http.Error(w, "sandbox_id claim missing", http.StatusForbidden)
 				return
 			}
