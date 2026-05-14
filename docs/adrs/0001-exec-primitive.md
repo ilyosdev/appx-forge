@@ -92,6 +92,39 @@ Residual risks (documented, accepted):
 - DB schema change requires production migration before binary deploy.
 - New env var FORGE_EXEC_JWT_SECRET must be shared between backend + appx-forge.
 
+## Addendum 2026-05-15: Migration loading via embed.FS
+
+### Trigger
+
+When migration 00007 (`add_exec_command_type`) was deployed via the standard pattern (`go build` → `scp` binary → `systemctl restart forge-control`), the binary booted clean + logged "migrations complete", but the production `commands.command_type` CHECK constraint did NOT accept `'exec'`. Backend `run_command` calls failed against the constraint. Workaround was direct `psql -c "ALTER TABLE commands DROP CONSTRAINT ... ADD CONSTRAINT ..."` + manual `INSERT INTO goose_db_version`.
+
+### Root cause
+
+`runMigrations()` in `cmd/forge-control/main.go` used `goose.SetBaseFS(nil)` with disk-relative path `migrations/` (fallback `control/migrations/`). The Docker image (`Dockerfile:14`) copied migrations correctly, but Server 1 runs the binary bare via systemd, not via Docker. The deploy pattern `scp BINARY` shipped only the binary — the migrations dir on Server 1 disk was last-touched whenever someone happened to refresh it. goose scanned the stale dir, found no pending migrations, returned nil, and the "migrations complete" log was technically true (nothing-to-apply succeeds) but operationally false (00007 was never applied).
+
+### Decision
+
+Replace disk-relative loading with `//go:embed migrations/*.sql` so the binary is self-contained. The scp pattern then ships migrations automatically alongside the binary, with no possibility of disk drift between deploys.
+
+### Implementation
+
+- New file `control/migrations/embed.go` — `package migrations` declaring `//go:embed *.sql var FS embed.FS`.
+- `control/cmd/forge-control/main.go` — import `github.com/appx/forge/control/migrations`; in `runMigrations()` use `goose.SetBaseFS(migrations.FS)` and `goose.Up(db, ".")`. Disk-stat fallback removed.
+
+### Consequences
+
+- **Positive**: forge-control binary is self-contained; scp pattern can no longer ship a binary that's out-of-sync with its migrations. Docker build is also unaffected (the migrations dir copy in Dockerfile becomes redundant but harmless and can be cleaned in a later commit).
+- **Positive**: rollback safety — old binary backed up as `.pre-embed` on Server 1 before swap. If the embedded loader misbehaves, `mv .pre-embed forge-control && systemctl restart` restores prior behavior.
+- **Neutral**: developers running locally via `go run ./control/cmd/forge-control` no longer need migrations dir present in CWD — embed reads from the binary at compile time. Disk migrations dir remains the source of truth checked into git.
+- **Negative**: requires rebuild + redeploy of forge-control whenever a new migration is added. This is already true in practice for any schema change, so this is not a regression.
+
+### References (addendum)
+
+- Memory: `~/.claude/.../memory/forge-control-goose-auto-run-bug.md`
+- Phase tracker log: `text2design/docs/superpowers/plans/2026-05-14-phase-tracker.html` § "2026-05-15 POST-DEPLOY AUDIT"
+
+---
+
 ## References
 
 - Design spec — `text2design/docs/superpowers/specs/2026-05-14-c0-forge-exec.md`

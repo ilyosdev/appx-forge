@@ -36,6 +36,7 @@ import (
 	"github.com/appx/forge/control/internal/routing"
 	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/control/migrations"
 	"github.com/appx/forge/shared-go/models"
 )
 
@@ -332,7 +333,7 @@ func main() {
 // ── Migrations ─────────────────────────────────────────────────────────
 
 // runMigrations opens a database/sql connection (required by goose) and runs
-// all pending migrations from the filesystem.
+// all pending migrations from the embedded migrations FS.
 func runMigrations(databaseURL string) error {
 	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
@@ -340,21 +341,12 @@ func runMigrations(databaseURL string) error {
 	}
 	defer db.Close()
 
-	goose.SetBaseFS(nil)
+	goose.SetBaseFS(migrations.FS)
 	if err := goose.SetDialect("postgres"); err != nil {
 		return err
 	}
 
-	// Locate migrations directory relative to the binary.
-	// In production and docker-compose, we compile from module root so
-	// the migrations path is relative to the working directory.
-	migrationsDir := "migrations"
-	if _, err := os.Stat(migrationsDir); os.IsNotExist(err) {
-		// Fallback: when run from repo root (go run ./control/cmd/forge-control/)
-		migrationsDir = "control/migrations"
-	}
-
-	return goose.Up(db, migrationsDir)
+	return goose.Up(db, ".")
 }
 
 // ── Heartbeat Monitor ──────────────────────────────────────────────────
