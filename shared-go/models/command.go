@@ -8,6 +8,7 @@ const (
 	CmdStopSandbox    CommandType = "stop_sandbox"
 	CmdRestartSandbox CommandType = "restart_sandbox"
 	CmdGetLogs        CommandType = "get_logs"
+	CmdExec           CommandType = "exec"
 	CmdPrune          CommandType = "prune"
 )
 
