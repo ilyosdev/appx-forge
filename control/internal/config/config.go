@@ -39,6 +39,12 @@ type Config struct {
 	WebhookURL                string `envconfig:"FORGE_WEBHOOK_URL" default:""`
 	WebhookSecret             string `envconfig:"FORGE_WEBHOOK_SECRET" default:""`
 	WebhookTimeoutSeconds     int    `envconfig:"FORGE_WEBHOOK_TIMEOUT_SECONDS" default:"3"`
+
+	// Scoped exec JWT secret. When set, /sandboxes/{id}/exec routes accept
+	// an HMAC-signed JWT in X-Exec-Token (with sandbox_id claim) in addition
+	// to the global FORGE_API_TOKEN Bearer. When empty, only Bearer is
+	// accepted on those routes (graceful degradation).
+	ExecJWTSecret string `envconfig:"FORGE_EXEC_JWT_SECRET" default:""`
 }
 
 // Load parses environment variables into a Config struct. Returns an error

@@ -216,13 +216,20 @@ func main() {
 	}
 
 	// ── HTTP Server ────────────────────────────────────────────────────
+	srvCfg := api.NewServerConfig(cfg.APIToken, cfg.HMACSecret)
+	if cfg.ExecJWTSecret != "" {
+		srvCfg.SetExecJWTSecret(cfg.ExecJWTSecret)
+		logger.Info("exec JWT secret configured — /sandboxes/{id}/exec accepts X-Exec-Token")
+	} else {
+		logger.Warn("FORGE_EXEC_JWT_SECRET unset — /sandboxes/{id}/exec only accepts Bearer FORGE_API_TOKEN")
+	}
 	srv := api.NewServer(
-		api.NewServerConfig(cfg.APIToken, cfg.HMACSecret),
+		srvCfg,
 		pool,
 		logger,
-		adapter,         // NodeStore
-		lc,              // SandboxLifecycle
-		adapter,         // SandboxReader
+		adapter, // NodeStore
+		lc,      // SandboxLifecycle
+		adapter, // SandboxReader
 		cfg.HeartbeatIntervalSeconds,
 	)
 	srv.SetAgentDeps(adapter, lc)
@@ -1090,6 +1097,24 @@ func (c *stateWebhookClient) OnSandboxStateChanged(
 	ctx context.Context,
 	payload lifecycle.StateChangePayload,
 ) error {
+	return c.postSigned(ctx, payload)
+}
+
+// OnExecCompleted satisfies lifecycle.StateWebhookNotifier for exec acks.
+// Same URL + HMAC scheme as state-change; receiver discriminates on
+// payload.type ("exec_completed").
+func (c *stateWebhookClient) OnExecCompleted(
+	ctx context.Context,
+	payload lifecycle.ExecCompletedPayload,
+) error {
+	return c.postSigned(ctx, payload)
+}
+
+// postSigned marshals the payload, posts it to the configured URL with the
+// shared HMAC-SHA256 signature header, and validates the listener's response
+// status. Used by both OnSandboxStateChanged and OnExecCompleted — the body
+// is opaque to this helper, only its marshaling matters.
+func (c *stateWebhookClient) postSigned(ctx context.Context, payload interface{}) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal payload: %w", err)

@@ -75,8 +75,14 @@ type RouteNotifier interface {
 // Like RouteNotifier, this is best-effort — errors are logged but never
 // propagated. Backend consumers MUST tolerate missed events (e.g. via
 // existing polling fallbacks) until Phase 33-C drops the polling path.
+//
+// OnExecCompleted is fired once per exec command ack (success OR failure)
+// so backend can correlate the per-command result without polling
+// /sandboxes/{id}/exec/{cmd_id}. Same HMAC signing rules as state-change
+// — listener verifies via X-Forge-Signature: sha256=<hex>.
 type StateWebhookNotifier interface {
 	OnSandboxStateChanged(ctx context.Context, payload StateChangePayload) error
+	OnExecCompleted(ctx context.Context, payload ExecCompletedPayload) error
 }
 
 // StateChangePayload is the JSON body posted to the configured webhook URL.
@@ -91,6 +97,26 @@ type StateChangePayload struct {
 	ContainerID string `json:"container_id,omitempty"`
 	NodeID      string `json:"node_id,omitempty"`
 	Timestamp   string `json:"ts"`
+}
+
+// ExecCompletedPayload is the JSON body posted to the webhook URL when an
+// exec command acks. The Type discriminator lets the receiver multiplex
+// state vs exec payloads on the same endpoint without sniffing fields.
+//
+// Stdout/Stderr may be truncated by the agent at agent-configured caps;
+// the *_truncated flags signal the cut so the caller knows the strings
+// are not the full output.
+type ExecCompletedPayload struct {
+	Type            string `json:"type"` // always "exec_completed"
+	SandboxID       string `json:"sandbox_id"`
+	CommandID       string `json:"command_id"`
+	ExitCode        int    `json:"exit_code"`
+	Stdout          string `json:"stdout"`
+	Stderr          string `json:"stderr"`
+	StdoutTruncated bool   `json:"stdout_truncated"`
+	StderrTruncated bool   `json:"stderr_truncated"`
+	DurationMs      int64  `json:"duration_ms"`
+	Ts              int64  `json:"ts"`
 }
 
 // ── Request/Result Types ─────────────────────────────────────────────
@@ -224,6 +250,97 @@ func (ls *LifecycleService) notifyStateWebhook(
 			)
 		}
 	}(payload)
+}
+
+// notifyExecCompleted is a fire-and-forget helper that POSTs the exec ack
+// payload to the configured webhook. Called from HandleAck after the agent
+// reports exec result (success or failure). The agent's result map shape
+// is documented in the agent exec executor — control plane just shuttles
+// it into the typed payload here without re-validating fields.
+func (ls *LifecycleService) notifyExecCompleted(
+	sandboxID uuid.UUID,
+	cmdID uuid.UUID,
+	ackResult json.RawMessage,
+) {
+	if ls.webhookNotifier == nil {
+		return
+	}
+	var resultMap map[string]interface{}
+	if len(ackResult) > 0 {
+		if err := json.Unmarshal(ackResult, &resultMap); err != nil {
+			ls.logger.Warn("exec_completed: failed to parse ack result; emitting partial payload",
+				"err", err, "sandbox_id", sandboxID, "cmd_id", cmdID)
+			resultMap = nil
+		}
+	}
+
+	payload := ExecCompletedPayload{
+		Type:            "exec_completed",
+		SandboxID:       sandboxID.String(),
+		CommandID:       cmdID.String(),
+		ExitCode:        int(asFloat(resultMap, "exit_code")),
+		Stdout:          asString(resultMap, "stdout"),
+		Stderr:          asString(resultMap, "stderr"),
+		StdoutTruncated: asBool(resultMap, "stdout_truncated"),
+		StderrTruncated: asBool(resultMap, "stderr_truncated"),
+		DurationMs:      int64(asFloat(resultMap, "duration_ms")),
+		Ts:              time.Now().UnixMilli(),
+	}
+
+	go func(p ExecCompletedPayload) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := ls.webhookNotifier.OnExecCompleted(ctx, p); err != nil {
+			ls.logger.Warn("exec_completed webhook delivery failed",
+				"error", err,
+				"sandbox_id", p.SandboxID,
+				"cmd_id", p.CommandID,
+			)
+		}
+	}(payload)
+}
+
+// asFloat extracts a float64 from a parsed JSON map. JSON numbers decode
+// to float64 by default via encoding/json; integer fields like exit_code
+// or duration_ms come through this path. Returns 0 if missing or wrong type.
+func asFloat(m map[string]interface{}, key string) float64 {
+	if m == nil {
+		return 0
+	}
+	v, ok := m[key]
+	if !ok {
+		return 0
+	}
+	f, _ := v.(float64)
+	return f
+}
+
+// asString extracts a string field from the parsed JSON map. Returns ""
+// if missing or wrong type.
+func asString(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	v, ok := m[key]
+	if !ok {
+		return ""
+	}
+	s, _ := v.(string)
+	return s
+}
+
+// asBool extracts a bool field from the parsed JSON map. Returns false
+// if missing or wrong type.
+func asBool(m map[string]interface{}, key string) bool {
+	if m == nil {
+		return false
+	}
+	v, ok := m[key]
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }
 
 // SetRestartManager injects the restart manager after construction.
@@ -659,6 +776,15 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	})
 	if err != nil {
 		return fmt.Errorf("ack command: %w", err)
+	}
+
+	// Fire exec_completed webhook for exec commands. Mirrors notifyStateWebhook:
+	// fire-and-forget goroutine, best-effort. Listener URL & HMAC secret are
+	// the same as the state-change channel (single webhook endpoint multiplexes
+	// on payload.type). The receiver gets the parsed stdout/stderr/exit_code
+	// from the agent's ack result map without re-polling /sandboxes/{id}/exec.
+	if cmdType == string(models.CmdExec) && ls.webhookNotifier != nil {
+		ls.notifyExecCompleted(sandboxID, cmdID, ackResult)
 	}
 
 	// Phase 33-Real-8 — inline pool cleanup. When a pool sandbox's

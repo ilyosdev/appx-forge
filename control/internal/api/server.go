@@ -34,14 +34,22 @@ type Freshness interface {
 // serverConfig holds configuration needed by the server. In production this
 // is populated from config.Config; in tests it can be a minimal struct.
 type serverConfig struct {
-	apiToken   string
-	hmacSecret string
+	apiToken      string
+	hmacSecret    string
+	execJWTSecret string
 }
 
 // NewServerConfig creates a serverConfig from the provided token and secret.
 // This allows callers outside the api package to construct configuration.
 func NewServerConfig(apiToken, hmacSecret string) *serverConfig {
 	return &serverConfig{apiToken: apiToken, hmacSecret: hmacSecret}
+}
+
+// SetExecJWTSecret configures the HMAC secret used to validate scoped exec
+// JWTs on /sandboxes/{id}/exec routes. Empty secret disables the scoped-JWT
+// path — only the global Bearer token is accepted.
+func (c *serverConfig) SetExecJWTSecret(secret string) {
+	c.execJWTSecret = secret
 }
 
 // Server is the control plane HTTP server.

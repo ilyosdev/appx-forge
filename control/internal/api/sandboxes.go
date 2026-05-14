@@ -31,6 +31,7 @@ type SandboxLifecycle interface {
 	DestroySandbox(ctx context.Context, id uuid.UUID) error
 	RestartSandbox(ctx context.Context, id uuid.UUID) error
 	WakeSandbox(ctx context.Context, id uuid.UUID) error
+	DispatchExec(ctx context.Context, sandboxID uuid.UUID, req lifecycle.ExecRequest) (string, error)
 }
 
 // SandboxReader abstracts the read-only store operations for sandbox handlers.
@@ -396,6 +397,224 @@ func (s *Server) handleWakeSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// ── Exec Handlers ────────────────────────────────────────────────────
+
+// execRequest is the JSON body for POST /v1/sandboxes/{id}/exec.
+type execRequest struct {
+	Command        string            `json:"command"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+}
+
+// execAcceptResponse is the 202 Accepted body returned by handleExecSandbox.
+type execAcceptResponse struct {
+	CommandID string `json:"command_id"`
+	Status    string `json:"status"`
+}
+
+// execResultResponse is the 200 OK body returned by handleGetExecResult.
+// status mirrors the command lifecycle:
+//
+//	queued    — agent has not yet picked up the command (status=pending)
+//	running   — agent is executing (status=dispatched, no ack yet)
+//	complete  — agent acked success (status=completed)
+//	failed    — agent acked failure (status=failed)
+type execResultResponse struct {
+	Status          string `json:"status"`
+	ExitCode        *int   `json:"exit_code,omitempty"`
+	Stdout          string `json:"stdout,omitempty"`
+	Stderr          string `json:"stderr,omitempty"`
+	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
+	DurationMs      int64  `json:"duration_ms,omitempty"`
+}
+
+// handleExecSandbox handles POST /v1/sandboxes/{id}/exec.
+// Dispatches a shell command to the agent hosting the sandbox and returns
+// 202 Accepted with the new command_id. Caller polls
+// GET /v1/sandboxes/{id}/exec/{cmd_id} for the result, or subscribes to
+// the exec_completed webhook to skip polling entirely.
+func (s *Server) handleExecSandbox(w http.ResponseWriter, r *http.Request) {
+	if s.lifecycle == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+	if s.sandboxReader == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	sandboxID, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	var req execRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		BadRequest(w, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Command) == "" {
+		BadRequest(w, "command is required")
+		return
+	}
+	// Clamp timeout into [1, 300] up front so the API contract matches the
+	// lifecycle layer. Callers passing 0 get the 120s default from lifecycle.
+	if req.TimeoutSeconds < 0 {
+		BadRequest(w, "timeout_seconds must be non-negative")
+		return
+	}
+	if req.TimeoutSeconds > 300 {
+		req.TimeoutSeconds = 300
+	}
+
+	// Verify sandbox exists + is running before dispatching. lifecycle's
+	// DispatchExec also validates, but checking here lets us return 404 vs
+	// 409 vs 500 with clean separation.
+	pgID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	sandbox, err := s.sandboxReader.GetSandbox(r.Context(), pgID)
+	if err != nil {
+		NotFound(w, "sandbox not found")
+		return
+	}
+	if sandbox.State != "running" {
+		WriteProblem(w, http.StatusConflict, "urn:forge:error:conflict",
+			"Conflict", fmt.Sprintf("sandbox must be running to exec, current state: %s", sandbox.State))
+		return
+	}
+
+	cmdID, err := s.lifecycle.DispatchExec(r.Context(), sandboxID, lifecycle.ExecRequest{
+		Command:        req.Command,
+		Cwd:            req.Cwd,
+		Env:            req.Env,
+		TimeoutSeconds: req.TimeoutSeconds,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, lifecycle.ErrNotFound):
+			NotFound(w, "sandbox not found")
+		case errors.Is(err, lifecycle.ErrSandboxNotAssigned):
+			ServiceUnavailable(w, "sandbox not assigned to a node")
+		case errors.Is(err, lifecycle.ErrSandboxNotRunning):
+			WriteProblem(w, http.StatusConflict, "urn:forge:error:conflict", "Conflict", err.Error())
+		default:
+			s.logger.Error("exec dispatch failed", "error", err, "sandbox_id", idStr)
+			WriteProblem(w, http.StatusInternalServerError,
+				"urn:forge:error:internal", "Internal Server Error", "failed to dispatch exec command")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, execAcceptResponse{
+		CommandID: cmdID,
+		Status:    "queued",
+	})
+}
+
+// handleGetExecResult handles GET /v1/sandboxes/{id}/exec/{cmd_id}.
+// Returns the current status of the exec command and, once acked, the
+// stdout/stderr/exit_code/duration extracted from the agent's ack result.
+//
+// Authorization: the cmd_id must belong to the sandbox in the path — a
+// caller authorized for sandbox A cannot read exec results from sandbox B
+// even if they know the cmd_id.
+func (s *Server) handleGetExecResult(w http.ResponseWriter, r *http.Request) {
+	if s.agentStore == nil {
+		ServiceUnavailable(w, "command service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	sandboxID, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	cmdIDStr := chi.URLParam(r, "cmd_id")
+	cmdID, err := uuid.Parse(cmdIDStr)
+	if err != nil {
+		BadRequest(w, "invalid command ID: must be a valid UUID")
+		return
+	}
+
+	cmd, err := s.agentStore.GetCommand(r.Context(), pgtype.UUID{Bytes: cmdID, Valid: true})
+	if err != nil {
+		NotFound(w, "command not found")
+		return
+	}
+
+	// Authorization check: refuse cross-sandbox reads. Compare the bytes
+	// directly rather than re-formatting both sides as strings.
+	if !cmd.SandboxID.Valid || cmd.SandboxID.Bytes != sandboxID {
+		NotFound(w, "command not found")
+		return
+	}
+
+	// Only return results for exec commands. Other command types (start_sandbox,
+	// stop_sandbox, restart_sandbox) have their own UX and shouldn't leak through
+	// this endpoint shape.
+	if cmd.CommandType != "exec" {
+		NotFound(w, "command not found")
+		return
+	}
+
+	resp := execResultResponse{}
+	switch cmd.Status {
+	case "pending":
+		resp.Status = "queued"
+	case "dispatched":
+		resp.Status = "running"
+	case "completed":
+		resp.Status = "complete"
+	case "failed":
+		resp.Status = "failed"
+	default:
+		// Defensive: unknown status — treat as failed so caller knows
+		// the row is no longer in flight.
+		resp.Status = "failed"
+	}
+
+	// Parse the ack result for terminal states. We don't fail the request
+	// if parsing fails — surface the status alone, log the parse error.
+	if cmd.Status == "completed" || cmd.Status == "failed" {
+		if len(cmd.Result) > 0 {
+			var resultMap map[string]interface{}
+			if err := json.Unmarshal(cmd.Result, &resultMap); err == nil {
+				if v, ok := resultMap["exit_code"]; ok {
+					if f, isNum := v.(float64); isNum {
+						exit := int(f)
+						resp.ExitCode = &exit
+					}
+				}
+				if s, ok := resultMap["stdout"].(string); ok {
+					resp.Stdout = s
+				}
+				if s, ok := resultMap["stderr"].(string); ok {
+					resp.Stderr = s
+				}
+				if b, ok := resultMap["stdout_truncated"].(bool); ok {
+					resp.StdoutTruncated = b
+				}
+				if b, ok := resultMap["stderr_truncated"].(bool); ok {
+					resp.StderrTruncated = b
+				}
+				if f, ok := resultMap["duration_ms"].(float64); ok {
+					resp.DurationMs = int64(f)
+				}
+			} else {
+				s.logger.Warn("exec result parse failed",
+					"err", err, "cmd_id", cmdIDStr, "sandbox_id", idStr)
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ── Response Mappers ─────────────────────────────────────────────────

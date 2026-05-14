@@ -54,6 +54,13 @@ func (m *mockLifecycle) WakeSandbox(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+// DispatchExec satisfies the SandboxLifecycle interface (added with the
+// exec endpoint). Stub returns empty cmd ID — exec handler tests stub
+// this themselves when they exercise the dispatch path.
+func (m *mockLifecycle) DispatchExec(ctx context.Context, sandboxID uuid.UUID, req lifecycle.ExecRequest) (string, error) {
+	return "", nil
+}
+
 // ── Mock Sandbox Reader ─────────────────────────────────────────────
 
 type mockSandboxReader struct {

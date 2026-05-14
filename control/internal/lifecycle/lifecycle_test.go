@@ -1471,14 +1471,25 @@ func TestLifecycle_Route_NilRouteNotifier_DoesNotPanic(t *testing.T) {
 // ── Mock StateWebhookNotifier (Phase 33-B) ────────────────────────
 
 type mockStateWebhookNotifier struct {
-	mu    sync.Mutex
-	calls []StateChangePayload
+	mu        sync.Mutex
+	calls     []StateChangePayload
+	execCalls []ExecCompletedPayload
 }
 
 func (m *mockStateWebhookNotifier) OnSandboxStateChanged(_ context.Context, payload StateChangePayload) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, payload)
+	return nil
+}
+
+// OnExecCompleted satisfies the StateWebhookNotifier interface for the
+// exec ack hook. Captures payloads so exec-specific tests can assert on
+// them; existing state-change tests remain untouched.
+func (m *mockStateWebhookNotifier) OnExecCompleted(_ context.Context, payload ExecCompletedPayload) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.execCalls = append(m.execCalls, payload)
 	return nil
 }
 
