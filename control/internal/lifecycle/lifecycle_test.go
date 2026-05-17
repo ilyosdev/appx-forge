@@ -1764,3 +1764,149 @@ func TestLifecycle_Webhook_DestroySandbox_OrphanFiresOnDestroyed(t *testing.T) {
 		t.Errorf("app_name = %q, want pool-orphan", calls[0].AppName)
 	}
 }
+
+// ── 2026-05-17 — stop_sandbox+failure missing-container force-destroy ──
+//
+// Idle-reaper fires stop_sandbox against a stale container_id every 60s.
+// The agent returns "No such container: <id>" since the container was
+// recreated/pruned out-of-band. Pre-fix: ack hit the `default:` branch
+// ("unhandled ack combination"); the row stayed alive; DriftDetector
+// re-found the replacement container 20s later and flipped state to
+// running, causing an infinite reap loop. Post-fix: HandleAck force-
+// transitions the row to StateDestroyed (bypassing the state machine
+// since no valid running→destroyed event exists, but the container is
+// provably gone). Other generic stop_sandbox failures (timeout etc.)
+// stay a no-op so the reaper can retry on the next tick.
+
+func TestHandleAck_StopSandboxFailure_MissingContainer_ForcesDestroyed(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	var capturedTransition store.TransitionSandboxStateParams
+	transitionCalls := 0
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "running", AppName: "stuck-app",
+				ContainerID: pgtype.Text{String: "7ece1234abcd", Valid: true},
+			}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			capturedTransition = arg
+			transitionCalls++
+			return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"stop_sandbox", "failure",
+		json.RawMessage(`{"error":"No such container: 7ece1234abcd"}`))
+
+	if err != nil {
+		t.Fatalf("expected nil error (force-destroy path), got: %v", err)
+	}
+	if transitionCalls != 1 {
+		t.Fatalf("expected exactly 1 transition call, got %d", transitionCalls)
+	}
+	if capturedTransition.State != "destroyed" {
+		t.Fatalf("expected force-transition to 'destroyed', got %q", capturedTransition.State)
+	}
+	// Optimistic-concurrency guard must reflect the actual prior state
+	// (running) so the WHERE state = $3 clause matches.
+	if capturedTransition.State_2 != "running" {
+		t.Fatalf("expected transition guard from 'running', got %q", capturedTransition.State_2)
+	}
+}
+
+func TestHandleAck_StopSandboxFailure_GenericFailure_NoOp(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	transitionCalls := 0
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "running", AppName: "stuck-app",
+				ContainerID: pgtype.Text{String: "7ece1234abcd", Valid: true},
+			}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			transitionCalls++
+			return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"stop_sandbox", "failure",
+		json.RawMessage(`{"error":"timeout while stopping container"}`))
+
+	if err != nil {
+		t.Fatalf("expected nil error (no-op path), got: %v", err)
+	}
+	if transitionCalls != 0 {
+		t.Fatalf("expected no state transition for generic stop failure, got %d transition calls", transitionCalls)
+	}
+}
+
+func TestHandleAck_StopSandboxFailure_AlreadyDestroyed_NoOp(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	transitionCalls := 0
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "destroyed", AppName: "stuck-app",
+				ContainerID: pgtype.Text{String: "7ece1234abcd", Valid: true},
+			}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			transitionCalls++
+			return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.HandleAck(context.Background(), uuid.New(), sandboxID,
+		"stop_sandbox", "failure",
+		json.RawMessage(`{"error":"No such container: 7ece1234abcd"}`))
+
+	if err != nil {
+		t.Fatalf("expected nil error when already destroyed, got: %v", err)
+	}
+	// alreadyAtTarget escape hatch must suppress the transition — sandbox
+	// is already in the destination state.
+	if transitionCalls != 0 {
+		t.Fatalf("expected no state transition when already destroyed, got %d transition calls", transitionCalls)
+	}
+}
+
+func TestIsMissingContainerErr_MatchesVariants(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload json.RawMessage
+		want    bool
+	}{
+		{"docker NotFound with id", json.RawMessage(`{"error":"No such container: 7ece1234abcd"}`), true},
+		{"docker daemon prefix", json.RawMessage(`{"error":"Error response from daemon: No such container: abc"}`), true},
+		{"bare phrase", json.RawMessage(`{"error":"No such container"}`), true},
+		{"lowercase variant — case-sensitive substring match", json.RawMessage(`{"error":"no such container"}`), false},
+		{"generic timeout", json.RawMessage(`{"error":"timeout while stopping container"}`), false},
+		{"empty ack result", json.RawMessage(``), false},
+		{"empty error field", json.RawMessage(`{"error":""}`), false},
+		{"malformed json", json.RawMessage(`not-json`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isMissingContainerErr(tc.payload)
+			if got != tc.want {
+				t.Errorf("isMissingContainerErr(%q) = %v, want %v", string(tc.payload), got, tc.want)
+			}
+		})
+	}
+}
