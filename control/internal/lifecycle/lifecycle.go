@@ -563,9 +563,16 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	if sandboxID == uuid.Nil {
 		ls.logger.Info("ack: orphan-cleanup cmd, closing without state transition",
 			"cmd_id", cmdID, "cmd_type", cmdType, "status", status)
+		// Translate agent ack (success|failure) → commands.status CHECK
+		// constraint (completed|failed). Mirrors the same translation at
+		// the bottom of HandleAck for the normal flow.
+		ackStatus := "completed"
+		if status == "failure" {
+			ackStatus = "failed"
+		}
 		return ls.store.AckCommand(ctx, store.AckCommandParams{
 			ID:     pgCmdID,
-			Status: status,
+			Status: ackStatus,
 			Result: ackResult,
 		})
 	}
