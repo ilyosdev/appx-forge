@@ -555,6 +555,21 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
 	pgCmdID := pgtype.UUID{Bytes: cmdID, Valid: true}
 
+	// 2026-05-17 — orphan-cleanup commands (dispatched by HeartbeatReconciler
+	// for containers that have NO corresponding DB row) carry a NULL sandbox
+	// ID through the commands table; api/agents.go converts that to a zero
+	// uuid.UUID. There is no sandbox row to transition — just close out the
+	// command so the agent's long-poll doesn't refetch it.
+	if sandboxID == uuid.Nil {
+		ls.logger.Info("ack: orphan-cleanup cmd, closing without state transition",
+			"cmd_id", cmdID, "cmd_type", cmdType, "status", status)
+		return ls.store.AckCommand(ctx, store.AckCommandParams{
+			ID:     pgCmdID,
+			Status: status,
+			Result: ackResult,
+		})
+	}
+
 	// Get current sandbox state
 	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
 	if err != nil {

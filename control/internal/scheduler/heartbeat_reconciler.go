@@ -217,5 +217,48 @@ func (r *HeartbeatReconciler) Reconcile(ctx context.Context, nodeID pgtype.UUID,
 	if dispatched > 0 {
 		r.logger.Info("reconcile orphan cleanup", "stop_dispatched", dispatched)
 	}
+
+	// 2026-05-17 — orphan-container cleanup for the case where the agent
+	// reports a container whose app_name has NO matching DB row at all.
+	// Mechanism: prior versions of the stop_sandbox failure handler
+	// (lifecycle.go:587 default case) silently skipped on "No such
+	// container", letting Audit-8 cleanup cron delete destroyed rows
+	// while containers lived on. Result: 35 orphans observed in prod
+	// 2026-05-17. Fix at the source (lifecycle.go 80d08b7) prevents new
+	// occurrences; this branch cleans up the existing population by
+	// dispatching stop_sandbox with NULL sandbox_id. HandleAck shortcircuits
+	// on zero sandboxID so no state-machine transitions are attempted.
+	dbAppSet := make(map[string]struct{}, len(dbRows)+len(terminalRows))
+	for _, row := range dbRows {
+		dbAppSet[row.AppName] = struct{}{}
+	}
+	for _, row := range terminalRows {
+		// Terminal rows are tracked by the orphan_terminal_row branch
+		// above; exclude them from the no-DB-row branch.
+		dbAppSet[row.AppName] = struct{}{}
+	}
+	orphans := 0
+	for _, c := range containers {
+		if c.AppName == "" {
+			continue
+		}
+		if _, present := dbAppSet[c.AppName]; present {
+			continue
+		}
+		if c.ContainerID == "" {
+			continue
+		}
+		nullSandboxID := pgtype.UUID{Valid: false}
+		if err := r.store.DispatchStopSandbox(ctx, nullSandboxID, nodeID, c.ContainerID, "orphan_no_db_row"); err != nil {
+			r.logger.Warn("reconcile: orphan stop dispatch failed",
+				"app_name", c.AppName, "container_id", c.ContainerID, "err", err)
+			continue
+		}
+		orphans++
+	}
+	if orphans > 0 {
+		r.logger.Info("reconcile orphan-no-row cleanup", "stop_dispatched", orphans)
+	}
+
 	return nil
 }

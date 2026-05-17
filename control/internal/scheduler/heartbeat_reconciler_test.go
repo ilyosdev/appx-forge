@@ -179,6 +179,64 @@ func TestReconcile_DispatchesStopForOrphanOnTerminalRow(t *testing.T) {
 	}
 }
 
+// 2026-05-17 — agent reports a container whose app_name has NO matching
+// DB row at all. Reconciler must dispatch stop_sandbox with NULL
+// sandbox_id so the orphan container is destroyed without a state
+// transition. Mirror of TestReconcile_DispatchesStopForOrphanOnTerminalRow
+// but with empty `terminalRows` instead of empty `listSandboxes`.
+func TestReconcile_DispatchesStopForOrphanWithNoDBRow(t *testing.T) {
+	store := &fakeStore{
+		listSandboxes: []SandboxRow{},
+		terminalRows:  []TerminalSandboxRow{},
+	}
+	r := NewHeartbeatReconciler(store, nil)
+
+	err := r.Reconcile(context.Background(), newPgUUID(), []ContainerInfo{
+		{AppName: "pool-ghost", State: "running", ContainerID: "ctn-ghost-1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(store.dispatchedStops) != 1 {
+		t.Fatalf("expected 1 stop dispatch, got %d (%+v)",
+			len(store.dispatchedStops), store.dispatchedStops)
+	}
+	got := store.dispatchedStops[0]
+	if got.ContainerID != "ctn-ghost-1" {
+		t.Errorf("dispatched container_id=%q, expected ctn-ghost-1", got.ContainerID)
+	}
+	if got.Reason != "orphan_no_db_row" {
+		t.Errorf("dispatched reason=%q, expected orphan_no_db_row", got.Reason)
+	}
+	// AppName comes from fakeStore reverse-lookup which only knows
+	// terminalRows; orphan-no-db-row dispatch carries no sandbox row so
+	// the fake records empty AppName. Fine for this assertion.
+}
+
+// 2026-05-17 — agent reports an empty AppName (corrupt/missing label).
+// Reconciler must skip dispatch defensively rather than dispatching a
+// stop for "" with a real container_id (which would catch any container
+// without app_name label across the host).
+func TestReconcile_SkipsOrphanDispatchOnEmptyAppName(t *testing.T) {
+	store := &fakeStore{
+		listSandboxes: []SandboxRow{},
+		terminalRows:  []TerminalSandboxRow{},
+	}
+	r := NewHeartbeatReconciler(store, nil)
+
+	err := r.Reconcile(context.Background(), newPgUUID(), []ContainerInfo{
+		{AppName: "", State: "running", ContainerID: "ctn-unlabeled"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(store.dispatchedStops) != 0 {
+		t.Errorf("expected 0 dispatches for empty app_name, got %+v", store.dispatchedStops)
+	}
+}
+
 // Phase 33-Real-7 — when the row is terminal but the agent does NOT
 // report the container (already destroyed), no dispatch should fire.
 func TestReconcile_SkipsStopWhenTerminalContainerAbsent(t *testing.T) {
