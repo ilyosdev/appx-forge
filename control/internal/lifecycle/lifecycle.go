@@ -564,6 +564,11 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	// Map (cmdType, status) to state machine event
 	var event models.SandboxEvent
 	needsTransition := true
+	// forceDestroyed bypasses the state-machine and writes StateDestroyed
+	// directly. Used when the agent reports "No such container" on a
+	// stop_sandbox failure: the container is provably absent so the only
+	// consistent DB state is destroyed, regardless of the current state.
+	forceDestroyed := false
 
 	switch {
 	case cmdType == string(models.CmdStartSandbox) && status == "success":
@@ -580,6 +585,31 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 		} else {
 			needsTransition = false
 		}
+	case cmdType == string(models.CmdStopSandbox) && status == "failure":
+		// 2026-05-17 incident — stuck-sandbox infinite reap loop.
+		//
+		// Idle-reaper fires stop_sandbox with a stale container_id every
+		// 60s. The container with that ID no longer exists on the host
+		// (recreated/pruned out-of-band — agent returns
+		// "No such container: <id>"). Previously this fell through to
+		// `default:` ("unhandled ack combination") which did nothing, so
+		// the row stayed alive; 20s later DriftDetector found the
+		// replacement container by name and flipped state back to
+		// running, and the cycle repeated forever.
+		//
+		// Recovery: when the agent confirms the container is missing,
+		// force-transition the row to StateDestroyed (bypassing the
+		// state machine — no valid running→destroyed event exists, but
+		// the container is provably gone so the DB just needs to catch
+		// up). Other stop_sandbox failures (container still exists but
+		// stop call timed out etc.) fall through to a no-op so the
+		// idle-reaper can retry on the next tick.
+		if isMissingContainerErr(ackResult) {
+			event = models.EventDestroyed
+			forceDestroyed = true
+		} else {
+			needsTransition = false
+		}
 	case cmdType == string(models.CmdRestartSandbox) && status == "success":
 		// Restart success: no state change, container restarted at Docker level
 		needsTransition = false
@@ -591,6 +621,22 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	if needsTransition {
 		currentState := models.SandboxState(sandbox.State)
 		nextState, valid := models.NextState(currentState, event)
+
+		// 2026-05-17 — stop_sandbox+failure with missing container.
+		// Force StateDestroyed regardless of current state because the
+		// container is provably gone. Treat current state as already
+		// terminal so we never round-trip through StateDestroying.
+		if forceDestroyed {
+			nextState = models.StateDestroyed
+			valid = currentState != models.StateDestroyed
+			if !valid {
+				ls.logger.Info("ack: stop_sandbox+failure on missing container; already destroyed",
+					"sandbox_id", sandboxID, "current_state", currentState)
+			} else {
+				ls.logger.Warn("ack: stop_sandbox+failure on missing container; force-destroying",
+					"sandbox_id", sandboxID, "current_state", currentState)
+			}
+		}
 
 		if !valid {
 			// Race: HandleEvent (e.g. container_started) may have already
@@ -797,7 +843,8 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	// commands and the row inline; project sandboxes (with appx.projectId
 	// metadata) keep the existing `stopped` behavior since they may be
 	// woken later. Best-effort: cleanup failures don't unwind the ack.
-	if cmdType == string(models.CmdStopSandbox) && status == "success" &&
+	if cmdType == string(models.CmdStopSandbox) &&
+		(status == "success" || forceDestroyed) &&
 		isPoolSandbox(sandbox.Metadata) {
 		// Re-fetch sandbox to confirm it's actually in stopped state
 		// (HandleAck may have transitioned it above for destroying flow).
@@ -841,6 +888,28 @@ func isPoolSandbox(metadataJSON []byte) bool {
 		}
 	}
 	return true
+}
+
+// isMissingContainerErr reports whether an agent failure ack indicates the
+// target container no longer exists on the host. ackResult shape on failure
+// is {"error": "<msg>"} (built in api.handleAckCommand). Docker's
+// NotFound error message is "No such container: <id>" — substring-match
+// keeps this resilient to Docker version drift.
+//
+// Wired into HandleAck's stop_sandbox+failure branch so a stale
+// container_id reference cannot keep the idle-reaper retrying the same
+// dead command forever (2026-05-17 incident).
+func isMissingContainerErr(ackResult json.RawMessage) bool {
+	if len(ackResult) == 0 {
+		return false
+	}
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(ackResult, &payload); err != nil {
+		return false
+	}
+	return strings.Contains(payload.Error, "No such container")
 }
 
 // ── HandleEvent ──────────────────────────────────────────────────────
