@@ -38,11 +38,67 @@ config.resolver.nodeModulesPaths = ['/opt/expo-shared-deps/node_modules'];
 config.resolver.useWatchman = false;
 config.watcher = { ...(config.watcher || {}), useWatchman: false };
 
+// W3 — content negotiation at `/`. Browsers iframe-loading a sandbox URL expect
+// an HTML wrapper that boots the JS bundle; Expo Go expects an Expo manifest JSON.
+// Default Metro serves manifest at `/`, which caused iframes to render raw JSON
+// text instead of the user app. Intercept GET `/` for browser-style Accept
+// headers and serve a minimal Expo web bootstrap HTML wrapper; pass everything
+// else through to Metro so Expo Go still gets manifest.
+const HTML_WRAPPER =
+  '<!DOCTYPE html>\n' +
+  '<html lang="en">\n' +
+  '<head>\n' +
+  '<meta charset="UTF-8">\n' +
+  '<meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
+  '<title>AppX Preview</title>\n' +
+  '<style>html,body,#root{margin:0;padding:0;height:100%}#root{display:flex;flex:1}</style>\n' +
+  '</head>\n' +
+  '<body>\n' +
+  '<noscript>You need to enable JavaScript to run this app.</noscript>\n' +
+  '<div id="root"></div>\n' +
+  '<script src="/entry.bundle?platform=web&dev=true&hot=false&lazy=false&transform.engine=hermes&transform.routerRoot=app&unstable_transformProfile=hermes-stable" defer></script>\n' +
+  '</body>\n' +
+  '</html>\n';
+function acceptQuality(accept, mime) {
+  const entries = accept.split(',').map((s) => s.trim().toLowerCase());
+  for (const e of entries) {
+    const [type, ...params] = e.split(';').map((s) => s.trim());
+    const matches = type === mime || type === '*/*' || (type.endsWith('/*') && mime.startsWith(type.slice(0, -2)));
+    if (!matches) continue;
+    const qParam = params.find((p) => p.startsWith('q='));
+    return qParam ? parseFloat(qParam.slice(2)) : 1;
+  }
+  return 0;
+}
+function preferHtmlOverManifest(req) {
+  const expoHeader = (req.headers['expo-platform'] || req.headers['exponent-platform'] || '').toString();
+  if (expoHeader) return false;
+  const accept = (req.headers['accept'] || '').toLowerCase();
+  if (!accept) return true;
+  if (accept.includes('application/expo+json') || accept.includes('multipart/mixed')) return false;
+  return acceptQuality(accept, 'text/html') >= acceptQuality(accept, 'application/json');
+}
 // Disable lazy bundling. Prevents session-graph leak documented in facebook/metro#1191.
 config.server = {
   ...(config.server || {}),
   rewriteRequestUrl: (url) =>
     url.replace('&lazy=true', '&lazy=false').replace('?lazy=true', '?lazy=false'),
+  enhanceMiddleware: (metroMiddleware) => {
+    return (req, res, next) => {
+      if (
+        (req.method === 'GET' || req.method === 'HEAD') &&
+        (req.url === '/' || req.url === '/index.html' || req.url.startsWith('/?'))
+      ) {
+        if (preferHtmlOverManifest(req)) {
+          res.setHeader('Content-Type', 'text/html; charset=utf-8');
+          res.setHeader('Cache-Control', 'no-store');
+          res.end(req.method === 'HEAD' ? '' : HTML_WRAPPER);
+          return;
+        }
+      }
+      return metroMiddleware(req, res, next);
+    };
+  },
 };
 
 // Shared persistent transform cache. Survives container restarts; transforms of
