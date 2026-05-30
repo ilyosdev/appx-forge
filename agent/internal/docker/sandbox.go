@@ -53,7 +53,17 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 	// running sandboxes as "missing on agent" and destroys them within
 	// seconds of reaching running state.
 	cfg := &container.Config{
-		Image:        spec.Image,
+		Image: spec.Image,
+		// Set /etc/hostname to `forge-{appName}` so the sandbox entrypoint can
+		// recover APP_NAME from it. Docker defaults /etc/hostname to the random
+		// container ID (not the container name), which silently defeated the
+		// entrypoint's hostname fallback — so EXPO_PACKAGER_PROXY_URL was never
+		// set and Expo Go got `{host}:8081` manifest URLs ("Could not connect to
+		// development server", since only :443 is exposed via Caddy). The
+		// backend also sends APP_NAME via createApp env, but it is dropped in the
+		// control→agent hop; deriving it from the locally-known spec.AppName here
+		// is the reliable fix.
+		Hostname:     "forge-" + spec.AppName,
 		Env:          env,
 		ExposedPorts: network.PortSet{containerPortParsed: {}},
 		Labels: map[string]string{
