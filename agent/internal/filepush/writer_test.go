@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestWriteFiles_CreatesFileAtCorrectPath(t *testing.T) {
@@ -278,6 +279,51 @@ func TestWriteTar_IgnoresSymlinks(t *testing.T) {
 	// Symlink should NOT exist
 	if _, err := os.Lstat(filepath.Join(dir, "evil-link")); !os.IsNotExist(err) {
 		t.Error("symlink entry should have been ignored")
+	}
+}
+
+func TestWriteFiles_BumpsWatchedRootMtimeOnWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a watched root file (Metro entry) with an old mtime.
+	entry := filepath.Join(dir, "entry.js")
+	if err := os.WriteFile(entry, []byte("import 'expo-router/entry';"), 0644); err != nil {
+		t.Fatalf("seeding entry.js: %v", err)
+	}
+	old := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(entry, old, old); err != nil {
+		t.Fatalf("backdating entry.js: %v", err)
+	}
+
+	// Push a brand-new nested file, the inotify-weak-spot case.
+	files := []FileEntry{
+		{Path: "app/(tabs)/settings.tsx", Content: b64("export default function S(){return null}"), Delete: false},
+	}
+	result := WriteFiles(dir, files)
+	if len(result.Written) != 1 {
+		t.Fatalf("expected 1 written, got %v", result.Written)
+	}
+
+	info, err := os.Stat(entry)
+	if err != nil {
+		t.Fatalf("stat entry.js: %v", err)
+	}
+	if !info.ModTime().After(old) {
+		t.Errorf("expected entry.js mtime to be bumped past %v, got %v", old, info.ModTime())
+	}
+}
+
+func TestTriggerMetroRebuild_NoWatchedFileIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	// No entry.js / app router files present — must not panic or create anything.
+	triggerMetroRebuild(dir)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("reading dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("triggerMetroRebuild created files: %v", entries)
 	}
 }
 

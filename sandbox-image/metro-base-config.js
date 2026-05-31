@@ -44,6 +44,48 @@ config.watcher = { ...(config.watcher || {}), useWatchman: false };
 // text instead of the user app. Intercept GET `/` for browser-style Accept
 // headers and serve a minimal Expo web bootstrap HTML wrapper; pass everything
 // else through to Metro so Expo Go still gets manifest.
+// Blank-root watchdog. The runtime-error hook in app/entry.js only fires on a
+// THROWN error; an empty module graph or an Expo Router "Unmatched Route" tree
+// renders nothing yet throws nothing → silent black screen while the backend
+// reports "ready". This inline script (runs in the raw browser context, so it
+// works even if the Metro bundle never mounts anything) checks #root ~4s after
+// load and, if still blank, posts the SAME envelope app/entry.js uses
+// ({type:'appx:runtime-error', source, message, timestamp}) so the existing
+// AppX frontend handler (PhonePreviewPanel.tsx → handlePreviewRuntimeError)
+// picks it up. Fires at most once.
+const BLANK_ROOT_WATCHDOG =
+  '<script>\n' +
+  '(function(){\n' +
+  '  var DELAY_MS = 4000;\n' +
+  '  var fired = false;\n' +
+  '  function isUnmatchedRoute(root){\n' +
+  '    try {\n' +
+  "      var t = (root.textContent || '');\n" +
+  "      return t.indexOf('Unmatched Route') !== -1 || t.indexOf('This screen does not exist') !== -1;\n" +
+  '    } catch (e) { return false; }\n' +
+  '  }\n' +
+  '  function check(){\n' +
+  '    if (fired) return;\n' +
+  "    var root = document.getElementById('root');\n" +
+  '    var blank = !root || root.childElementCount === 0;\n' +
+  '    var unmatched = root && isUnmatchedRoute(root);\n' +
+  '    if (!blank && !unmatched) return;\n' +
+  '    fired = true;\n' +
+  '    try {\n' +
+  '      if (window.parent && window.parent !== window) {\n' +
+  '        window.parent.postMessage({\n' +
+  "          type: 'appx:runtime-error',\n" +
+  "          source: 'blank-root',\n" +
+  "          message: unmatched ? 'App mounted but rendered an unmatched route' : 'App mounted but rendered nothing',\n" +
+  '          timestamp: Date.now()\n' +
+  "        }, '*');\n" +
+  '      }\n' +
+  '    } catch (e) { /* cross-origin or disabled — never break preview */ }\n' +
+  '  }\n' +
+  '  setTimeout(check, DELAY_MS);\n' +
+  '})();\n' +
+  '</script>\n';
+
 const HTML_WRAPPER =
   '<!DOCTYPE html>\n' +
   '<html lang="en">\n' +
@@ -57,6 +99,7 @@ const HTML_WRAPPER =
   '<noscript>You need to enable JavaScript to run this app.</noscript>\n' +
   '<div id="root"></div>\n' +
   '<script src="/entry.bundle?platform=web&dev=true&hot=false&lazy=false&transform.engine=hermes&transform.routerRoot=app&unstable_transformProfile=hermes-stable" defer></script>\n' +
+  BLANK_ROOT_WATCHDOG +
   '</body>\n' +
   '</html>\n';
 function acceptQuality(accept, mime) {
