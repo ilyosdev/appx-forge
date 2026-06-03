@@ -31,6 +31,7 @@ type SandboxLifecycle interface {
 	DestroySandbox(ctx context.Context, id uuid.UUID) error
 	RestartSandbox(ctx context.Context, id uuid.UUID) error
 	WakeSandbox(ctx context.Context, id uuid.UUID) error
+	SleepSandbox(ctx context.Context, id uuid.UUID) error
 	DispatchExec(ctx context.Context, sandboxID uuid.UUID, req lifecycle.ExecRequest) (string, error)
 }
 
@@ -393,6 +394,40 @@ func (s *Server) handleWakeSandbox(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("wake sandbox failed", "error", err, "sandbox_id", idStr)
 		WriteProblem(w, http.StatusInternalServerError,
 			"urn:forge:error:internal", "Internal Server Error", "failed to wake sandbox")
+		return
+	}
+
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleSleepSandbox handles POST /v1/sandboxes/{id}/sleep.
+// Stops a running sandbox without destroying it, leaving it in StateStopped so
+// a subsequent wake can revive it. Idempotent on already-stopped sandboxes.
+func (s *Server) handleSleepSandbox(w http.ResponseWriter, r *http.Request) {
+	if s.lifecycle == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	if err := s.lifecycle.SleepSandbox(r.Context(), id); err != nil {
+		if errors.Is(err, lifecycle.ErrNotFound) {
+			NotFound(w, "sandbox not found")
+			return
+		}
+		if errors.Is(err, lifecycle.ErrInvalidState) {
+			WriteProblem(w, http.StatusConflict, "urn:forge:error:conflict", "Conflict", err.Error())
+			return
+		}
+		s.logger.Error("sleep sandbox failed", "error", err, "sandbox_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to sleep sandbox")
 		return
 	}
 

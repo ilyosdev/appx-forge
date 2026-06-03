@@ -44,6 +44,7 @@ func (s *Server) RegisterRoutes() {
 				r.Delete("/sandboxes/{id}", s.handleDestroySandbox)
 				r.Post("/sandboxes/{id}/restart", s.handleRestartSandbox)
 				r.Post("/sandboxes/{id}/wake", s.handleWakeSandbox)
+				r.Post("/sandboxes/{id}/sleep", s.handleSleepSandbox)
 				r.Post("/sandboxes/{id}/files", s.handleFilePush)
 
 				// Exec endpoints — optionally accept a scoped JWT in the

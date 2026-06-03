@@ -1213,6 +1213,117 @@ func TestDestroySandbox_OrphanShortCircuit(t *testing.T) {
 	}
 }
 
+// ── SleepSandbox Tests ──────────────────────────────────────────────
+
+// SleepSandbox stops a running sandbox without destroying it: running→stopped
+// (NOT destroying) + a stop_sandbox command, so a later wake can revive it.
+func TestSleepSandbox_HappyPath(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	nodeID := uuid.New()
+	pgNodeID := makePgUUID(nodeID)
+
+	var capturedTransition store.TransitionSandboxStateParams
+	var capturedCmd store.CreateCommandParams
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:          pgSandboxID,
+				State:       "running",
+				AppName:     "test-app",
+				NodeID:      pgNodeID,
+				ContainerID: pgtype.Text{String: "container-abc", Valid: true},
+			}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			capturedTransition = arg
+			return store.Sandbox{ID: pgSandboxID, State: arg.State, NodeID: pgNodeID}, nil
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			capturedCmd = arg
+			return store.Command{ID: arg.ID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.SleepSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Lands in stopped (wake-able), NOT destroying/destroyed.
+	if capturedTransition.State != "stopped" {
+		t.Fatalf("expected transition to 'stopped', got %q", capturedTransition.State)
+	}
+	if capturedTransition.State_2 != "running" {
+		t.Fatalf("expected transition guard from 'running', got %q", capturedTransition.State_2)
+	}
+	// Stop command issued to the sandbox's node.
+	if capturedCmd.CommandType != "stop_sandbox" {
+		t.Fatalf("expected command type 'stop_sandbox', got %q", capturedCmd.CommandType)
+	}
+	if capturedCmd.NodeID != pgNodeID {
+		t.Fatal("expected stop command to target the sandbox's node")
+	}
+}
+
+// Idempotent: sleeping an already-stopped sandbox is a no-op success (no
+// transition, no command).
+func TestSleepSandbox_AlreadyStopped_NoOp(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	transitionCalled := false
+	createCommandCalled := false
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: "stopped", AppName: "asleep-app"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			transitionCalled = true
+			return store.Sandbox{}, nil
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			createCommandCalled = true
+			return store.Command{ID: arg.ID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.SleepSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("expected no-op success on already-stopped, got %v", err)
+	}
+	if transitionCalled {
+		t.Fatal("expected NO state transition on already-stopped sandbox")
+	}
+	if createCommandCalled {
+		t.Fatal("expected NO stop command on already-stopped sandbox")
+	}
+}
+
+// A non-running, non-stopped sandbox (e.g. starting) cannot be slept — returns
+// ErrInvalidState so the API surfaces a 409 rather than corrupting state.
+func TestSleepSandbox_NotRunning_InvalidState(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: "starting", AppName: "booting-app"}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	err := svc.SleepSandbox(context.Background(), sandboxID)
+	if err == nil {
+		t.Fatal("expected error sleeping a non-running sandbox")
+	}
+	if !errors.Is(err, ErrInvalidState) {
+		t.Fatalf("expected ErrInvalidState, got %v", err)
+	}
+}
+
 // ── RestartSandbox Tests ────────────────────────────────────────────
 
 func TestRestartSandbox_HappyPath(t *testing.T) {

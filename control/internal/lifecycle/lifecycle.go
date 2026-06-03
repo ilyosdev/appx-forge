@@ -1238,6 +1238,107 @@ func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID
 	return nil
 }
 
+// ── SleepSandbox ─────────────────────────────────────────────────────
+
+// SleepSandbox stops a running sandbox WITHOUT destroying it, leaving the row
+// in StateStopped so a later WakeSandbox can revive it. It is the on-demand
+// HTTP counterpart to the idle reaper's running→stopped transition: same
+// state edge, same stop_sandbox command, same route teardown.
+//
+// This exists because DestroySandbox lands a sandbox in StateDestroyed, which
+// WakeSandbox rejects (it only accepts StateStopped). Backends that want a
+// "sleep now, wake later" toggle (a user-initiated sleep, or scale-to-zero)
+// must route through here, not through destroy.
+//
+// Idempotent: a sandbox already in StateStopped is a no-op success so repeated
+// sleep calls don't error.
+func (ls *LifecycleService) SleepSandbox(ctx context.Context, sandboxID uuid.UUID) error {
+	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+
+	sandbox, err := ls.store.GetSandbox(ctx, pgSandboxID)
+	if err != nil {
+		return fmt.Errorf("get sandbox: %w", err)
+	}
+
+	currentState := models.SandboxState(sandbox.State)
+
+	// Idempotent: already asleep.
+	if currentState == models.StateStopped {
+		return nil
+	}
+
+	if currentState != models.StateRunning {
+		return fmt.Errorf("%w: sandbox must be running to sleep, current state: %s", ErrInvalidState, sandbox.State)
+	}
+
+	// running → stopped via EventIdleTimeout (the only edge out of running into
+	// stopped; the idle reaper uses the same one). actor distinguishes the
+	// on-demand sleep from an idle reap in the event log.
+	nextState, valid := models.NextState(currentState, models.EventIdleTimeout)
+	if !valid {
+		return fmt.Errorf("%w: cannot sleep sandbox in state %s", ErrInvalidTransition, sandbox.State)
+	}
+	_, err = ls.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(nextState),
+		ID:      pgSandboxID,
+		State_2: sandbox.State,
+	})
+	if err != nil {
+		return fmt.Errorf("transition state: %w", err)
+	}
+
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"container_id": sandbox.ContainerID.String,
+		"reason":       "control-plane-sleep",
+	})
+
+	// A running sandbox always has a node assigned; guard anyway so an orphan
+	// row never produces a NOT NULL command insert (the 500 DestroySandbox's
+	// orphan short-circuit was added to avoid). With no node there is no agent
+	// to stop the container — the row is already transitioned to stopped, and
+	// the orphan reaper / drift detector will reconcile the dangling container.
+	if sandbox.NodeID.Valid {
+		cmdID := uuid.New()
+		_, err = ls.store.CreateCommand(ctx, store.CreateCommandParams{
+			ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+			NodeID:         sandbox.NodeID,
+			SandboxID:      pgSandboxID,
+			CommandType:    string(models.CmdStopSandbox),
+			Payload:        cmdPayload,
+			TimeoutSeconds: 60,
+		})
+		if err != nil {
+			return fmt.Errorf("create stop command: %w", err)
+		}
+	} else {
+		ls.logger.Warn("sleeping orphan sandbox without stop command (no node)",
+			"sandbox_id", sandboxID, "app_name", sandbox.AppName)
+	}
+
+	_, err = ls.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: pgSandboxID,
+		NodeID:    sandbox.NodeID,
+		EventType: string(models.EventIdleTimeout),
+		Actor:     "control-plane-sleep",
+		PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+		NextState: pgtype.Text{String: string(nextState), Valid: true},
+		Payload:   safePayload(cmdPayload),
+	})
+	if err != nil {
+		ls.logger.Warn("failed to record sleep event", "error", err, "sandbox_id", sandboxID)
+	}
+
+	// Tear the Caddy route down so the upstream stops pointing at the dying
+	// container; WakeSandbox re-adds it on the next start ack. Best-effort,
+	// guarded like the other route call sites (routeNotifier may be nil).
+	if ls.routeNotifier != nil {
+		ls.notifyRouteRemove(ctx, sandbox.AppName, sandboxID)
+	}
+
+	ls.logger.Info("sleeping running sandbox", "sandbox_id", sandboxID, "app_name", sandbox.AppName)
+	return nil
+}
+
 // ── RestartSandbox ───────────────────────────────────────────────────
 
 // RestartSandbox creates a restart_sandbox command for a running sandbox.

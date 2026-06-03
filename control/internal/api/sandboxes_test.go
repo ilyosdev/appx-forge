@@ -25,6 +25,7 @@ type mockLifecycle struct {
 	createFn  func(ctx context.Context, req lifecycle.CreateRequest) (*lifecycle.SandboxResult, error)
 	destroyFn func(ctx context.Context, id uuid.UUID) error
 	restartFn func(ctx context.Context, id uuid.UUID) error
+	sleepFn   func(ctx context.Context, id uuid.UUID) error
 }
 
 func (m *mockLifecycle) CreateSandbox(ctx context.Context, req lifecycle.CreateRequest) (*lifecycle.SandboxResult, error) {
@@ -51,6 +52,15 @@ func (m *mockLifecycle) RestartSandbox(ctx context.Context, id uuid.UUID) error 
 // WakeSandbox satisfies the SandboxLifecycle interface (added in b90f6a6).
 // Stub returns nil — no Phase 30 test exercises wake semantics.
 func (m *mockLifecycle) WakeSandbox(ctx context.Context, id uuid.UUID) error {
+	return nil
+}
+
+// SleepSandbox satisfies the SandboxLifecycle interface. Stub returns nil —
+// sleep semantics are exercised at the lifecycle layer, not the handler.
+func (m *mockLifecycle) SleepSandbox(ctx context.Context, id uuid.UUID) error {
+	if m.sleepFn != nil {
+		return m.sleepFn(ctx, id)
+	}
 	return nil
 }
 
