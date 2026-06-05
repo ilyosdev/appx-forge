@@ -22,6 +22,7 @@ type mockRescheduleStore struct {
 	createCommandFn              func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	recordEventFn                func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
 	resetSandboxFailureCountFn   func(ctx context.Context, id pgtype.UUID) error
+	countSchedulableFn           func(ctx context.Context, nodeID pgtype.UUID) (int32, error)
 }
 
 func (m *mockRescheduleStore) ListRunningSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) ([]store.Sandbox, error) {
@@ -71,6 +72,13 @@ func (m *mockRescheduleStore) ResetSandboxFailureCount(ctx context.Context, id p
 		return m.resetSandboxFailureCountFn(ctx, id)
 	}
 	return nil
+}
+
+func (m *mockRescheduleStore) CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	if m.countSchedulableFn != nil {
+		return m.countSchedulableFn(ctx, nodeID)
+	}
+	return 0, nil
 }
 
 // ── Mock RouteNotifier ────────────────────────────────────────────────
@@ -191,6 +199,78 @@ func TestRescheduleNode_TwoRunningSandboxes_BothRescheduled(t *testing.T) {
 		if a.NodeID != makePgUUID(healthyNode1) {
 			t.Fatalf("expected assignment to node with most free RAM, got %v", a.NodeID)
 		}
+	}
+}
+
+// TestRescheduleNode_CountCap_FailoverHoldsViaLiveDBCount proves the cap holds
+// during a failover pass — the path where OOM risk is worst. A failed node's
+// sandboxes are moved sequentially onto a single surviving node that reports
+// running_containers=0 (heartbeat-stale) and abundant free RAM, so neither the
+// stale count nor RAM would ever reject. With the cap at 2 and the DB count
+// rising as each AssignSandboxToNode commits, only 2 sandboxes may land; the
+// rest must transition to FAILED rather than pile on past the ceiling.
+func TestRescheduleNode_CountCap_FailoverHoldsViaLiveDBCount(t *testing.T) {
+	failedNodeID := uuid.New()
+	survivorID := uuid.New()
+
+	// 4 running sandboxes to move; survivor cap is 2.
+	sandboxes := []store.Sandbox{
+		makeRunningSandbox(uuid.New(), failedNodeID, "fo-1"),
+		makeRunningSandbox(uuid.New(), failedNodeID, "fo-2"),
+		makeRunningSandbox(uuid.New(), failedNodeID, "fo-3"),
+		makeRunningSandbox(uuid.New(), failedNodeID, "fo-4"),
+	}
+
+	var liveCount int32 // authoritative DB count on the survivor
+	var assigns []store.AssignSandboxToNodeParams
+	var failedTransitions int
+
+	ms := &mockRescheduleStore{
+		listRunningSandboxesByNodeFn: func(ctx context.Context, nodeID pgtype.UUID) ([]store.Sandbox, error) {
+			return sandboxes, nil
+		},
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			// Single survivor: 0 running per heartbeat, huge free RAM.
+			n := makeNode(survivorID, 64000, 0)
+			n.RunningContainers = 0
+			return []store.Node{n}, nil
+		},
+		countSchedulableFn: func(ctx context.Context, _ pgtype.UUID) (int32, error) {
+			return liveCount, nil
+		},
+		assignSandboxToNodeFn: func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
+			liveCount++ // row committed to survivor — DB count rises mid-pass
+			assigns = append(assigns, arg)
+			return store.Sandbox{State: "starting"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			if arg.State == string(models.StateFailed) {
+				failedTransitions++
+			}
+			return store.Sandbox{State: arg.State}, nil
+		},
+	}
+
+	r := NewRescheduler(ms, &mockRescheduleRouteNotifier{}, nil)
+	r.SetMaxSandboxesPerNode(2)
+
+	result, err := r.RescheduleNode(context.Background(), makePgUUID(failedNodeID))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Exactly 2 should be placed (cap), the other 2 failed — NOT all 4 piled on.
+	if len(assigns) != 2 {
+		t.Fatalf("expected exactly 2 assigns under cap, got %d (cap defeated — OOM risk)", len(assigns))
+	}
+	if result.Count != 2 {
+		t.Fatalf("expected Count=2, got %d", result.Count)
+	}
+	if result.Failed != 2 {
+		t.Fatalf("expected Failed=2 (over-cap rejected), got %d", result.Failed)
+	}
+	if failedTransitions != 2 {
+		t.Fatalf("expected 2 pending->failed transitions, got %d", failedTransitions)
 	}
 }
 

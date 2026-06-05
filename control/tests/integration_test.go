@@ -34,7 +34,8 @@ func discardLogger() *slog.Logger {
 // integrationAdapter bridges store.Queries to the interfaces needed by
 // api.Server and lifecycle.LifecycleService for integration tests.
 type integrationAdapter struct {
-	q *store.Queries
+	q    *store.Queries
+	pool *pgxpool.Pool
 }
 
 // ── api.NodeStore ──────────────────────────────────────────────────────
@@ -117,6 +118,10 @@ func (a *integrationAdapter) CountActiveSandboxesByNode(ctx context.Context, nod
 	return a.q.CountActiveSandboxesByNode(ctx, nodeID)
 }
 
+func (a *integrationAdapter) CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	return a.q.CountSchedulableSandboxesByNode(ctx, nodeID)
+}
+
 // ── api.SandboxReader ──────────────────────────────────────────────────
 
 func (a *integrationAdapter) GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
@@ -169,6 +174,10 @@ func (a *integrationAdapter) ListHealthyNodes(ctx context.Context) ([]store.Node
 
 func (a *integrationAdapter) AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
 	return a.q.AssignSandboxToNode(ctx, arg)
+}
+
+func (a *integrationAdapter) AssignSandboxToNodeUnderCap(ctx context.Context, nodeID, sandboxID pgtype.UUID, cap int32) (bool, store.Sandbox, error) {
+	return store.AssignPendingSandboxUnderCap(ctx, a.pool, nodeID, sandboxID, cap)
 }
 
 func (a *integrationAdapter) TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
@@ -331,7 +340,7 @@ func setupIntegrationServerWithPool(t *testing.T) (string, *store.Queries, *pgxp
 
 	pool := testhelpers.ConnectPool(t, connStr)
 	queries := store.New(pool)
-	adapter := &integrationAdapter{q: queries}
+	adapter := &integrationAdapter{q: queries, pool: pool}
 
 	lc := lifecycle.New(adapter, discardLogger())
 

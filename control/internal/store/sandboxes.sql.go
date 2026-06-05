@@ -56,6 +56,60 @@ func (q *Queries) AssignSandboxToNode(ctx context.Context, arg AssignSandboxToNo
 	return i, err
 }
 
+const assignSandboxToNodeUnderCap = `-- name: AssignSandboxToNodeUnderCap :one
+UPDATE sandboxes AS s
+SET node_id = $1, state = 'starting', updated_at = NOW(), state_version = state_version + 1
+WHERE s.id = $2 AND s.state = 'pending'
+  AND (
+    SELECT count(*) FROM sandboxes s2
+    WHERE s2.node_id = $1
+      AND s2.state IN ('pending', 'starting', 'running', 'restarting', 'destroying')
+  ) < $3::int
+RETURNING s.id, s.app_name, s.user_id, s.node_id, s.container_id, s.host_port, s.image, s.state, s.state_version, s.resources, s.env, s.idle_timeout_seconds, s.created_at, s.updated_at, s.last_active_at, s.failure_count, s.metadata, s.verified_at
+`
+
+type AssignSandboxToNodeUnderCapParams struct {
+	NodeID pgtype.UUID `json:"node_id"`
+	ID     pgtype.UUID `json:"id"`
+	Cap    int32       `json:"cap"`
+}
+
+// Atomic conditional assign for the per-node count cap. Assigns the pending
+// sandbox to the node ONLY IF the node's live schedulable count is strictly
+// below @cap (an INTEGER, the per-node ceiling), measured in the SAME
+// statement's snapshot. The caller MUST hold a per-node advisory lock
+// (pg_advisory_xact_lock) in the enclosing transaction BEFORE running this so
+// concurrent assigns to the same node serialize — without that, two
+// simultaneous creates would each read the same pre-burst count and both pass
+// (the TOCTOU window this guards against). When the node is at/over cap the
+// UPDATE matches zero rows and returns no row (pgx.ErrNoRows), so the caller
+// picks another node or returns ErrNoCapacity.
+func (q *Queries) AssignSandboxToNodeUnderCap(ctx context.Context, arg AssignSandboxToNodeUnderCapParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, assignSandboxToNodeUnderCap, arg.NodeID, arg.ID, arg.Cap)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.AppName,
+		&i.UserID,
+		&i.NodeID,
+		&i.ContainerID,
+		&i.HostPort,
+		&i.Image,
+		&i.State,
+		&i.StateVersion,
+		&i.Resources,
+		&i.Env,
+		&i.IdleTimeoutSeconds,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastActiveAt,
+		&i.FailureCount,
+		&i.Metadata,
+		&i.VerifiedAt,
+	)
+	return i, err
+}
+
 const countSandboxesByState = `-- name: CountSandboxesByState :many
 SELECT state, COUNT(*)::int AS count
 FROM sandboxes

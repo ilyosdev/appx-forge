@@ -33,6 +33,32 @@ SET node_id = $1, host_port = $2, container_id = $3, state = 'starting', updated
 WHERE id = $4 AND state = 'pending'
 RETURNING *;
 
+-- name: AssignSandboxToNodeUnderCap :one
+-- Atomic conditional assign for the per-node count cap. Assigns the pending
+-- sandbox to the node ONLY IF the node's live schedulable count is strictly
+-- below @cap (an INTEGER, the per-node ceiling), measured in the SAME
+-- statement's snapshot. The caller MUST hold a per-node advisory lock
+-- (pg_advisory_xact_lock) in the enclosing transaction BEFORE running this so
+-- concurrent assigns to the same node serialize — without that, two
+-- simultaneous creates would each read the same pre-burst count and both pass
+-- (the TOCTOU window this guards against). When the node is at/over cap the
+-- UPDATE matches zero rows and returns no row (pgx.ErrNoRows), so the caller
+-- picks another node or returns ErrNoCapacity.
+--
+-- NOTE: @cap is a named parameter (sqlc.arg) so the generated binding is a
+-- typed INT field (Cap int32), NOT a UUID. A previous attempt left this as a
+-- bare $3 positional which sqlc mis-bound to the node UUID, producing
+-- "operator does not exist: bigint < uuid" at runtime on every capped assign.
+UPDATE sandboxes AS s
+SET node_id = @node_id, state = 'starting', updated_at = NOW(), state_version = state_version + 1
+WHERE s.id = @id AND s.state = 'pending'
+  AND (
+    SELECT count(*) FROM sandboxes s2
+    WHERE s2.node_id = @node_id
+      AND s2.state IN ('pending', 'starting', 'running', 'restarting', 'destroying')
+  ) < @cap::int
+RETURNING s.*;
+
 -- name: UpdateSandboxLastActive :exec
 UPDATE sandboxes SET last_active_at = NOW() WHERE id = $1;
 

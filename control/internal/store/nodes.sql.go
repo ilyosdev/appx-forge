@@ -23,6 +23,23 @@ func (q *Queries) CountActiveSandboxesByNode(ctx context.Context, nodeID pgtype.
 	return column_1, err
 }
 
+const countSchedulableSandboxesByNode = `-- name: CountSchedulableSandboxesByNode :one
+SELECT count(*)::int FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('pending', 'starting', 'running', 'restarting', 'destroying')
+`
+
+// CountSchedulableSandboxesByNode returns the authoritative count of
+// RAM-consuming sandboxes on a node (excludes terminal destroyed/failed and
+// RAM-freed stopped). Reflects a provision burst synchronously, unlike the
+// heartbeat-derived running_containers column.
+func (q *Queries) CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, countSchedulableSandboxesByNode, nodeID)
+	var column_1 int32
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const createNode = `-- name: CreateNode :one
 INSERT INTO nodes (id, hostname, tailscale_ip, agent_listen_port, capacity_mb, capacity_cpu, agent_version, metadata)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)

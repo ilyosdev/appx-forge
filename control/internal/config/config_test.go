@@ -15,6 +15,7 @@ func TestLoad_AllFieldsParsed(t *testing.T) {
 		"FORGE_LOG_LEVEL":                  "debug",
 		"FORGE_HEARTBEAT_INTERVAL_SECONDS": "30",
 		"FORGE_HEARTBEAT_MISS_THRESHOLD":   "5",
+		"FORGE_MAX_SANDBOXES_PER_NODE":     "120",
 	}
 	for k, v := range envVars {
 		os.Setenv(k, v)
@@ -47,6 +48,9 @@ func TestLoad_AllFieldsParsed(t *testing.T) {
 	if cfg.HeartbeatMissThreshold != 5 {
 		t.Errorf("HeartbeatMissThreshold = %d, want 5", cfg.HeartbeatMissThreshold)
 	}
+	if cfg.MaxSandboxesPerNode != 120 {
+		t.Errorf("MaxSandboxesPerNode = %d, want 120", cfg.MaxSandboxesPerNode)
+	}
 }
 
 func TestLoad_Defaults(t *testing.T) {
@@ -63,6 +67,7 @@ func TestLoad_Defaults(t *testing.T) {
 	os.Unsetenv("FORGE_LOG_LEVEL")
 	os.Unsetenv("FORGE_HEARTBEAT_INTERVAL_SECONDS")
 	os.Unsetenv("FORGE_HEARTBEAT_MISS_THRESHOLD")
+	os.Unsetenv("FORGE_MAX_SANDBOXES_PER_NODE")
 
 	cfg, err := Load()
 	if err != nil {
@@ -80,6 +85,11 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.HeartbeatMissThreshold != 3 {
 		t.Errorf("HeartbeatMissThreshold default = %d, want 3", cfg.HeartbeatMissThreshold)
+	}
+	// Load-bearing OOM backstop: must default to 80 (cap ON). A typo'd tag or
+	// an accidental 0 default would silently disable the cap and go uncaught.
+	if cfg.MaxSandboxesPerNode != 80 {
+		t.Errorf("MaxSandboxesPerNode default = %d, want 80", cfg.MaxSandboxesPerNode)
 	}
 }
 

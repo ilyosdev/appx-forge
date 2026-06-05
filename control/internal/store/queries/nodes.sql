@@ -26,3 +26,15 @@ UPDATE nodes SET agent_token = $1, agent_version = $2, last_seen_at = NOW() WHER
 
 -- name: CountActiveSandboxesByNode :one
 SELECT count(*)::int FROM sandboxes WHERE node_id = $1 AND state NOT IN ('destroyed', 'stopped');
+
+-- name: CountSchedulableSandboxesByNode :one
+-- Authoritative count of sandboxes that currently hold (or are about to hold)
+-- a container's RAM on a node — i.e. RAM-consuming states only. Excludes
+-- terminal states (destroyed, failed) and the RAM-freed stopped/sleeping
+-- state. Used by the scheduler's per-node count cap so the backstop reflects
+-- a provision burst SYNCHRONOUSLY (each CreateSandbox/AssignSandboxToNode is
+-- committed to this table), unlike the heartbeat-derived running_containers
+-- which is only refreshed every ~15s and goes stale during a burst/failover.
+SELECT count(*)::int FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('pending', 'starting', 'running', 'restarting', 'destroying');

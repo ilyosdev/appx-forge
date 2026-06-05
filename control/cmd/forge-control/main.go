@@ -98,9 +98,11 @@ func main() {
 
 	// ── Store + Lifecycle ──────────────────────────────────────────────
 	queries := store.New(pool)
-	adapter := &storeAdapter{q: queries}
+	adapter := &storeAdapter{q: queries, pool: pool}
 
 	lc := lifecycle.New(adapter, logger)
+	lc.SetMaxSandboxesPerNode(cfg.MaxSandboxesPerNode)
+	logger.Info("per-node sandbox count cap configured", "max_sandboxes_per_node", cfg.MaxSandboxesPerNode)
 
 	// Route manager (Caddy proxy integration)
 	caddyClient := routing.NewCaddyClient(cfg.CaddyAdminURL)
@@ -278,6 +280,7 @@ func main() {
 
 	// ── Rescheduler (node failover) ───────────────────────────────────
 	rescheduler := lifecycle.NewRescheduler(adapter, routeManager, logger)
+	rescheduler.SetMaxSandboxesPerNode(cfg.MaxSandboxesPerNode)
 	logger.Info("rescheduler wired")
 
 	// ── Background heartbeat monitor ───────────────────────────────────
@@ -567,6 +570,12 @@ func float64ToNumeric(f float64) pgtype.Numeric {
 //   - lifecycle.IdleReaperStore
 type storeAdapter struct {
 	q *store.Queries
+	// pool is the underlying connection pool, needed for the few operations
+	// that must run inside an explicit transaction (e.g. the advisory-locked
+	// atomic cap-checked assign in AssignSandboxToNodeUnderCap). Always set by
+	// the wiring in main(); unit tests exercise the lifecycle service against a
+	// mock Store instead of this adapter.
+	pool *pgxpool.Pool
 }
 
 // ── NodeStore interface ────────────────────────────────────────────────
@@ -648,6 +657,10 @@ func (a *storeAdapter) CountActiveSandboxesByNode(ctx context.Context, nodeID pg
 	return a.q.CountActiveSandboxesByNode(ctx, nodeID)
 }
 
+func (a *storeAdapter) CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	return a.q.CountSchedulableSandboxesByNode(ctx, nodeID)
+}
+
 // ── SandboxReader interface ────────────────────────────────────────────
 
 func (a *storeAdapter) GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
@@ -722,6 +735,16 @@ func (a *storeAdapter) ListHealthyNodes(ctx context.Context) ([]store.Node, erro
 
 func (a *storeAdapter) AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error) {
 	return a.q.AssignSandboxToNode(ctx, arg)
+}
+
+// AssignSandboxToNodeUnderCap atomically assigns a pending sandbox to a node
+// only if the node's live schedulable count is strictly below cap, closing the
+// concurrent-create overshoot window. Delegates to the store-level helper which
+// runs the advisory-locked, cap-checked conditional assign in one transaction
+// (see store.AssignPendingSandboxUnderCap). Returns assigned=false (nil error)
+// when the node is at/over cap.
+func (a *storeAdapter) AssignSandboxToNodeUnderCap(ctx context.Context, nodeID, sandboxID pgtype.UUID, cap int32) (bool, store.Sandbox, error) {
+	return store.AssignPendingSandboxUnderCap(ctx, a.pool, nodeID, sandboxID, cap)
 }
 
 func (a *storeAdapter) TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {

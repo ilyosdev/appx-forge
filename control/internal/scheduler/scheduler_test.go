@@ -18,7 +18,7 @@ func TestSchedule_PicksMostFreeRAM(t *testing.T) {
 		{ID: node3, CapacityMB: 6000, UsedMB: 3000, Status: "healthy"},
 	}
 
-	got, err := Schedule(candidates, 512)
+	got, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestSchedule_ExcludesDrainingNodes(t *testing.T) {
 		{ID: healthy2, CapacityMB: 6000, UsedMB: 3000, Status: "healthy"},
 	}
 
-	got, err := Schedule(candidates, 512)
+	got, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestSchedule_ExcludesUnhealthyNodes(t *testing.T) {
 		{ID: healthy2, CapacityMB: 8000, UsedMB: 5000, Status: "healthy"},
 	}
 
-	got, err := Schedule(candidates, 256)
+	got, err := Schedule(candidates, 256, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestSchedule_ExcludesRemovedNodes(t *testing.T) {
 		{ID: healthy, CapacityMB: 4000, UsedMB: 2000, Status: "healthy"},
 	}
 
-	got, err := Schedule(candidates, 256)
+	got, err := Schedule(candidates, 256, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -90,12 +90,12 @@ func TestSchedule_ExcludesRemovedNodes(t *testing.T) {
 
 func TestSchedule_ErrNoNodes(t *testing.T) {
 	// No nodes at all (empty slice) -> ErrNoNodes
-	_, err := Schedule(nil, 512)
+	_, err := Schedule(nil, 512, 0)
 	if err != ErrNoNodes {
 		t.Errorf("want ErrNoNodes, got %v", err)
 	}
 
-	_, err = Schedule([]NodeCandidate{}, 512)
+	_, err = Schedule([]NodeCandidate{}, 512, 0)
 	if err != ErrNoNodes {
 		t.Errorf("want ErrNoNodes for empty slice, got %v", err)
 	}
@@ -111,7 +111,7 @@ func TestSchedule_ErrNoCapacity(t *testing.T) {
 		{ID: node2, CapacityMB: 4000, UsedMB: 3900, Status: "healthy"},
 	}
 
-	_, err := Schedule(candidates, 512)
+	_, err := Schedule(candidates, 512, 0)
 	if err != ErrNoCapacity {
 		t.Errorf("want ErrNoCapacity, got %v", err)
 	}
@@ -125,7 +125,7 @@ func TestSchedule_ErrNoCapacity_AllExcluded(t *testing.T) {
 		{ID: uuid.New(), CapacityMB: 8000, UsedMB: 0, Status: "removed"},
 	}
 
-	_, err := Schedule(candidates, 256)
+	_, err := Schedule(candidates, 256, 0)
 	if err != ErrNoCapacity {
 		t.Errorf("want ErrNoCapacity when all nodes excluded, got %v", err)
 	}
@@ -139,7 +139,7 @@ func TestSchedule_ExactFit(t *testing.T) {
 		{ID: node, CapacityMB: 2000, UsedMB: 1488, Status: "healthy"},
 	}
 
-	got, err := Schedule(candidates, 512)
+	got, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestSchedule_DeterministicTiebreak(t *testing.T) {
 		{ID: second, CapacityMB: 4000, UsedMB: 2000, Status: "healthy"},
 	}
 
-	got, err := Schedule(candidates, 512)
+	got, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestSchedule_DistributesAcrossMultipleNodes(t *testing.T) {
 	}
 
 	// First schedule: picks node1 (most free: 6000)
-	got1, err := Schedule(candidates, 512)
+	got1, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("schedule 1: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestSchedule_DistributesAcrossMultipleNodes(t *testing.T) {
 	candidates[0].UsedMB = 2512 // 5488 free now
 
 	// Second schedule: picks node2 (5500 free > 5488 > 5000)
-	got2, err := Schedule(candidates, 512)
+	got2, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("schedule 2: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestSchedule_DistributesAcrossMultipleNodes(t *testing.T) {
 	candidates[1].UsedMB = 3012 // 4988 free now
 
 	// Third schedule: picks node1 (5488 free > 5000 > 4988)
-	got3, err := Schedule(candidates, 512)
+	got3, err := Schedule(candidates, 512, 0)
 	if err != nil {
 		t.Fatalf("schedule 3: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestSchedule_NeverOverloadsOneNode(t *testing.T) {
 
 	placements := make(map[uuid.UUID]int)
 	for i := 0; i < 5; i++ {
-		got, err := Schedule(candidates, 256)
+		got, err := Schedule(candidates, 256, 0)
 		if err != nil {
 			t.Fatalf("schedule %d: %v", i, err)
 		}
@@ -265,5 +265,101 @@ func TestSchedule_NeverOverloadsOneNode(t *testing.T) {
 		if count == 5 {
 			t.Errorf("node %v received all 5 sandboxes -- scheduler should distribute", id)
 		}
+	}
+}
+
+func TestSchedule_CountCap_RejectsNodeAtCap(t *testing.T) {
+	// Single healthy node with abundant free RAM but already at the count cap.
+	// The cap must reject it even though RAM accounting says it fits — this is
+	// the OOM backstop when the memory collector under-reports usage.
+	node := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: node, CapacityMB: 64000, UsedMB: 0, RunningSandboxes: 80, Status: "healthy"},
+	}
+
+	_, err := Schedule(candidates, 512, 80)
+	if err != ErrNoCapacity {
+		t.Errorf("want ErrNoCapacity when node at count cap, got %v", err)
+	}
+}
+
+func TestSchedule_CountCap_RejectsNodeOverCap(t *testing.T) {
+	// Node reporting more sandboxes than the cap (e.g. cap lowered after a
+	// burst) must still be rejected.
+	node := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: node, CapacityMB: 64000, UsedMB: 0, RunningSandboxes: 95, Status: "healthy"},
+	}
+
+	_, err := Schedule(candidates, 512, 80)
+	if err != ErrNoCapacity {
+		t.Errorf("want ErrNoCapacity when node over count cap, got %v", err)
+	}
+}
+
+func TestSchedule_CountCap_AllowsNodeUnderCap(t *testing.T) {
+	// Node one below the cap must still be schedulable.
+	node := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: node, CapacityMB: 64000, UsedMB: 0, RunningSandboxes: 79, Status: "healthy"},
+	}
+
+	got, err := Schedule(candidates, 512, 80)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != node {
+		t.Errorf("want node under cap to be selected, got %v", got)
+	}
+}
+
+func TestSchedule_CountCap_SkipsCappedNodePicksAnother(t *testing.T) {
+	// Capped node has the most free RAM, but a second node under the cap with
+	// less free RAM must win. Proves the cap is applied before the best-fit
+	// RAM ranking, not after.
+	capped := uuid.New()
+	available := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: capped, CapacityMB: 64000, UsedMB: 0, RunningSandboxes: 80, Status: "healthy"},    // most free RAM, but at cap
+		{ID: available, CapacityMB: 8000, UsedMB: 4000, RunningSandboxes: 10, Status: "healthy"}, // less free RAM, under cap
+	}
+
+	got, err := Schedule(candidates, 512, 80)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != available {
+		t.Errorf("want under-cap node despite less free RAM, got %v", got)
+	}
+}
+
+func TestSchedule_CountCap_Disabled(t *testing.T) {
+	// maxSandboxesPerNode <= 0 disables the cap: a node far over any sane
+	// count is still schedulable (backwards-compat / opt-out behavior).
+	node := uuid.New()
+
+	candidates := []NodeCandidate{
+		{ID: node, CapacityMB: 64000, UsedMB: 0, RunningSandboxes: 1000, Status: "healthy"},
+	}
+
+	got, err := Schedule(candidates, 512, 0)
+	if err != nil {
+		t.Fatalf("unexpected error with cap disabled: %v", err)
+	}
+	if got != node {
+		t.Errorf("want node selected with cap disabled, got %v", got)
+	}
+
+	// Negative cap also disables.
+	got, err = Schedule(candidates, 512, -1)
+	if err != nil {
+		t.Fatalf("unexpected error with negative cap: %v", err)
+	}
+	if got != node {
+		t.Errorf("want node selected with negative cap, got %v", got)
 	}
 }

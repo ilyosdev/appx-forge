@@ -19,19 +19,21 @@ import (
 // ── Mock Store ───────────────────────────────────────────────────────
 
 type mockStore struct {
-	createSandboxFn         func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
-	deleteSandboxFn         func(ctx context.Context, id pgtype.UUID) error
-	getSandboxFn            func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
-	getSandboxByAppNameFn   func(ctx context.Context, appName string) (store.Sandbox, error)
-	listHealthyNodesFn      func(ctx context.Context) ([]store.Node, error)
-	assignSandboxFn         func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
-	transitionStateFn       func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
-	updateSandboxRuntimeFn  func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
-	createCommandFn         func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
-	ackCommandFn            func(ctx context.Context, arg store.AckCommandParams) error
-	recordEventFn           func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
-	getNodeByIDFn           func(ctx context.Context, id pgtype.UUID) (store.Node, error)
+	createSandboxFn            func(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error)
+	deleteSandboxFn            func(ctx context.Context, id pgtype.UUID) error
+	getSandboxFn               func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
+	getSandboxByAppNameFn      func(ctx context.Context, appName string) (store.Sandbox, error)
+	listHealthyNodesFn         func(ctx context.Context) ([]store.Node, error)
+	assignSandboxFn            func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
+	transitionStateFn          func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
+	updateSandboxRuntimeFn     func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
+	createCommandFn            func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
+	ackCommandFn               func(ctx context.Context, arg store.AckCommandParams) error
+	recordEventFn              func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+	getNodeByIDFn              func(ctx context.Context, id pgtype.UUID) (store.Node, error)
 	deleteCommandsForSandboxFn func(ctx context.Context, sandboxID pgtype.UUID) error
+	countSchedulableFn         func(ctx context.Context, nodeID pgtype.UUID) (int32, error)
+	assignUnderCapFn           func(ctx context.Context, nodeID, sandboxID pgtype.UUID, cap int32) (bool, store.Sandbox, error)
 }
 
 func (m *mockStore) CreateSandbox(ctx context.Context, arg store.CreateSandboxParams) (store.Sandbox, error) {
@@ -126,6 +128,22 @@ func (m *mockStore) GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node
 		return m.getNodeByIDFn(ctx, id)
 	}
 	return store.Node{}, errors.New("not found")
+}
+
+func (m *mockStore) CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
+	if m.countSchedulableFn != nil {
+		return m.countSchedulableFn(ctx, nodeID)
+	}
+	return 0, nil
+}
+
+func (m *mockStore) AssignSandboxToNodeUnderCap(ctx context.Context, nodeID, sandboxID pgtype.UUID, cap int32) (bool, store.Sandbox, error) {
+	if m.assignUnderCapFn != nil {
+		return m.assignUnderCapFn(ctx, nodeID, sandboxID, cap)
+	}
+	// Default: behave like the real query with no contention — assign and
+	// return the starting row (cap never exceeded in the default path).
+	return true, store.Sandbox{ID: sandboxID, State: "starting", NodeID: nodeID}, nil
 }
 
 // ── Test Helpers ─────────────────────────────────────────────────────
@@ -226,6 +244,199 @@ func TestCreateSandbox_HappyPath(t *testing.T) {
 	}
 }
 
+// TestCreateSandbox_CountCap_SequentialUsesLiveDBCount proves the per-node cap
+// holds across SEQUENTIAL creates even when the heartbeat count is stale. The
+// single node reports running_containers=0 from the heartbeat AND has abundant
+// free RAM — so the heartbeat-derived cap would NEVER trip. The fix sources the
+// count from the authoritative DB count (checked atomically inside the
+// conditional assign), which rises as each create assigns a row. With the cap
+// at 3, the 4th create must be rejected.
+//
+// NOTE: this test exercises the SERIAL/heartbeat-staleness path only — each
+// create fully completes before the next begins, so it does NOT cover the
+// concurrent-burst race. That is covered by
+// TestCreateSandbox_CountCap_ConcurrentBurstHoldsCap below, which fires creates
+// in parallel against a mutex-guarded model of the atomic advisory-locked
+// assign.
+func TestCreateSandbox_CountCap_SequentialUsesLiveDBCount(t *testing.T) {
+	nodeID := uuid.New()
+
+	// liveCount models the DB's authoritative non-terminal sandbox count for
+	// the node — it does NOT depend on the heartbeat. The atomic conditional
+	// assign both checks it against the cap and increments it on success,
+	// exactly as the real advisory-locked UPDATE ... WHERE (count) < cap does.
+	var liveCount int32
+
+	ms := &mockStore{
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			// Heartbeat says 0 running and tons of free RAM — neither the
+			// stale count nor the RAM check would ever reject. Only the
+			// DB-derived count cap can.
+			n := makeNode(nodeID, 64000, 0)
+			n.RunningContainers = 0
+			return []store.Node{n}, nil
+		},
+		countSchedulableFn: func(ctx context.Context, _ pgtype.UUID) (int32, error) {
+			return liveCount, nil
+		},
+		assignUnderCapFn: func(ctx context.Context, nID, sID pgtype.UUID, cap int32) (bool, store.Sandbox, error) {
+			if liveCount >= cap {
+				return false, store.Sandbox{}, nil // node at/over cap
+			}
+			liveCount++ // row committed to the node
+			return true, store.Sandbox{ID: sID, State: "starting", NodeID: nID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	svc.SetMaxSandboxesPerNode(3)
+
+	// First 3 creates must succeed.
+	for i := 0; i < 3; i++ {
+		_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+			AppName:   "burst-app",
+			UserID:    "user-1",
+			Image:     "appx/sandbox:v1",
+			Resources: Resources{MemoryMB: 512},
+		})
+		if err != nil {
+			t.Fatalf("create %d should succeed under cap (live count rising), got %v", i, err)
+		}
+	}
+
+	// 4th create: DB count is now 3 == cap. Must be rejected even though the
+	// heartbeat still reports 0 running and RAM is plentiful.
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName:   "burst-app",
+		UserID:    "user-1",
+		Image:     "appx/sandbox:v1",
+		Resources: Resources{MemoryMB: 512},
+	})
+	if err != ErrNoCapacity {
+		t.Fatalf("4th create should be rejected with ErrNoCapacity at cap, got %v", err)
+	}
+}
+
+// TestCreateSandbox_CountCap_ConcurrentBurstHoldsCap proves the per-node cap
+// holds under a genuinely CONCURRENT provision burst — the exact TOCTOU window
+// the plain check-then-act count cap leaves open (N goroutines each read
+// count=cap-1 before any assigns, all pass, all overshoot).
+//
+// The mock models the real defense: the atomic advisory-locked assign
+// (storeAdapter.AssignSandboxToNodeUnderCap) serializes the count→assign per
+// node and re-checks the live count under that lock. Here a sync.Mutex stands
+// in for the per-node advisory lock + the conditional UPDATE's same-snapshot
+// recount. With the cap at 5 and 50 concurrent creates, EXACTLY 5 must be
+// admitted and the rest rejected with ErrNoCapacity — never an overshoot. Run
+// under `go test -race` to catch any unsynchronised access.
+func TestCreateSandbox_CountCap_ConcurrentBurstHoldsCap(t *testing.T) {
+	const cap = 5
+	const creates = 50
+
+	nodeID := uuid.New()
+
+	var mu sync.Mutex // models the per-node advisory lock
+	var liveCount int32
+
+	ms := &mockStore{
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			// Heartbeat is stale (0 running) and RAM is plentiful, so only the
+			// atomic cap re-check can prevent overshoot.
+			n := makeNode(nodeID, 256000, 0)
+			n.RunningContainers = 0
+			return []store.Node{n}, nil
+		},
+		countSchedulableFn: func(ctx context.Context, _ pgtype.UUID) (int32, error) {
+			// Best-effort pre-check count used only to build candidates; the
+			// authoritative decision is made atomically in assignUnderCapFn.
+			mu.Lock()
+			defer mu.Unlock()
+			return liveCount, nil
+		},
+		assignUnderCapFn: func(ctx context.Context, nID, sID pgtype.UUID, c int32) (bool, store.Sandbox, error) {
+			// Critical section = advisory lock held across recount + assign.
+			mu.Lock()
+			defer mu.Unlock()
+			if liveCount >= c {
+				return false, store.Sandbox{}, nil
+			}
+			liveCount++
+			return true, store.Sandbox{ID: sID, State: "starting", NodeID: nID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	svc.SetMaxSandboxesPerNode(cap)
+
+	var (
+		wg        sync.WaitGroup
+		successes int32
+		resultMu  sync.Mutex
+	)
+	for i := 0; i < creates; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+				AppName:   "burst-app",
+				UserID:    "user-1",
+				Image:     "appx/sandbox:v1",
+				Resources: Resources{MemoryMB: 512},
+			})
+			if err == nil {
+				resultMu.Lock()
+				successes++
+				resultMu.Unlock()
+			} else if err != ErrNoCapacity {
+				t.Errorf("unexpected error from concurrent create: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if successes != cap {
+		t.Fatalf("cap overshoot/undershoot: admitted %d, want exactly %d", successes, cap)
+	}
+	mu.Lock()
+	final := liveCount
+	mu.Unlock()
+	if final != cap {
+		t.Fatalf("live count after burst = %d, want %d (cap must hold)", final, cap)
+	}
+}
+
+// TestCreateSandbox_CountCap_DisabledSkipsDBCount proves that when the cap is
+// off (the default for a freshly-constructed service), CreateSandbox does NOT
+// query the authoritative count at all — no extra DB round-trip on the hot path.
+func TestCreateSandbox_CountCap_DisabledSkipsDBCount(t *testing.T) {
+	nodeID := uuid.New()
+	countCalled := false
+
+	ms := &mockStore{
+		listHealthyNodesFn: func(ctx context.Context) ([]store.Node, error) {
+			return []store.Node{makeNode(nodeID, 24000, 0)}, nil
+		},
+		countSchedulableFn: func(ctx context.Context, _ pgtype.UUID) (int32, error) {
+			countCalled = true
+			return 0, nil
+		},
+	}
+
+	svc := New(ms, nil) // cap defaults to 0 (off)
+	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
+		AppName:   "no-cap-app",
+		UserID:    "user-1",
+		Image:     "appx/sandbox:v1",
+		Resources: Resources{MemoryMB: 512},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if countCalled {
+		t.Error("CountSchedulableSandboxesByNode must NOT be called when cap is disabled")
+	}
+}
+
 func TestCreateSandbox_DuplicateAppName(t *testing.T) {
 	// Primary rejection path: pre-check sees an existing row in an active state (running).
 	existingID := makePgUUID(uuid.New())
@@ -312,9 +523,9 @@ func TestCreateSandbox_RecyclesDestroyed(t *testing.T) {
 
 	svc := New(ms, nil)
 	result, err := svc.CreateSandbox(context.Background(), CreateRequest{
-		AppName: "recycled-app",
-		UserID:  "user-123",
-		Image:   "appx/sandbox:v1",
+		AppName:   "recycled-app",
+		UserID:    "user-123",
+		Image:     "appx/sandbox:v1",
 		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
 	})
 
@@ -374,9 +585,9 @@ func TestCreateSandbox_RecyclesFailed(t *testing.T) {
 
 	svc := New(ms, nil)
 	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
-		AppName: "failed-app",
-		UserID:  "user-123",
-		Image:   "appx/sandbox:v1",
+		AppName:   "failed-app",
+		UserID:    "user-123",
+		Image:     "appx/sandbox:v1",
 		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
 	})
 
@@ -472,9 +683,9 @@ func TestCreateSandbox_NoPriorRow_HappyPath(t *testing.T) {
 
 	svc := New(ms, nil)
 	_, err := svc.CreateSandbox(context.Background(), CreateRequest{
-		AppName: "fresh-app",
-		UserID:  "user-123",
-		Image:   "appx/sandbox:v1",
+		AppName:   "fresh-app",
+		UserID:    "user-123",
+		Image:     "appx/sandbox:v1",
 		Resources: Resources{CPUCores: 0.5, MemoryMB: 512},
 	})
 

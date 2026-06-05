@@ -20,6 +20,15 @@ type Config struct {
 	IdleReaperIntervalSeconds    int `envconfig:"FORGE_IDLE_REAPER_INTERVAL_SECONDS" default:"60"`
 	DriftDetectorIntervalSeconds int `envconfig:"FORGE_DRIFT_DETECTOR_INTERVAL_SECONDS" default:"60"`
 
+	// Hard per-node sandbox count cap enforced by the scheduler. A node
+	// already running at or above this many sandboxes is rejected for new
+	// placements regardless of its (possibly under-reported) free RAM. This
+	// is a backstop against OOMing a node during a provision burst — the
+	// agent memory collector currently reports 0 used, so RAM admission
+	// control is effectively off. Default 80 matches the Server 2 RAM
+	// ceiling (~23.5GB / ~512MB per sandbox). Set to 0 to disable the cap.
+	MaxSandboxesPerNode int32 `envconfig:"FORGE_MAX_SANDBOXES_PER_NODE" default:"80"`
+
 	// Phase 30 — read-through freshness threshold. A row is considered
 	// fresh if verified_at is within this window; older rows trigger a
 	// synchronous agent.ContainerExists call.

@@ -18,6 +18,12 @@ import (
 type RescheduleStore interface {
 	ListRunningSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) ([]store.Sandbox, error)
 	ListHealthyNodes(ctx context.Context) ([]store.Node, error)
+	// CountSchedulableSandboxesByNode returns the authoritative live count of
+	// RAM-consuming sandboxes on a node. During a failover pass the
+	// rescheduler assigns sandboxes sequentially; this DB-derived count ticks
+	// up as each AssignSandboxToNode commits, so the cap holds before OOM
+	// even though running_containers is heartbeat-stale.
+	CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error)
 	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
 	AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
@@ -43,6 +49,10 @@ type Rescheduler struct {
 	store    RescheduleStore
 	notifier RouteNotifier
 	logger   *slog.Logger
+	// maxSandboxesPerNode is the hard per-node count cap passed to the
+	// scheduler. 0 (the zero value) disables the cap. Set via
+	// SetMaxSandboxesPerNode after construction.
+	maxSandboxesPerNode int32
 }
 
 // NewRescheduler creates a new Rescheduler.
@@ -51,6 +61,13 @@ func NewRescheduler(s RescheduleStore, notifier RouteNotifier, logger *slog.Logg
 		logger = slog.Default()
 	}
 	return &Rescheduler{store: s, notifier: notifier, logger: logger}
+}
+
+// SetMaxSandboxesPerNode sets the hard per-node sandbox count cap enforced
+// during reschedule placement. A value <= 0 disables the cap. Optional —
+// when unset, the cap is off (backwards compat).
+func (r *Rescheduler) SetMaxSandboxesPerNode(max int32) {
+	r.maxSandboxesPerNode = max
 }
 
 // RescheduleNode moves all RUNNING sandboxes on the failed node to healthy nodes.
@@ -160,11 +177,25 @@ func (r *Rescheduler) rescheduleSandbox(ctx context.Context, sandbox store.Sandb
 
 	candidates := make([]scheduler.NodeCandidate, len(nodes))
 	for i, n := range nodes {
+		nodeID := uuid.UUID(n.ID.Bytes)
+		runningSandboxes := n.RunningContainers
+		if r.maxSandboxesPerNode > 0 {
+			cnt, cntErr := r.store.CountSchedulableSandboxesByNode(ctx, n.ID)
+			if cntErr != nil {
+				// Fail safe: fall back to the heartbeat count rather than
+				// admitting blindly when the authoritative count is unavailable.
+				r.logger.Warn("count schedulable sandboxes failed; using heartbeat count for cap",
+					"error", cntErr, "node_id", nodeID.String())
+			} else {
+				runningSandboxes = cnt
+			}
+		}
 		candidates[i] = scheduler.NodeCandidate{
-			ID:         uuid.UUID(n.ID.Bytes),
-			CapacityMB: n.CapacityMb,
-			UsedMB:     n.UsedMb,
-			Status:     n.Status,
+			ID:               nodeID,
+			CapacityMB:       n.CapacityMb,
+			UsedMB:           n.UsedMb,
+			RunningSandboxes: runningSandboxes,
+			Status:           n.Status,
 		}
 	}
 
@@ -175,7 +206,7 @@ func (r *Rescheduler) rescheduleSandbox(ctx context.Context, sandbox store.Sandb
 		requiredMB = res.MemoryMB
 	}
 
-	selectedNodeID, err := scheduler.Schedule(candidates, requiredMB)
+	selectedNodeID, err := scheduler.Schedule(candidates, requiredMB, r.maxSandboxesPerNode)
 	if err != nil {
 		// 6. No capacity: transition sandbox to FAILED
 		r.logger.Warn("no capacity for rescheduled sandbox, transitioning to failed",

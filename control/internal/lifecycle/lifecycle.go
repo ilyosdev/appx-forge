@@ -46,7 +46,20 @@ type Store interface {
 	GetSandboxByAppName(ctx context.Context, appName string) (store.Sandbox, error)
 	GetNodeByID(ctx context.Context, id pgtype.UUID) (store.Node, error)
 	ListHealthyNodes(ctx context.Context) ([]store.Node, error)
+	// CountSchedulableSandboxesByNode returns the authoritative live count of
+	// RAM-consuming sandboxes on a node (DB-derived, reflects a provision
+	// burst synchronously — unlike the heartbeat-stale running_containers).
+	CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error)
 	AssignSandboxToNode(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
+	// AssignSandboxToNodeUnderCap atomically assigns a pending sandbox to a
+	// node ONLY IF the node's live schedulable count is strictly below cap,
+	// serializing concurrent assigns to the SAME node via a per-node advisory
+	// lock held across the count→assign in one transaction. This closes the
+	// concurrent-create TOCTOU window the plain count cap leaves open: without
+	// it, N simultaneous creates can each read count=cap-1 and all assign,
+	// overshooting by up to N-1. Returns assigned=false (nil error) when the
+	// node is at/over cap so the caller falls back to another node.
+	AssignSandboxToNodeUnderCap(ctx context.Context, nodeID, sandboxID pgtype.UUID, cap int32) (assigned bool, sb store.Sandbox, err error)
 	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
 	UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
@@ -159,6 +172,10 @@ type LifecycleService struct {
 	routeNotifier   RouteNotifier
 	webhookNotifier StateWebhookNotifier
 	restartMgr      *RestartManager
+	// maxSandboxesPerNode is the hard per-node count cap passed to the
+	// scheduler. 0 (the zero value) disables the cap. Set via
+	// SetMaxSandboxesPerNode after construction.
+	maxSandboxesPerNode int32
 }
 
 // New creates a new LifecycleService.
@@ -173,6 +190,13 @@ func New(s Store, logger *slog.Logger) *LifecycleService {
 // This avoids widening the New() signature for optional dependencies.
 func (ls *LifecycleService) SetRouteNotifier(rn RouteNotifier) {
 	ls.routeNotifier = rn
+}
+
+// SetMaxSandboxesPerNode sets the hard per-node sandbox count cap enforced
+// during scheduling. A value <= 0 disables the cap. Optional — when unset,
+// the cap is off (backwards compat).
+func (ls *LifecycleService) SetMaxSandboxesPerNode(max int32) {
+	ls.maxSandboxesPerNode = max
 }
 
 // SetStateWebhookNotifier injects the Phase 33-B state-change webhook
@@ -465,14 +489,35 @@ func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest
 		return nil, fmt.Errorf("list healthy nodes: %w", err)
 	}
 
-	// Convert to scheduler candidates
+	// Convert to scheduler candidates. When the count cap is enabled, source
+	// RunningSandboxes from an authoritative DB count (committed by every
+	// CreateSandbox/AssignSandboxToNode) rather than the heartbeat-derived
+	// running_containers column, which is only refreshed every ~15s and so
+	// reads stale during a provision burst — the exact window this cap
+	// defends against. The DB count rises immediately as each row is
+	// assigned, so the cap actually trips mid-burst (and drops immediately
+	// on destroy/reap, avoiding spurious under-admission).
 	candidates := make([]scheduler.NodeCandidate, len(nodes))
 	for i, n := range nodes {
+		nodeID := uuid.UUID(n.ID.Bytes)
+		runningSandboxes := n.RunningContainers
+		if ls.maxSandboxesPerNode > 0 {
+			cnt, cntErr := ls.store.CountSchedulableSandboxesByNode(ctx, n.ID)
+			if cntErr != nil {
+				// Fail safe: if the authoritative count is unavailable, fall
+				// back to the heartbeat count rather than admitting blindly.
+				ls.logger.Warn("count schedulable sandboxes failed; using heartbeat count for cap",
+					"error", cntErr, "node_id", nodeID.String())
+			} else {
+				runningSandboxes = cnt
+			}
+		}
 		candidates[i] = scheduler.NodeCandidate{
-			ID:         uuid.UUID(n.ID.Bytes),
-			CapacityMB: n.CapacityMb,
-			UsedMB:     n.UsedMb,
-			Status:     n.Status,
+			ID:               nodeID,
+			CapacityMB:       n.CapacityMb,
+			UsedMB:           n.UsedMb,
+			RunningSandboxes: runningSandboxes,
+			Status:           n.Status,
 		}
 	}
 
@@ -481,21 +526,66 @@ func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest
 		requiredMB = 512
 	}
 
-	selectedNodeID, err := scheduler.Schedule(candidates, requiredMB)
-	if err != nil {
-		return nil, ErrNoCapacity
+	// Schedule + assign. The plain count cap (above, in candidate construction)
+	// only closes the SERIAL/heartbeat-stale window: between Schedule reading
+	// the count and AssignSandboxToNode committing, a CONCURRENT create (one
+	// goroutine per HTTP request) can read the same pre-burst count and also
+	// pass, overshooting the cap by up to N-1.
+	//
+	// When the cap is enabled we close that window with an ATOMIC conditional
+	// assign that re-checks the live count under a per-node advisory lock in
+	// one transaction (AssignSandboxToNodeUnderCap). If we lose the race (the
+	// node filled up since Schedule picked it), assigned=false comes back; we
+	// drop that node from the candidate set and re-Schedule, bounded by the
+	// number of candidates. When the cap is disabled, the plain unconditional
+	// assign is used (no extra DB work on the hot path).
+	var (
+		selectedNodeID uuid.UUID
+		assigned       store.Sandbox
+	)
+	if ls.maxSandboxesPerNode > 0 {
+		remaining := candidates
+		for {
+			nodeID, schedErr := scheduler.Schedule(remaining, requiredMB, ls.maxSandboxesPerNode)
+			if schedErr != nil {
+				return nil, ErrNoCapacity
+			}
+			pgCandidate := pgtype.UUID{Bytes: nodeID, Valid: true}
+			ok, sb, assignErr := ls.store.AssignSandboxToNodeUnderCap(ctx, pgCandidate, pgID, ls.maxSandboxesPerNode)
+			if assignErr != nil {
+				return nil, fmt.Errorf("assign sandbox to node: %w", assignErr)
+			}
+			if ok {
+				selectedNodeID = nodeID
+				assigned = sb
+				break
+			}
+			// Lost the cap race on this node — it filled up concurrently.
+			// Remove it from the candidate set and try the next-best node.
+			ls.logger.Info("node hit per-node cap mid-burst; trying next candidate",
+				"node_id", nodeID.String(), "cap", ls.maxSandboxesPerNode, "app_name", req.AppName)
+			remaining = dropCandidate(remaining, nodeID)
+			if len(remaining) == 0 {
+				return nil, ErrNoCapacity
+			}
+		}
+	} else {
+		nodeID, schedErr := scheduler.Schedule(candidates, requiredMB, ls.maxSandboxesPerNode)
+		if schedErr != nil {
+			return nil, ErrNoCapacity
+		}
+		selectedNodeID = nodeID
+		sb, assignErr := ls.store.AssignSandboxToNode(ctx, store.AssignSandboxToNodeParams{
+			NodeID: pgtype.UUID{Bytes: nodeID, Valid: true},
+			ID:     pgID,
+		})
+		if assignErr != nil {
+			return nil, fmt.Errorf("assign sandbox to node: %w", assignErr)
+		}
+		assigned = sb
 	}
 
 	pgNodeID := pgtype.UUID{Bytes: selectedNodeID, Valid: true}
-
-	// Assign sandbox to node (transitions pending -> starting)
-	assigned, err := ls.store.AssignSandboxToNode(ctx, store.AssignSandboxToNodeParams{
-		NodeID: pgNodeID,
-		ID:     pgID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("assign sandbox to node: %w", err)
-	}
 
 	// Create start_sandbox command
 	cmdPayload, err := json.Marshal(map[string]interface{}{
@@ -545,6 +635,20 @@ func (ls *LifecycleService) CreateSandbox(ctx context.Context, req CreateRequest
 		NodeID:  &nodeIDVal,
 		Image:   req.Image,
 	}, nil
+}
+
+// dropCandidate returns a new slice with the node matching id removed. Used by
+// CreateSandbox to retry scheduling on the next-best node when the atomic
+// conditional assign loses the per-node cap race (the chosen node filled up
+// concurrently mid-burst).
+func dropCandidate(candidates []scheduler.NodeCandidate, id uuid.UUID) []scheduler.NodeCandidate {
+	out := make([]scheduler.NodeCandidate, 0, len(candidates))
+	for _, c := range candidates {
+		if c.ID != id {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // ── HandleAck ────────────────────────────────────────────────────────
