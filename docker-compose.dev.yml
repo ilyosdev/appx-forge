@@ -54,6 +54,8 @@ services:
   #     FORGE_HOSTNAME: "dev-node-1"
   #     FORGE_TAILSCALE_IP: "100.64.0.1"
   #     FORGE_CAPACITY_MB: "8000"
+  #     FORGE_API_TOKEN: "dev-token-change-me"
+  #     FORGE_HMAC_SECRET: "dev-hmac-secret-change-me"
   #   depends_on:
   #     forge-control:
   #       condition: service_started

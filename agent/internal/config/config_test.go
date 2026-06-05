@@ -22,6 +22,7 @@ func requiredEnv() map[string]string {
 		"FORGE_HOSTNAME":    "node-1",
 		"FORGE_HMAC_SECRET": "test-secret-key",
 		"FORGE_CAPACITY_MB": "8000",
+		"FORGE_API_TOKEN":   "test-token",
 	}
 }
 
