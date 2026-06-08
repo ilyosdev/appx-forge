@@ -321,10 +321,28 @@ type dockerResourceCollector struct {
 	logger *slog.Logger
 }
 
-// Collect returns current memory usage (placeholder) and running container count.
+// Collect returns current host memory usage in MB for the control-plane
+// scheduler (free = CapacityMB - UsedMB). The runningContainers return is
+// always 0 here: the heartbeat sender derives the authoritative running count
+// from its per-tick container snapshot and ignores this value (see
+// health.HeartbeatSender.sendHeartbeat), so paying for a second Docker
+// round-trip here would be wasted.
+//
+// Memory is read from /proc/meminfo as MemTotal - MemAvailable — whole-host
+// pressure including the OS, dockerd, the agent, and every sandbox (Metro
+// included). Reported against a node CapacityMB ≈ physical RAM, this gives a
+// conservative, OOM-safe admission signal.
+//
+// Fail-open: any read/parse error reports usedMB=0, which makes the scheduler
+// see full free RAM and fall back to the per-node count cap. A meminfo hiccup
+// must never wrongly starve a healthy node.
 func (c *dockerResourceCollector) Collect() (usedMB int, runningContainers int) {
-	// In v1, we report a placeholder for memory usage.
-	// A future version can read /proc/meminfo or cgroup stats.
-	// Running containers count comes from Docker inspect of known containers.
-	return 0, 0
+	used, err := hostUsedMemoryMB()
+	if err != nil {
+		c.logger.Warn("host memory read failed; reporting 0 used (admission falls back to per-node count cap)",
+			"error", err,
+		)
+		return 0, 0
+	}
+	return used, 0
 }
