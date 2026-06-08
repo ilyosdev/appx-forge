@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -217,14 +219,33 @@ func (e *CommandExecutor) executeStopSandbox(ctx context.Context, cmd controlcli
 
 	// Release port and clean up sandbox tracking
 	e.mu.Lock()
+	var workdirToRemove string
 	if info, ok := e.sandboxes[cmd.SandboxID]; ok {
 		if releaseErr := e.ports.Release(info.HostPort); releaseErr != nil {
 			e.logger.Warn("failed to release port on stop",
 				"port", info.HostPort, "error", releaseErr)
 		}
+		// E3 dir-leak fix — capture the workdir to delete AFTER the container
+		// is removed, so destroying a sandbox no longer leaks its bind-mount
+		// directory under SandboxDir. Guard a non-empty AppName: an empty name
+		// would join to SandboxDir itself and RemoveAll the whole tree.
+		if info.AppName != "" {
+			workdirToRemove = filepath.Join(e.sandboxDir, info.AppName)
+		}
 		delete(e.sandboxes, cmd.SandboxID)
 	}
 	e.mu.Unlock()
+
+	// Remove the sandbox workdir outside the lock (filesystem I/O). Non-fatal:
+	// a failure here must never fail the stop — the periodic GC is the backstop.
+	if workdirToRemove != "" {
+		if rmErr := os.RemoveAll(workdirToRemove); rmErr != nil {
+			e.logger.Warn("failed to remove sandbox workdir",
+				"path", workdirToRemove, "error", rmErr)
+		} else {
+			e.logger.Info("removed sandbox workdir", "path", workdirToRemove)
+		}
+	}
 
 	e.logger.Info("sandbox stopped", "sandbox_id", cmd.SandboxID, "container_id", payload.ContainerID)
 
