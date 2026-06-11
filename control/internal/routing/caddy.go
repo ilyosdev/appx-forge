@@ -154,7 +154,25 @@ func buildRouteJSON(r Route) map[string]any {
 			{
 				"handler":   "reverse_proxy",
 				"upstreams": []map[string]string{{"dial": r.Upstream}},
-				"transport":  map[string]string{"protocol": "http"},
+				// Explicit generous timeouts (defense-in-depth). Caddy v2's
+				// reverse_proxy transport defaults response_header_timeout /
+				// read_timeout / write_timeout to "no timeout" today, so an
+				// un-tuned route already streams a multi-minute entry.bundle
+				// fine — these pins guard against a future Caddy default change
+				// or an HTTP/2 transport silently capping the stream. NOTE: this
+				// is belt-and-suspenders only — the operative ceiling on the
+				// CF-fronted public hostname is Cloudflare's hard 100s origin
+				// cap, which this does NOT touch (the iOS bundle must be
+				// pre-warmed server-side over the direct dial; see backend
+				// ToolboxClientService.prewarmNativeBundle). caddy.Duration
+				// unmarshals string durations, so emit "300s" not nanoseconds.
+				"transport": map[string]string{
+					"protocol":                "http",
+					"dial_timeout":            "10s",
+					"response_header_timeout": "300s",
+					"read_timeout":            "300s",
+					"write_timeout":           "300s",
+				},
 				"headers": map[string]any{
 					"request": map[string]any{
 						"set": map[string][]string{
@@ -170,8 +188,8 @@ func buildRouteJSON(r Route) map[string]any {
 
 // caddyRoutePayload represents a route as returned by Caddy's Admin API.
 type caddyRoutePayload struct {
-	ID     string `json:"@id"`
-	Match  []struct {
+	ID    string `json:"@id"`
+	Match []struct {
 		Host []string `json:"host"`
 	} `json:"match"`
 	Handle []struct {

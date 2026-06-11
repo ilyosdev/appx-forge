@@ -198,7 +198,7 @@ func TestWriteTar_ExtractsContents(t *testing.T) {
 
 	// Build a tar.gz with two files
 	buf := buildTarGz(t, map[string]string{
-		"App.tsx":         "app content",
+		"App.tsx":          "app content",
 		"screens/Home.tsx": "home content",
 	})
 
@@ -242,9 +242,9 @@ func TestWriteTar_IgnoresSymlinks(t *testing.T) {
 	// Add a regular file
 	content := []byte("legit content")
 	if err := tw.WriteHeader(&tar.Header{
-		Name: "legit.tsx",
-		Size: int64(len(content)),
-		Mode: 0644,
+		Name:     "legit.tsx",
+		Size:     int64(len(content)),
+		Mode:     0644,
 		Typeflag: tar.TypeReg,
 	}); err != nil {
 		t.Fatal(err)
@@ -324,6 +324,186 @@ func TestTriggerMetroRebuild_NoWatchedFileIsNoop(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("triggerMetroRebuild created files: %v", entries)
+	}
+}
+
+// TestWriteFiles_IdenticalBytesSkipWrite is the core wake-reflush fix: pushing
+// the exact bytes a file already holds must NOT rewrite it (no mtime bump) but
+// must still report the path as Written so caller accounting is unchanged.
+func TestWriteFiles_IdenticalBytesSkipWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "app/index.tsx")
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	content := "export default function Home(){ return null }"
+	if err := os.WriteFile(target, []byte(content), 0644); err != nil {
+		t.Fatalf("seeding file: %v", err)
+	}
+	// Backdate the file's mtime far enough that any rewrite is detectable.
+	old := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(target, old, old); err != nil {
+		t.Fatalf("backdating: %v", err)
+	}
+
+	result := WriteFiles(dir, []FileEntry{
+		{Path: "app/index.tsx", Content: b64(content), Delete: false},
+	})
+
+	// Reported as written (file IS present with the requested bytes).
+	if len(result.Written) != 1 || result.Written[0] != "app/index.tsx" {
+		t.Fatalf("expected Written=[app/index.tsx], got %v", result.Written)
+	}
+	if len(result.Failed) != 0 {
+		t.Fatalf("expected no failures, got %v", result.Failed)
+	}
+
+	// But the mtime must be UNCHANGED — no rewrite happened.
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Errorf("identical-byte push bumped mtime: was %v, now %v", old, info.ModTime())
+	}
+}
+
+// TestWriteFiles_AllIdenticalNoMetroNudge proves the rebuild trigger: an
+// all-identical reflush (the wake case) leaves the watched-root mtime untouched
+// so Metro is never forced to cold-rebundle.
+func TestWriteFiles_AllIdenticalNoMetroNudge(t *testing.T) {
+	dir := t.TempDir()
+
+	// Watched root (entry.js) — triggerMetroRebuild would bump this.
+	entry := filepath.Join(dir, "entry.js")
+	if err := os.WriteFile(entry, []byte("import 'expo-router/entry';"), 0644); err != nil {
+		t.Fatalf("seeding entry.js: %v", err)
+	}
+	// A user file with known content.
+	app := filepath.Join(dir, "App.tsx")
+	appContent := "export default function App(){ return null }"
+	if err := os.WriteFile(app, []byte(appContent), 0644); err != nil {
+		t.Fatalf("seeding App.tsx: %v", err)
+	}
+
+	old := time.Now().Add(-1 * time.Hour)
+	for _, p := range []string{entry, app} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("backdating %s: %v", p, err)
+		}
+	}
+
+	// Reflush the exact same App.tsx bytes (sleep→wake re-push).
+	result := WriteFiles(dir, []FileEntry{
+		{Path: "App.tsx", Content: b64(appContent), Delete: false},
+	})
+	if len(result.Written) != 1 {
+		t.Fatalf("expected 1 written, got %v", result.Written)
+	}
+
+	info, err := os.Stat(entry)
+	if err != nil {
+		t.Fatalf("stat entry.js: %v", err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Errorf("all-identical reflush nudged Metro (entry.js mtime bumped): was %v, now %v", old, info.ModTime())
+	}
+}
+
+// TestWriteFiles_ChangedBytesStillNudge guards the inverse: when even one file's
+// bytes differ, the write happens AND Metro is nudged.
+func TestWriteFiles_ChangedBytesStillNudge(t *testing.T) {
+	dir := t.TempDir()
+
+	entry := filepath.Join(dir, "entry.js")
+	if err := os.WriteFile(entry, []byte("import 'expo-router/entry';"), 0644); err != nil {
+		t.Fatalf("seeding entry.js: %v", err)
+	}
+	app := filepath.Join(dir, "App.tsx")
+	if err := os.WriteFile(app, []byte("old"), 0644); err != nil {
+		t.Fatalf("seeding App.tsx: %v", err)
+	}
+	old := time.Now().Add(-1 * time.Hour)
+	for _, p := range []string{entry, app} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("backdating %s: %v", p, err)
+		}
+	}
+
+	result := WriteFiles(dir, []FileEntry{
+		{Path: "App.tsx", Content: b64("new content"), Delete: false},
+	})
+	if len(result.Written) != 1 {
+		t.Fatalf("expected 1 written, got %v", result.Written)
+	}
+
+	// File actually rewritten.
+	got, err := os.ReadFile(app)
+	if err != nil {
+		t.Fatalf("reading App.tsx: %v", err)
+	}
+	if string(got) != "new content" {
+		t.Errorf("App.tsx = %q, want %q", got, "new content")
+	}
+
+	// Metro nudged (entry.js mtime bumped).
+	info, err := os.Stat(entry)
+	if err != nil {
+		t.Fatalf("stat entry.js: %v", err)
+	}
+	if !info.ModTime().After(old) {
+		t.Errorf("changed-byte push did not nudge Metro: entry.js mtime still %v", info.ModTime())
+	}
+}
+
+// TestWriteFiles_DeleteMissingIsNoFailure: deleting an already-absent file is a
+// no-op success (desired end-state holds), not a Failed entry.
+func TestWriteFiles_DeleteMissingIsNoFailure(t *testing.T) {
+	dir := t.TempDir()
+
+	result := WriteFiles(dir, []FileEntry{
+		{Path: "never-existed.tsx", Content: "", Delete: true},
+	})
+
+	if len(result.Failed) != 0 {
+		t.Fatalf("expected no failures for absent-file delete, got %v", result.Failed)
+	}
+	if len(result.Written) != 1 || result.Written[0] != "never-existed.tsx" {
+		t.Fatalf("expected Written=[never-existed.tsx], got %v", result.Written)
+	}
+}
+
+// TestWriteTar_IdenticalBytesSkipWrite mirrors the WriteFiles identical-skip on
+// the tar path.
+func TestWriteTar_IdenticalBytesSkipWrite(t *testing.T) {
+	dir := t.TempDir()
+
+	target := filepath.Join(dir, "App.tsx")
+	content := "app content"
+	if err := os.WriteFile(target, []byte(content), 0644); err != nil {
+		t.Fatalf("seeding: %v", err)
+	}
+	old := time.Now().Add(-1 * time.Hour)
+	if err := os.Chtimes(target, old, old); err != nil {
+		t.Fatalf("backdating: %v", err)
+	}
+
+	buf := buildTarGz(t, map[string]string{"App.tsx": content})
+	result, err := WriteTar(dir, buf)
+	if err != nil {
+		t.Fatalf("WriteTar failed: %v", err)
+	}
+	if len(result.Written) != 1 {
+		t.Fatalf("expected 1 written, got %v", result.Written)
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !info.ModTime().Equal(old) {
+		t.Errorf("identical tar entry bumped mtime: was %v, now %v", old, info.ModTime())
 	}
 }
 

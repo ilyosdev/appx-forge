@@ -5,6 +5,7 @@ package filepush
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"encoding/base64"
 	"fmt"
@@ -32,11 +33,24 @@ type WriteResult struct {
 // Each file path is validated to prevent path traversal. Invalid paths are added to
 // the Failed list. WriteFiles never returns an error -- partial failures are reported
 // in the result.
+//
+// Identical-byte writes are skipped: if the on-disk file already holds the exact
+// bytes being pushed, the write (and its mtime bump) is elided. The path is still
+// reported in Written — the file IS present with the requested content, so callers
+// that count Written for accounting see no change — but Metro is NOT nudged unless
+// at least one file's bytes (or set of files) actually changed. This is the wake
+// reflush fix: a sleep→wake cycle re-pushes the whole tree, and without the compare
+// every chtimes/write bumped mtimes and forced Metro to cold-rebundle TreeFS.
 func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 	result := WriteResult{
 		Written: []string{},
 		Failed:  []string{},
 	}
+
+	// Count of operations that actually mutated the filesystem (a real write of
+	// changed bytes, or a delete). Identical-byte no-ops do NOT count, so an
+	// all-identical reflush triggers no Metro rebuild.
+	changed := 0
 
 	for _, f := range files {
 		if !isValidPath(f.Path) {
@@ -48,9 +62,17 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 
 		if f.Delete {
 			if err := os.Remove(fullPath); err != nil {
-				result.Failed = append(result.Failed, f.Path)
+				// A delete of an already-absent file is a no-op, not a failure:
+				// the desired end-state (file gone) holds. Report it as written
+				// but do not count it as a change so it can't trigger a rebuild.
+				if os.IsNotExist(err) {
+					result.Written = append(result.Written, f.Path)
+				} else {
+					result.Failed = append(result.Failed, f.Path)
+				}
 			} else {
 				result.Written = append(result.Written, f.Path)
+				changed++
 			}
 			continue
 		}
@@ -58,6 +80,15 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 		data, err := base64.StdEncoding.DecodeString(f.Content)
 		if err != nil {
 			result.Failed = append(result.Failed, f.Path)
+			continue
+		}
+
+		// Skip the write when the file already holds exactly these bytes. Avoids
+		// the mtime bump that makes Metro's mtime-keyed TreeFS re-crawl on every
+		// reflush (the dominant cost of sleep→wake). One read per file is cheap
+		// next to a write + a Metro cold rebundle.
+		if sameBytes(fullPath, data) {
+			result.Written = append(result.Written, f.Path)
 			continue
 		}
 
@@ -73,15 +104,36 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 		}
 
 		result.Written = append(result.Written, f.Path)
+		changed++
 	}
 
 	// Nudge Metro to re-bundle even when inotify misses new files in nested
-	// app/** subdirs (Watchman is disabled in the baked Metro config).
-	if len(result.Written) > 0 {
+	// app/** subdirs (Watchman is disabled in the baked Metro config). Only when
+	// something actually changed on disk — an all-identical reflush (the wake
+	// case) leaves mtimes untouched and must not force a cold rebundle.
+	if changed > 0 {
 		triggerMetroRebuild(codeDir)
 	}
 
 	return result
+}
+
+// sameBytes reports whether the file at path already holds exactly want. Returns
+// false on any read error (missing file, permission) so the caller falls through
+// to a normal write — the compare is a fast-path optimization, never a gate.
+//
+// Size is checked first (one stat) to avoid reading large files that obviously
+// differ; only same-size files are read and byte-compared.
+func sameBytes(path string, want []byte) bool {
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() || fi.Size() != int64(len(want)) {
+		return false
+	}
+	have, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(have, want)
 }
 
 // WriteTar extracts a tar.gz archive from r into codeDir.
@@ -101,6 +153,9 @@ func WriteTar(codeDir string, r io.Reader) (WriteResult, error) {
 	defer gz.Close()
 
 	tr := tar.NewReader(gz)
+
+	// See WriteFiles: only a real on-disk mutation may trigger a Metro rebuild.
+	changed := 0
 
 	for {
 		hdr, err := tr.Next()
@@ -125,30 +180,39 @@ func WriteTar(codeDir string, r io.Reader) (WriteResult, error) {
 
 		fullPath := filepath.Join(codeDir, name)
 
+		// Buffer the entry so we can compare against the on-disk bytes before
+		// writing. Tar entries are individual source files (small); buffering
+		// is cheaper than the mtime-bump cold rebundle a blind rewrite causes.
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			result.Failed = append(result.Failed, name)
+			continue
+		}
+
+		// Identical-byte skip: file already holds these bytes → no write, no
+		// mtime bump (the wake reflush fix; see WriteFiles).
+		if sameBytes(fullPath, data) {
+			result.Written = append(result.Written, name)
+			continue
+		}
+
 		dir := filepath.Dir(fullPath)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			result.Failed = append(result.Failed, name)
 			continue
 		}
 
-		f, err := os.Create(fullPath)
-		if err != nil {
+		if err := os.WriteFile(fullPath, data, 0644); err != nil {
 			result.Failed = append(result.Failed, name)
 			continue
 		}
-
-		if _, err := io.Copy(f, tr); err != nil {
-			f.Close()
-			result.Failed = append(result.Failed, name)
-			continue
-		}
-		f.Close()
 
 		result.Written = append(result.Written, name)
+		changed++
 	}
 
-	// Nudge Metro to re-bundle (see WriteFiles).
-	if len(result.Written) > 0 {
+	// Nudge Metro to re-bundle (see WriteFiles) — only on a real change.
+	if changed > 0 {
 		triggerMetroRebuild(codeDir)
 	}
 

@@ -1,5 +1,18 @@
-# Forge Sandbox Image v8 (inotify watcher fix + web platform support).
+# Forge Sandbox Image v14 (wake reflush fix — no cold rebundle on docker-start).
 # See .planning/phases/19-shared-bundler/19-B3-SPEC.md for B3 rationale.
+#
+# v14 fix (2026-06-12): sleep-not-destroy wakes a sandbox via docker stop→start
+# against the SAME preserved /app/code bind mount. The entrypoint then re-ran
+# its framework-file + metro.config refresh with an UNCONDITIONAL `cp -f`, and
+# the backend re-flushed the whole source_files tree on every wake. Both rewrote
+# byte-identical files, bumping their mtimes; Metro's mtime-keyed TreeFS treated
+# them as changed and cold-rebundled (adding seconds to every wake). v14 makes
+# the entrypoint cmp-before-cp (copy only when bytes differ) — first boot of a
+# fresh container is unchanged (dest absent → copy), an identical wake touches
+# nothing. Companion changes: forge-agent's filepush writer skips identical-byte
+# writes + only nudges Metro on a real change (writer.go), and the backend skips
+# the wake reflush when the live bundle already equals the current revision
+# (deployment.service.ts wakeContainer).
 #
 # v8 fix: template had no app/ subdir → Metro never added inotify watcher on
 # app/ → AI-generated files pushed to app/ were invisible. Added app/index.tsx

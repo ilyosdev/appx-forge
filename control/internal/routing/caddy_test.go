@@ -23,7 +23,7 @@ type matchJSON struct {
 }
 
 type handlerJSON struct {
-	Handler   string        `json:"handler"`
+	Handler   string         `json:"handler"`
 	Upstreams []upstreamJSON `json:"upstreams"`
 	Transport *transportJSON `json:"transport,omitempty"`
 	Headers   *headersJSON   `json:"headers,omitempty"`
@@ -34,7 +34,11 @@ type upstreamJSON struct {
 }
 
 type transportJSON struct {
-	Protocol string `json:"protocol"`
+	Protocol              string `json:"protocol"`
+	DialTimeout           string `json:"dial_timeout"`
+	ResponseHeaderTimeout string `json:"response_header_timeout"`
+	ReadTimeout           string `json:"read_timeout"`
+	WriteTimeout          string `json:"write_timeout"`
 }
 
 type headersJSON struct {
@@ -96,6 +100,20 @@ func TestCaddyAddRoute_SendsCorrectJSON(t *testing.T) {
 	}
 	if h.Transport == nil || h.Transport.Protocol != "http" {
 		t.Errorf("transport protocol = %v, want http", h.Transport)
+	}
+	// Explicit generous timeouts (defense-in-depth) so a future Caddy default
+	// change / HTTP/2 transport can't silently cap entry.bundle streaming.
+	if h.Transport.DialTimeout != "10s" {
+		t.Errorf("transport dial_timeout = %q, want 10s", h.Transport.DialTimeout)
+	}
+	if h.Transport.ResponseHeaderTimeout != "300s" {
+		t.Errorf("transport response_header_timeout = %q, want 300s", h.Transport.ResponseHeaderTimeout)
+	}
+	if h.Transport.ReadTimeout != "300s" {
+		t.Errorf("transport read_timeout = %q, want 300s", h.Transport.ReadTimeout)
+	}
+	if h.Transport.WriteTimeout != "300s" {
+		t.Errorf("transport write_timeout = %q, want 300s", h.Transport.WriteTimeout)
 	}
 	if h.Headers == nil || h.Headers.Request == nil {
 		t.Fatal("headers.request is nil")

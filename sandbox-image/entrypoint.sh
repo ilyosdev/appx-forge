@@ -6,14 +6,26 @@ set -e
 #   1. -n (no-overwrite) copies USER-OWNED files if absent. Agent-written
 #      code in subdirectories (app/, components/, ...) is preserved.
 #   2. Framework files (entry.js, app.json, babel.config.js, package.json,
-#      tsconfig.json) are FORCE-refreshed on every container start. These
-#      are infrastructure, not user code — when we ship a new sandbox image
-#      (e.g. switching entry.js to expo-router/entry), existing sandboxes'
-#      bind mounts must pick up the change without requiring a wipe.
+#      tsconfig.json) are refreshed when they DIFFER from the baked template.
+#      These are infrastructure, not user code — when we ship a new sandbox
+#      image (e.g. switching entry.js to expo-router/entry), existing
+#      sandboxes' bind mounts must pick up the change without a wipe.
+#
+#      cmp-before-cp (v14): a sleep→wake (docker stop→start) re-runs this
+#      entrypoint against the SAME preserved /app/code bind mount. An
+#      unconditional `cp -f` rewrote these files every wake, bumping their
+#      mtime, which made Metro's mtime-keyed TreeFS treat them as changed and
+#      cold-rebundle on every wake. Copying only when the bytes differ leaves
+#      mtimes untouched on an identical wake while still force-updating after a
+#      genuine image bump. `cmp -s` exits non-zero when the dest is missing or
+#      differs (→ copy), zero when identical (→ skip). First boot of a fresh
+#      container: dest absent → cmp non-zero → copy, identical to before.
 cp -rn /opt/template/. /app/code/ 2>/dev/null || true
 for f in entry.js app.json babel.config.js package.json tsconfig.json; do
   if [ -f "/opt/template/$f" ]; then
-    cp -f "/opt/template/$f" "/app/code/$f"
+    if ! cmp -s "/opt/template/$f" "/app/code/$f"; then
+      cp -f "/opt/template/$f" "/app/code/$f"
+    fi
   fi
 done
 
@@ -23,15 +35,27 @@ if [ ! -e /app/code/node_modules ]; then
 fi
 
 # Enforce our tuned Metro config (three-layer defense vs. user/AI overrides).
-# Layer 1: remove any user-pushed metro.config.* at every container start.
-rm -f /app/code/metro.config.js \
-      /app/code/metro.config.ts \
+# Layer 1: remove any user-pushed non-.js metro.config.* variants every start.
+# These should never exist (forge-agent rejects metro.config.* pushes); rm -f of
+# an absent file is a no-op and never touches metro.config.js's mtime.
+rm -f /app/code/metro.config.ts \
       /app/code/metro.config.cjs \
       /app/code/metro.config.mjs
 
-# Layer 2: copy baked config, mark read-only so appuser cannot modify at runtime.
-cp /opt/metro-base-config.js /app/code/metro.config.js
-chmod 444 /app/code/metro.config.js
+# Layer 2: install the baked config, but only rewrite when it DIFFERS (or is
+# missing) — same cmp-before-cp wake fix as the framework files above. The old
+# unconditional rm+cp rewrote metro.config.js every boot; a sleep→wake then
+# bumped the config's mtime and Metro re-crawled the whole project. On an
+# identical wake cmp matches → skip → mtime untouched → no rebundle. After a
+# real image bump the baked config differs → rewrite. First boot: file absent
+# → cmp non-zero → copy. We chmod 444 only when we actually (re)wrote it so a
+# skipped wake performs zero filesystem mutation on this path.
+if ! cmp -s /opt/metro-base-config.js /app/code/metro.config.js; then
+  # File is 444 from a previous boot; make it writable before overwriting.
+  chmod 644 /app/code/metro.config.js 2>/dev/null || true
+  cp /opt/metro-base-config.js /app/code/metro.config.js
+  chmod 444 /app/code/metro.config.js
+fi
 
 # Layer 3 lives in forge-agent: http/writer.go rejects file-push writes to
 # metro.config.*. See appx-forge/agent/internal/http/writer.go.
