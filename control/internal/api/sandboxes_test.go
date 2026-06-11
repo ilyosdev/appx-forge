@@ -456,12 +456,12 @@ func TestSandboxDestroy_NotFound(t *testing.T) {
 // SandboxFreshnessService. The fields capture the most recent call so
 // assertions can confirm the handler forwarded the right name + force flag.
 type fakeFreshness struct {
-	row          *scheduler.SandboxRow
-	verifiedAt   time.Time
-	err          error
-	calledName   string
-	calledForce  bool
-	calledCount  int
+	row         *scheduler.SandboxRow
+	verifiedAt  time.Time
+	err         error
+	calledName  string
+	calledForce bool
+	calledCount int
 }
 
 func (f *fakeFreshness) GetSandbox(ctx context.Context, name string, forceRefresh bool) (*scheduler.SandboxRow, time.Time, error) {
@@ -662,5 +662,253 @@ func TestSandboxRestart_Success(t *testing.T) {
 
 	if w.Code != http.StatusAccepted {
 		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── POST /v1/sandboxes/{id}/activity Tests ──────────────────────────
+//
+// Viewer keep-alive (2026-06-11): pure last_active_at bump so connected
+// preview viewers (whose HTTP never flows through forge-control) stop
+// being idle-reaped mid-session. Reuses mockFilePushStore (agents_test.go).
+
+// newActivityTestServer wires the wake + activity routes with both the
+// lifecycle and filePushStore deps so the wake-bumps-activity companion
+// behavior is exercised end-to-end at the handler level.
+func newActivityTestServer(lc SandboxLifecycle, fps FilePushStore) *Server {
+	r := chi.NewRouter()
+	s := &Server{
+		router:        r,
+		config:        &serverConfig{apiToken: "test-token"},
+		logger:        testLogger(),
+		lifecycle:     lc,
+		filePushStore: fps,
+	}
+
+	r.Group(func(r chi.Router) {
+		r.Use(BearerAuth("test-token"))
+		r.Route("/v1", func(r chi.Router) {
+			r.Post("/sandboxes/{id}/wake", s.handleWakeSandbox)
+			r.Post("/sandboxes/{id}/activity", s.handleTouchSandboxActivity)
+		})
+	})
+
+	return s
+}
+
+func TestTouchSandboxActivity_Success(t *testing.T) {
+	sandboxID := uuid.New()
+	bumped := false
+
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			if id.Bytes != sandboxID {
+				t.Fatalf("expected sandbox ID %s in GetSandbox", sandboxID)
+			}
+			return makeSandbox(sandboxID, "my-app", "running"), nil
+		},
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			if id.Bytes != sandboxID {
+				t.Fatalf("expected sandbox ID %s in UpdateSandboxLastActive", sandboxID)
+			}
+			bumped = true
+			return nil
+		},
+	}
+
+	srv := newActivityTestServer(&mockLifecycle{}, fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/activity", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bumped {
+		t.Fatal("expected UpdateSandboxLastActive to be called")
+	}
+
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["id"] != sandboxID.String() {
+		t.Errorf("expected id %q, got %q", sandboxID.String(), resp["id"])
+	}
+	if resp["state"] != "running" {
+		t.Errorf("expected state 'running', got %q", resp["state"])
+	}
+}
+
+// A stopped sandbox is still touchable (200) — the bump is harmless there:
+// second-tier destroy keys off updated_at, not last_active_at. The returned
+// state lets the backend log "stopped while viewers connected" drift.
+func TestTouchSandboxActivity_StoppedSandboxReportsState(t *testing.T) {
+	sandboxID := uuid.New()
+
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return makeSandbox(sandboxID, "my-app", "stopped"), nil
+		},
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			return nil
+		},
+	}
+
+	srv := newActivityTestServer(&mockLifecycle{}, fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/activity", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["state"] != "stopped" {
+		t.Errorf("expected state 'stopped', got %q", resp["state"])
+	}
+}
+
+func TestTouchSandboxActivity_UnknownID(t *testing.T) {
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{}, errors.New("no rows")
+		},
+	}
+
+	srv := newActivityTestServer(&mockLifecycle{}, fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+uuid.New().String()+"/activity", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTouchSandboxActivity_BadUUID(t *testing.T) {
+	srv := newActivityTestServer(&mockLifecycle{}, &mockFilePushStore{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/not-a-uuid/activity", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTouchSandboxActivity_StoreError(t *testing.T) {
+	sandboxID := uuid.New()
+
+	fps := &mockFilePushStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return makeSandbox(sandboxID, "my-app", "running"), nil
+		},
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			return errors.New("db down")
+		},
+	}
+
+	srv := newActivityTestServer(&mockLifecycle{}, fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/activity", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTouchSandboxActivity_NotConfigured(t *testing.T) {
+	srv := newActivityTestServer(&mockLifecycle{}, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+uuid.New().String()+"/activity", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// ── Wake bumps last_active_at (keep-alive companion fix) ────────────
+
+// A successful wake must reset last_active_at — otherwise a sandbox woken
+// with a stale (>idle_timeout) timestamp is re-reaped on the reaper's next
+// tick before any file push lands (observed live: re-reap 110s after wake).
+func TestWakeSandbox_BumpsActivity(t *testing.T) {
+	sandboxID := uuid.New()
+	bumped := false
+
+	fps := &mockFilePushStore{
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			if id.Bytes != sandboxID {
+				t.Fatalf("expected sandbox ID %s in UpdateSandboxLastActive", sandboxID)
+			}
+			bumped = true
+			return nil
+		},
+	}
+
+	srv := newActivityTestServer(&mockLifecycle{}, fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+sandboxID.String()+"/wake", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	if !bumped {
+		t.Fatal("expected wake to bump last_active_at via UpdateSandboxLastActive")
+	}
+}
+
+// The bump is best-effort: a failed bump must never fail the wake.
+func TestWakeSandbox_BumpFailureStillAccepted(t *testing.T) {
+	fps := &mockFilePushStore{
+		updateSandboxLastActive: func(ctx context.Context, id pgtype.UUID) error {
+			return errors.New("db down")
+		},
+	}
+
+	srv := newActivityTestServer(&mockLifecycle{}, fps)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+uuid.New().String()+"/wake", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 despite bump failure, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Wake without a configured filePushStore (nil) must not panic and must
+// still return 202 — the bump is strictly additive.
+func TestWakeSandbox_NoFilePushStoreStillAccepted(t *testing.T) {
+	srv := newActivityTestServer(&mockLifecycle{}, nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/"+uuid.New().String()+"/wake", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 with nil filePushStore, got %d: %s", w.Code, w.Body.String())
 	}
 }

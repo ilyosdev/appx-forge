@@ -27,6 +27,7 @@ type mockStore struct {
 	assignSandboxFn            func(ctx context.Context, arg store.AssignSandboxToNodeParams) (store.Sandbox, error)
 	transitionStateFn          func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
 	updateSandboxRuntimeFn     func(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
+	updateSandboxLastActiveFn  func(ctx context.Context, id pgtype.UUID) error
 	createCommandFn            func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	ackCommandFn               func(ctx context.Context, arg store.AckCommandParams) error
 	recordEventFn              func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
@@ -98,6 +99,13 @@ func (m *mockStore) TransitionSandboxState(ctx context.Context, arg store.Transi
 func (m *mockStore) UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error {
 	if m.updateSandboxRuntimeFn != nil {
 		return m.updateSandboxRuntimeFn(ctx, arg)
+	}
+	return nil
+}
+
+func (m *mockStore) UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) error {
+	if m.updateSandboxLastActiveFn != nil {
+		return m.updateSandboxLastActiveFn(ctx, id)
 	}
 	return nil
 }
@@ -1476,6 +1484,16 @@ func TestSleepSandbox_HappyPath(t *testing.T) {
 	if capturedCmd.NodeID != pgNodeID {
 		t.Fatal("expected stop command to target the sandbox's node")
 	}
+	// Sleep must carry mode=stop — a mode-less payload makes the agent
+	// DESTROY the container (rm + workdir + port release) while the row
+	// stays 'stopped', so the later wake can only cold-create.
+	var payload map[string]interface{}
+	if err := json.Unmarshal(capturedCmd.Payload, &payload); err != nil {
+		t.Fatalf("bad payload: %v", err)
+	}
+	if payload["mode"] != "stop" {
+		t.Fatalf("expected sleep payload mode=stop, got %s", capturedCmd.Payload)
+	}
 }
 
 // Idempotent: sleeping an already-stopped sandbox is a no-op success (no
@@ -1532,6 +1550,358 @@ func TestSleepSandbox_NotRunning_InvalidState(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("expected ErrInvalidState, got %v", err)
+	}
+}
+
+// ── Sleep-not-destroy fixes (2026-06-12) ────────────────────────────
+
+// Wake must bump last_active_at atomically with the start dispatch —
+// otherwise the idle reaper re-selects the woken sandbox on its next tick
+// when the post-wake file push fails (the only other bump site).
+func TestWakeSandbox_BumpsLastActive(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	pgNodeID := makePgUUID(uuid.New())
+
+	bumpedID := pgtype.UUID{}
+	bumpCalls := 0
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgSandboxID,
+				State:   "stopped",
+				AppName: "slept-app",
+				NodeID:  pgNodeID,
+				Image:   "appx/sandbox:v12",
+			}, nil
+		},
+		updateSandboxLastActiveFn: func(ctx context.Context, id pgtype.UUID) error {
+			bumpCalls++
+			bumpedID = id
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.WakeSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bumpCalls != 1 {
+		t.Fatalf("expected exactly 1 last_active_at bump on wake, got %d", bumpCalls)
+	}
+	if bumpedID != pgSandboxID {
+		t.Fatal("expected bump to target the woken sandbox")
+	}
+}
+
+// A failed bump must never fail the wake — the start-ack bump is the
+// second chance.
+func TestWakeSandbox_BumpFailure_StillWakes(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+	pgNodeID := makePgUUID(uuid.New())
+
+	var capturedCmd store.CreateCommandParams
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID: pgSandboxID, State: "stopped", AppName: "slept-app", NodeID: pgNodeID,
+			}, nil
+		},
+		updateSandboxLastActiveFn: func(ctx context.Context, id pgtype.UUID) error {
+			return errors.New("pg hiccup")
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			capturedCmd = arg
+			return store.Command{ID: arg.ID}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.WakeSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("wake must tolerate a failed activity bump, got: %v", err)
+	}
+	if capturedCmd.CommandType != "start_sandbox" {
+		t.Fatalf("expected start_sandbox dispatched despite bump failure, got %q", capturedCmd.CommandType)
+	}
+}
+
+// Start acks refresh activity (covers crash-restarts and the wake's
+// stopped→starting→running tail); stop acks must NOT.
+func TestHandleAck_StartBumpsLastActive_StopDoesNot(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	state := "starting"
+	bumpCalls := 0
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: state, AppName: "test-app"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+		},
+		updateSandboxLastActiveFn: func(ctx context.Context, id pgtype.UUID) error {
+			bumpCalls++
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "start_sandbox", "success",
+		json.RawMessage(`{"container_id":"abc","host_port":40001}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bumpCalls != 1 {
+		t.Fatalf("expected 1 last_active_at bump on start ack, got %d", bumpCalls)
+	}
+
+	// stop_sandbox ack on a slept row: NO bump (a stop must never extend
+	// the idle window or look like activity).
+	state = "stopped"
+	if err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "stop_sandbox", "success",
+		json.RawMessage(`{"slept":true}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bumpCalls != 1 {
+		t.Fatalf("stop ack must not bump last_active_at (got %d bumps)", bumpCalls)
+	}
+}
+
+// Real-8 inline row delete must SKIP slept containers: the row is the only
+// control-plane handle to the kept, wakeable container.
+func TestHandleAck_StopSandboxSuccess_SleptAck_KeepsRow(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	deleteCalled := false
+	deleteCmdsCalled := false
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:      pgSandboxID,
+				State:   "stopped",
+				AppName: "pool-slept",
+				// Even a POSITIVELY pool-classified row survives when the
+				// agent says it slept the container.
+				Metadata: []byte(`{"appx.pool":"true"}`),
+			}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalled = true
+			return nil
+		},
+		deleteCommandsForSandboxFn: func(ctx context.Context, sandboxID pgtype.UUID) error {
+			deleteCmdsCalled = true
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "stop_sandbox", "success",
+		json.RawMessage(`{"slept":true}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteCalled || deleteCmdsCalled {
+		t.Fatal("slept sandbox row must NOT be deleted on stop ack (it is wakeable)")
+	}
+}
+
+// The Real-8 inline cleanup still fires for true pool destroys (mode-less
+// stop, ack without slept:true) so warm-rotation rows don't accumulate.
+func TestHandleAck_StopSandboxSuccess_PoolDestroyAck_DeletesRow(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	deleteCalled := false
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:       pgSandboxID,
+				State:    "stopped",
+				AppName:  "pool-fungible",
+				Metadata: []byte(`{"appx.pool":"true"}`),
+			}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "stop_sandbox", "success",
+		json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !deleteCalled {
+		t.Fatal("expected Real-8 inline delete for a destroyed pool sandbox")
+	}
+}
+
+// Claimed-before-tag-at-claim rows (no appx.projectId, no appx.pool) must
+// never be row-deleted on a stop ack — fail-safe classification.
+func TestHandleAck_StopSandboxSuccess_UntaggedClaimed_KeepsRow(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	deleteCalled := false
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{
+				ID:       pgSandboxID,
+				State:    "stopped",
+				AppName:  "pool-claimed-pre-fix",
+				Metadata: []byte(`{"appx.managed":"true","appx.appName":"pool-claimed-pre-fix"}`),
+			}, nil
+		},
+		deleteSandboxFn: func(ctx context.Context, id pgtype.UUID) error {
+			deleteCalled = true
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.HandleAck(context.Background(), uuid.New(), sandboxID, "stop_sandbox", "success",
+		json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if deleteCalled {
+		t.Fatal("untagged (claimed-pre-fix) sandbox row must NOT be deleted on stop ack")
+	}
+}
+
+// container_exited arriving while the row is stopped/destroying/destroyed is
+// the expected tail of an agent-initiated docker stop: legal no-op, audit
+// event recorded, NO TransitionSandboxState call (a self-loop would bump
+// updated_at and reset the stopped-retention clock).
+func TestHandleEvent_ContainerExitedAfterStop_NoOp(t *testing.T) {
+	for _, state := range []string{"stopped", "destroying", "destroyed"} {
+		t.Run(state, func(t *testing.T) {
+			sandboxID := uuid.New()
+			pgSandboxID := makePgUUID(sandboxID)
+
+			transitionCalled := false
+			var recorded store.RecordEventParams
+
+			ms := &mockStore{
+				getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+					return store.Sandbox{ID: pgSandboxID, State: state, AppName: "slept-app"}, nil
+				},
+				transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+					transitionCalled = true
+					return store.Sandbox{}, nil
+				},
+				recordEventFn: func(ctx context.Context, arg store.RecordEventParams) (store.Event, error) {
+					recorded = arg
+					return store.Event{}, nil
+				},
+			}
+
+			svc := New(ms, nil)
+			err := svc.HandleEvent(context.Background(), uuid.New(), sandboxID, "container_exited", json.RawMessage(`{}`))
+			if err != nil {
+				t.Fatalf("expected legal no-op, got: %v", err)
+			}
+			if transitionCalled {
+				t.Fatalf("container_exited on %s must NOT transition state (retention clock reset)", state)
+			}
+			if recorded.EventType != "container_exited" {
+				t.Fatalf("expected audit event recorded, got %+v", recorded)
+			}
+			if recorded.PrevState.String != state || recorded.NextState.String != state {
+				t.Fatalf("audit event must record %s→%s, got %s→%s",
+					state, state, recorded.PrevState.String, recorded.NextState.String)
+			}
+		})
+	}
+}
+
+// container_started observed via the event channel refreshes activity
+// (belt-and-braces for a lost start ack).
+func TestHandleEvent_ContainerStarted_BumpsLastActive(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	bumpCalls := 0
+
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: "starting", AppName: "test-app"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+		},
+		updateSandboxLastActiveFn: func(ctx context.Context, id pgtype.UUID) error {
+			bumpCalls++
+			return nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.HandleEvent(context.Background(), uuid.New(), sandboxID, "container_started", nil); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if bumpCalls != 1 {
+		t.Fatalf("expected 1 last_active_at bump on container_started, got %d", bumpCalls)
+	}
+}
+
+// isPoolSandbox is fail-SAFE: only a positive appx.pool marker without an
+// owning appx.projectId classifies as pool (destroy + inline row delete).
+func TestIsPoolSandbox_Classification(t *testing.T) {
+	cases := []struct {
+		name     string
+		metadata []byte
+		want     bool
+	}{
+		{"nil metadata — unknown provenance, treat as claimed", nil, false},
+		{"empty object — pre-marker rows, treat as claimed", []byte(`{}`), false},
+		{"malformed json — leave row alone", []byte(`{not-json`), false},
+		{"managed-only (claimed pre-fix kill class)", []byte(`{"appx.managed":"true","appx.appName":"pool-x"}`), false},
+		{"project tag", []byte(`{"appx.projectId":"p-1"}`), false},
+		{"empty project tag, no pool marker", []byte(`{"appx.projectId":""}`), false},
+		{"pool marker", []byte(`{"appx.pool":"true"}`), true},
+		{"pool marker boolean", []byte(`{"appx.pool":true}`), true},
+		{"pool marker false", []byte(`{"appx.pool":"false"}`), false},
+		{"claimed pool sandbox — projectId wins over pool marker", []byte(`{"appx.pool":"true","appx.projectId":"p-2"}`), false},
+		{"pool marker with empty projectId", []byte(`{"appx.pool":"true","appx.projectId":""}`), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isPoolSandbox(tc.metadata); got != tc.want {
+				t.Errorf("isPoolSandbox(%s) = %v, want %v", tc.metadata, got, tc.want)
+			}
+		})
+	}
+}
+
+// isSleptAck tolerates empty and garbage payloads.
+func TestIsSleptAck(t *testing.T) {
+	cases := []struct {
+		name string
+		ack  json.RawMessage
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty object", json.RawMessage(`{}`), false},
+		{"garbage", json.RawMessage(`not-json`), false},
+		{"slept true", json.RawMessage(`{"slept":true}`), true},
+		{"slept false", json.RawMessage(`{"slept":false}`), false},
+		{"unrelated fields", json.RawMessage(`{"error":"x"}`), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isSleptAck(tc.ack); got != tc.want {
+				t.Errorf("isSleptAck(%s) = %v, want %v", tc.ack, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -256,9 +256,9 @@ func main() {
 	// the service synchronously calls agent's GET /v1/containers/{name}
 	// to confirm container existence; on miss the row is marked destroyed.
 	agentClient := &agentHTTPClient{
-		store:   &agentLookupAdapter{q: queries},
-		http:    &http.Client{Timeout: time.Duration(cfg.AgentRequestTimeoutSeconds) * time.Second},
-		logger:  logger,
+		store:  &agentLookupAdapter{q: queries},
+		http:   &http.Client{Timeout: time.Duration(cfg.AgentRequestTimeoutSeconds) * time.Second},
+		logger: logger,
 	}
 	freshnessSvc := scheduler.NewSandboxFreshnessService(
 		&freshnessStoreAdapter{q: queries},
@@ -759,6 +759,12 @@ func (a *storeAdapter) UpdateSandboxRuntime(ctx context.Context, arg store.Updat
 	return a.q.UpdateSandboxRuntime(ctx, arg)
 }
 
+// Sleep-not-destroy F1 (2026-06-12) — lifecycle bumps activity on wake and
+// successful starts so a woken sandbox is never instantly idle-stale.
+func (a *storeAdapter) UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) error {
+	return a.q.UpdateSandboxLastActive(ctx, id)
+}
+
 func (a *storeAdapter) CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
 	return a.q.CreateCommand(ctx, arg)
 }
@@ -1096,10 +1102,10 @@ func (c *agentHTTPClient) ContainerExists(ctx context.Context, name string) (boo
 // own retry / backoff here.
 
 type stateWebhookClient struct {
-	url     string
-	secret  []byte
-	client  *http.Client
-	logger  *slog.Logger
+	url    string
+	secret []byte
+	client *http.Client
+	logger *slog.Logger
 }
 
 func newStateWebhookClient(

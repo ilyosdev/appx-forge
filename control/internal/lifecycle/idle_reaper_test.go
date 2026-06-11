@@ -304,12 +304,22 @@ func TestIdleReaper_RecordsIdleTimeoutEvent(t *testing.T) {
 func TestIdleReaper_ProjectSleepsPoolDestroys(t *testing.T) {
 	project := makeIdleSandbox("proj-app")
 	project.Metadata = []byte(`{"appx.projectId":"p-123"}`)
+	// Pool fungibles are POSITIVELY marked at create (appx.pool) — only
+	// those keep prompt destroy semantics.
 	pool := makeIdleSandbox("pool-app")
-	pool.Metadata = []byte(`{}`)
+	pool.Metadata = []byte(`{"appx.pool":"true"}`)
+	// Claimed-before-tag-at-claim (the 2026-06-11 kill class): no projectId
+	// tag, no pool marker. MUST be treated as claimed → sleep, never the
+	// mode-less destroy that also deletes the forge row on ack.
+	legacy := makeIdleSandbox("pool-legacy-claimed")
+	legacy.Metadata = []byte(`{"appx.managed":"true","appx.appName":"pool-legacy-claimed"}`)
+	// No metadata at all — unknown provenance, conservative → sleep.
+	untagged := makeIdleSandbox("pool-untagged")
+	untagged.Metadata = nil
 
 	ms := &mockIdleReaperStore{
 		listIdleSandboxesFn: func(ctx context.Context) ([]store.Sandbox, error) {
-			return []store.Sandbox{project, pool}, nil
+			return []store.Sandbox{project, pool, legacy, untagged}, nil
 		},
 	}
 	var commands []store.CreateCommandParams
@@ -322,8 +332,13 @@ func TestIdleReaper_ProjectSleepsPoolDestroys(t *testing.T) {
 	if err := reaper.reap(context.Background()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(commands) != 2 {
-		t.Fatalf("expected 2 stop commands, got %d", len(commands))
+	if len(commands) != 4 {
+		t.Fatalf("expected 4 stop commands, got %d", len(commands))
+	}
+	mustSleep := map[pgtype.UUID]string{
+		project.ID:  "project",
+		legacy.ID:   "legacy claimed-untagged",
+		untagged.ID: "metadata-less",
 	}
 	for _, cmd := range commands {
 		var payload map[string]interface{}
@@ -331,9 +346,9 @@ func TestIdleReaper_ProjectSleepsPoolDestroys(t *testing.T) {
 			t.Fatalf("bad payload: %v", err)
 		}
 		mode, hasMode := payload["mode"]
-		if cmd.SandboxID == project.ID {
+		if kind, ok := mustSleep[cmd.SandboxID]; ok {
 			if !hasMode || mode != "stop" {
-				t.Errorf("project sandbox must sleep (mode=stop), payload=%s", cmd.Payload)
+				t.Errorf("%s sandbox must sleep (mode=stop), payload=%s", kind, cmd.Payload)
 			}
 		}
 		if cmd.SandboxID == pool.ID {

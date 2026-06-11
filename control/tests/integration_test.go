@@ -188,6 +188,10 @@ func (a *integrationAdapter) UpdateSandboxRuntime(ctx context.Context, arg store
 	return a.q.UpdateSandboxRuntime(ctx, arg)
 }
 
+func (a *integrationAdapter) UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) error {
+	return a.q.UpdateSandboxLastActive(ctx, id)
+}
+
 func (a *integrationAdapter) CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
 	return a.q.CreateCommand(ctx, arg)
 }

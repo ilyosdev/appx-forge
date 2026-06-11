@@ -59,6 +59,14 @@ ENV PORT=8081
 ENV NODE_ENV=development
 ENV EXPO_NO_PROMPT=1
 ENV EXPO_NO_METRO_LAZY=1
+# Wake-crash RCA (2026-06-11) — defense-in-depth for the v12 fat-template
+# crash: a /opt/template package.json claiming packages absent from
+# /opt/expo-shared-deps made `expo start` exit with PACKAGE_NOT_FOUND on every
+# container start (crash-watchdog restart loop, +60-120s per wake). The
+# backend also injects this per-sandbox (forge.service.ts createApp env);
+# baking it into the image covers sandboxes created outside that path. Users
+# can't npm-install into sandboxes, so dependency validation is pure liability.
+ENV EXPO_NO_DEPENDENCY_VALIDATION=1
 
 EXPOSE 8081
 

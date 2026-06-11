@@ -54,12 +54,12 @@ type SandboxReader interface {
 // ── Request/Response Types ───────────────────────────────────────────
 
 type createSandboxRequest struct {
-	AppName            string            `json:"app_name"`
-	UserID             string            `json:"user_id"`
-	Image              string            `json:"image"`
-	Resources          *resourcesRequest `json:"resources,omitempty"`
-	Env                map[string]string `json:"env,omitempty"`
-	IdleTimeoutSeconds *int32            `json:"idle_timeout_seconds,omitempty"`
+	AppName            string                 `json:"app_name"`
+	UserID             string                 `json:"user_id"`
+	Image              string                 `json:"image"`
+	Resources          *resourcesRequest      `json:"resources,omitempty"`
+	Env                map[string]string      `json:"env,omitempty"`
+	IdleTimeoutSeconds *int32                 `json:"idle_timeout_seconds,omitempty"`
 	Metadata           map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -70,21 +70,21 @@ type resourcesRequest struct {
 
 // SandboxResponse is the API response for a sandbox.
 type SandboxResponse struct {
-	ID           string           `json:"id"`
-	AppName      string           `json:"app_name"`
-	UserID       string           `json:"user_id"`
-	NodeID       *string          `json:"node_id,omitempty"`
-	ContainerID  *string          `json:"container_id,omitempty"`
-	Image        string           `json:"image"`
-	State        string           `json:"state"`
-	URL          string           `json:"url"`
-	Resources    json.RawMessage  `json:"resources,omitempty"`
-	HostPort     *int32           `json:"host_port,omitempty"`
-	CreatedAt    string           `json:"created_at,omitempty"`
-	UpdatedAt    string           `json:"updated_at,omitempty"`
-	LastActiveAt string           `json:"last_active_at,omitempty"`
-	FailureCount int32            `json:"failure_count"`
-	Metadata     json.RawMessage  `json:"metadata,omitempty"`
+	ID           string          `json:"id"`
+	AppName      string          `json:"app_name"`
+	UserID       string          `json:"user_id"`
+	NodeID       *string         `json:"node_id,omitempty"`
+	ContainerID  *string         `json:"container_id,omitempty"`
+	Image        string          `json:"image"`
+	State        string          `json:"state"`
+	URL          string          `json:"url"`
+	Resources    json.RawMessage `json:"resources,omitempty"`
+	HostPort     *int32          `json:"host_port,omitempty"`
+	CreatedAt    string          `json:"created_at,omitempty"`
+	UpdatedAt    string          `json:"updated_at,omitempty"`
+	LastActiveAt string          `json:"last_active_at,omitempty"`
+	FailureCount int32           `json:"failure_count"`
+	Metadata     json.RawMessage `json:"metadata,omitempty"`
 	// Phase 30 — last time control plane verified this row against agent truth.
 	// ISO8601 (RFC3339). Empty when the row predates the verified_at column
 	// or has never been touched by reconciler / freshness check.
@@ -442,6 +442,20 @@ func (s *Server) handleWakeSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Viewer keep-alive (2026-06-11): a successful wake must also bump
+	// last_active_at. WakeSandbox itself only transitions state; if the row's
+	// timestamp is already older than idle_timeout (the usual case for a just-
+	// woken sandbox), the idle reaper would re-reap it on its next tick before
+	// any file push lands (observed live: re-reaped 110s after wake). Handler-
+	// level and best-effort — the wake already succeeded, a failed bump only
+	// risks an earlier re-sleep, never a failed wake.
+	if s.filePushStore != nil {
+		pgID := pgtype.UUID{Bytes: id, Valid: true}
+		if err := s.filePushStore.UpdateSandboxLastActive(r.Context(), pgID); err != nil {
+			s.logger.Warn("wake: failed to bump last_active_at", "error", err, "sandbox_id", idStr)
+		}
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -477,6 +491,58 @@ func (s *Server) handleSleepSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleTouchSandboxActivity handles POST /v1/sandboxes/{id}/activity.
+// Pure last_active_at bump — no state transition, no event, no agent command.
+//
+// Why: the idle reaper's predicate (ListIdleSandboxes: state='running' AND
+// last_active_at < NOW() - idle_timeout) previously saw activity ONLY from
+// the file-push handler. Viewer HTTP traffic goes Server2-Caddy → container
+// directly, so a user watching a live preview generated zero bumps and the
+// reaper slept the container under them. The backend's viewer keep-alive
+// cron calls this every ~5min for each project room with connected sockets.
+//
+// Idempotent and safe in any state: second-tier destroy keys off updated_at
+// (ListStoppedExpired), so touching a stopped row never extends the 24h
+// destroy retention. UUID-only, no app-name alias — consistent with
+// wake/sleep/restart; the backend resolves aliases before calling.
+func (s *Server) handleTouchSandboxActivity(w http.ResponseWriter, r *http.Request) {
+	if s.filePushStore == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	pgID := pgtype.UUID{Bytes: id, Valid: true}
+	sb, err := s.filePushStore.GetSandbox(r.Context(), pgID)
+	if err != nil {
+		// No-rows and store errors both surface as 404 (mirrors
+		// handleMergeSandboxMetadata) — gives the backend a clean
+		// phantom-row signal.
+		NotFound(w, "sandbox not found")
+		return
+	}
+
+	if err := s.filePushStore.UpdateSandboxLastActive(r.Context(), pgID); err != nil {
+		s.logger.Error("touch sandbox activity failed", "error", err, "sandbox_id", idStr)
+		WriteProblem(w, http.StatusInternalServerError,
+			"urn:forge:error:internal", "Internal Server Error", "failed to update sandbox activity")
+		return
+	}
+
+	// state lets the backend detect "forge slept it while viewers connected"
+	// drift (logged as warn caller-side, never fatal).
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":    idStr,
+		"state": sb.State,
+	})
 }
 
 // ── Exec Handlers ────────────────────────────────────────────────────

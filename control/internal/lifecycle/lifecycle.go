@@ -62,6 +62,15 @@ type Store interface {
 	AssignSandboxToNodeUnderCap(ctx context.Context, nodeID, sandboxID pgtype.UUID, cap int32) (assigned bool, sb store.Sandbox, err error)
 	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
 	UpdateSandboxRuntime(ctx context.Context, arg store.UpdateSandboxRuntimeParams) error
+	// UpdateSandboxLastActive bumps last_active_at so ListIdleSandboxes'
+	// staleness predicate sees recent activity. Called on wake and on
+	// successful starts — NEVER on stop paths (a stop must not extend the
+	// idle window). Without the wake-time bump the only bump site in the
+	// control plane is the file-push 307 handler, so a woken sandbox whose
+	// immediate post-wake push fails keeps a >idle_timeout-stale
+	// last_active_at and is re-reaped on the next 60s reaper tick
+	// (wake 15:22:18 → re-reap 15:24:08, 2026-06-11 kill chain).
+	UpdateSandboxLastActive(ctx context.Context, id pgtype.UUID) error
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 	AckCommand(ctx context.Context, arg store.AckCommandParams) error
 	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
@@ -891,6 +900,15 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 		// compares app_names -- never heals it.
 		if event == models.EventStarted {
 			ls.persistRuntimeInfo(ctx, pgSandboxID, sandboxID, ackResult)
+			// Refresh activity on every successful start so a freshly
+			// started/woken sandbox is never instantly idle-stale. Covers
+			// crash-restarts and the wake path's second chance (WakeSandbox
+			// bumps too, but this ack is the moment the row actually flips
+			// to running and becomes reapable again).
+			if err := ls.store.UpdateSandboxLastActive(ctx, pgSandboxID); err != nil {
+				ls.logger.Warn("failed to bump last_active_at on start ack",
+					"error", err, "sandbox_id", sandboxID)
+			}
 			if refreshed, err := ls.store.GetSandbox(ctx, pgSandboxID); err == nil {
 				sandbox = refreshed
 			}
@@ -969,9 +987,18 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	// commands and the row inline; project sandboxes (with appx.projectId
 	// metadata) keep the existing `stopped` behavior since they may be
 	// woken later. Best-effort: cleanup failures don't unwind the ack.
+	//
+	// Sleep-not-destroy guard (2026-06-11): NEVER delete the row when the
+	// agent SLEPT the container (ack {"slept":true}, mode=stop). A slept
+	// row is the only control-plane handle to a kept, wakeable container —
+	// deleting it strands the docker-stopped container with nothing to
+	// wake it (and the heartbeat reconciler's orphan pass then destroys
+	// it). This makes a pool-vs-claimed misclassification non-fatal: the
+	// slept row survives until the second-tier retention destroy.
 	if cmdType == string(models.CmdStopSandbox) &&
 		(status == "success" || forceDestroyed) &&
-		isPoolSandbox(sandbox.Metadata) {
+		isPoolSandbox(sandbox.Metadata) &&
+		!isSleptAck(ackResult) {
 		// Re-fetch sandbox to confirm it's actually in stopped state
 		// (HandleAck may have transitioned it above for destroying flow).
 		fresh, ferr := ls.store.GetSandbox(ctx, pgSandboxID)
@@ -994,26 +1021,60 @@ func (ls *LifecycleService) HandleAck(ctx context.Context, cmdID uuid.UUID, sand
 	return nil
 }
 
-// isPoolSandbox returns true when the sandbox metadata lacks the
-// appx.projectId label, i.e. it was created by backend's container_pool
-// service for warm-cache rotation rather than by a user project. Pool
-// sandboxes do not get woken after idle reap (backend's pool layer
-// creates a fresh row instead), so their PG rows can be deleted inline
-// on stop ack rather than waiting for the daily cleanup cron.
+// isPoolSandbox reports whether the sandbox is POSITIVELY identified as a
+// warm-pool fungible: metadata carries the appx.pool marker AND no owning
+// appx.projectId. Pool sandboxes keep prompt destroy semantics on idle
+// reap (mode-less stop) and their PG row is deleted inline on the stop
+// ack (Real-8) — they are never woken.
+//
+// Everything else — claimed sandboxes, project sandboxes, rows with
+// empty, malformed, or pre-marker metadata — classifies as NOT pool, so
+// the idle reaper sleeps it (mode=stop) and the row survives until the
+// second-tier retention destroy. Deliberately fail-SAFE: the previous
+// fail-dangerous default ("no metadata / no projectId = pool") destroyed
+// every sandbox claimed before tag-at-claim existed AND deleted its forge
+// row on the stop ack — the 2026-06-11 kill chain. Worst case of
+// misclassifying a true pool sandbox as claimed is a slept row for the
+// retention window (~1.2MB disk, 0 RAM), bounded by reapExpired.
 func isPoolSandbox(metadataJSON []byte) bool {
 	if len(metadataJSON) == 0 {
-		return true // no metadata at all = treat as pool (rare)
+		return false // unknown provenance — treat as claimed (sleep, keep row)
 	}
 	var md map[string]interface{}
 	if err := json.Unmarshal(metadataJSON, &md); err != nil {
 		return false // malformed metadata — be conservative, leave row alone
 	}
+	// A claim tag always wins over the pool marker: claimed pool sandboxes
+	// keep appx.pool from birth and gain appx.projectId at claim.
 	if v, ok := md["appx.projectId"]; ok {
 		if s, isStr := v.(string); isStr && s != "" {
 			return false
 		}
 	}
-	return true
+	switch v := md["appx.pool"].(type) {
+	case string:
+		return v == "true"
+	case bool:
+		return v
+	}
+	return false
+}
+
+// isSleptAck reports whether a stop_sandbox success ack came from a
+// mode=stop sleep — the agent kept the container for wake and acked
+// {"slept": true} (agent executor.executeStopSandbox). Tolerates empty
+// or garbage ack payloads (returns false = old destroy-ack behavior).
+func isSleptAck(ackResult json.RawMessage) bool {
+	if len(ackResult) == 0 {
+		return false
+	}
+	var payload struct {
+		Slept bool `json:"slept"`
+	}
+	if err := json.Unmarshal(ackResult, &payload); err != nil {
+		return false
+	}
+	return payload.Slept
 }
 
 // isMissingContainerErr reports whether an agent failure ack indicates the
@@ -1066,8 +1127,40 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 		return nil
 	}
 
-	// Validate transition via state machine
 	currentState := models.SandboxState(sandbox.State)
+
+	// Sleep-not-destroy (2026-06-11): the agent's docker-event watcher maps
+	// every 'die' to container_exited — including dies the agent itself
+	// caused via docker stop (sleep or destroy). By the time the event
+	// lands, the row has already left running, so this is the expected tail
+	// of every stop — not drift. Record for audit and return at debug
+	// level. Deliberately does NOT go through TransitionSandboxState: a
+	// stopped→stopped self-loop would bump updated_at and silently reset
+	// the ListStoppedExpired retention clock on every post-sleep die.
+	if event == models.EventContainerExited &&
+		(currentState == models.StateStopped ||
+			currentState == models.StateDestroying ||
+			currentState == models.StateDestroyed) {
+		ls.logger.Debug("container_exited after stop/destroy — expected, ignoring",
+			"sandbox_id", sandboxID,
+			"current_state", sandbox.State,
+		)
+		if _, err := ls.store.RecordEvent(ctx, store.RecordEventParams{
+			SandboxID: pgSandboxID,
+			NodeID:    pgNodeID,
+			EventType: eventType,
+			Actor:     "agent",
+			PrevState: pgtype.Text{String: sandbox.State, Valid: true},
+			NextState: pgtype.Text{String: sandbox.State, Valid: true},
+			Payload:   safePayload(payload),
+		}); err != nil {
+			ls.logger.Warn("failed to record post-stop container_exited event",
+				"error", err, "sandbox_id", sandboxID)
+		}
+		return nil
+	}
+
+	// Validate transition via state machine
 	nextState, valid := models.NextState(currentState, event)
 	if !valid {
 		ls.logger.Warn("invalid state transition for event",
@@ -1086,6 +1179,16 @@ func (ls *LifecycleService) HandleEvent(ctx context.Context, nodeID uuid.UUID, s
 	})
 	if err != nil {
 		return fmt.Errorf("transition state: %w", err)
+	}
+
+	// Refresh activity when a container start is observed via the event
+	// channel (belt-and-braces for the start-ack bump: covers a lost ack).
+	// Start events only — a stop must never extend the idle window.
+	if event == models.EventStarted {
+		if err := ls.store.UpdateSandboxLastActive(ctx, pgSandboxID); err != nil {
+			ls.logger.Warn("failed to bump last_active_at on container_started event",
+				"error", err, "sandbox_id", sandboxID)
+		}
 	}
 
 	// Record event
@@ -1292,6 +1395,18 @@ func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID
 		return fmt.Errorf("transition state: %w", err)
 	}
 
+	// Bump last_active_at with the wake dispatch so the idle reaper cannot
+	// re-select this sandbox the moment it flips back to running. The only
+	// other bump site is the file-push 307 handler — a wake whose immediate
+	// post-wake push fails (or never happens) would otherwise keep a
+	// >idle_timeout-stale last_active_at and be re-reaped on the next 60s
+	// tick (wake 15:22:18 → re-reap 15:24:08, 2026-06-11). Non-fatal: the
+	// start-ack bump in HandleAck is the second chance.
+	if err := ls.store.UpdateSandboxLastActive(ctx, pgSandboxID); err != nil {
+		ls.logger.Warn("failed to bump last_active_at on wake",
+			"error", err, "sandbox_id", sandboxID)
+	}
+
 	// Decode resources and env to re-issue the start command
 	var resources Resources
 	if len(sandbox.Resources) > 0 {
@@ -1394,6 +1509,11 @@ func (ls *LifecycleService) SleepSandbox(ctx context.Context, sandboxID uuid.UUI
 	cmdPayload, _ := json.Marshal(map[string]interface{}{
 		"container_id": sandbox.ContainerID.String,
 		"reason":       "control-plane-sleep",
+		// mode=stop → agent docker-stops but KEEPS container/workdir/port
+		// for a fast wake. Without it the agent destroys everything while
+		// the row stays 'stopped' — the subsequent wake then silently
+		// cold-creates a fresh container instead of docker-starting.
+		"mode": "stop",
 	})
 
 	// A running sandbox always has a node assigned; guard anyway so an orphan
