@@ -62,6 +62,7 @@ type Server struct {
 	nodeStore                NodeStore
 	lifecycle                SandboxLifecycle
 	sandboxReader            SandboxReader
+	sandboxMetaWriter        SandboxMetadataWriter
 	agentStore               AgentStore
 	agentLifecycle           AgentLifecycle
 	filePushStore            FilePushStore
@@ -112,6 +113,12 @@ func (s *Server) SetAgentDeps(as AgentStore, al AgentLifecycle) {
 }
 
 // SetFilePushStore injects the file push store dependency after construction.
+// SetSandboxMetadataWriter wires the metadata-merge store write
+// (sleep-not-destroy, 2026-06-11).
+func (s *Server) SetSandboxMetadataWriter(mw SandboxMetadataWriter) {
+	s.sandboxMetaWriter = mw
+}
+
 func (s *Server) SetFilePushStore(fps FilePushStore) {
 	s.filePushStore = fps
 }

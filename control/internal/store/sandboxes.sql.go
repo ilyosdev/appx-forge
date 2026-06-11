@@ -747,6 +747,50 @@ func (q *Queries) MarkSandboxVerified(ctx context.Context, arg MarkSandboxVerifi
 	return err
 }
 
+const mergeSandboxMetadata = `-- name: MergeSandboxMetadata :one
+UPDATE sandboxes
+SET metadata = metadata || $2::jsonb,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING id, app_name, user_id, node_id, container_id, host_port, image, state, state_version, resources, env, idle_timeout_seconds, created_at, updated_at, last_active_at, failure_count, metadata, verified_at
+`
+
+type MergeSandboxMetadataParams struct {
+	ID    pgtype.UUID `json:"id"`
+	Patch []byte      `json:"patch"`
+}
+
+// Sleep-not-destroy (2026-06-11): merge a JSON patch into sandbox metadata.
+// Used by the backend to tag claimed pool sandboxes with appx.projectId so
+// the idle reaper classifies them as PROJECT (sleep, mode=stop) instead of
+// POOL (destroy + inline row delete) — the Phase-33 class where a claimed
+// sandbox's forge row vanished on idle-reap.
+func (q *Queries) MergeSandboxMetadata(ctx context.Context, arg MergeSandboxMetadataParams) (Sandbox, error) {
+	row := q.db.QueryRow(ctx, mergeSandboxMetadata, arg.ID, arg.Patch)
+	var i Sandbox
+	err := row.Scan(
+		&i.ID,
+		&i.AppName,
+		&i.UserID,
+		&i.NodeID,
+		&i.ContainerID,
+		&i.HostPort,
+		&i.Image,
+		&i.State,
+		&i.StateVersion,
+		&i.Resources,
+		&i.Env,
+		&i.IdleTimeoutSeconds,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.LastActiveAt,
+		&i.FailureCount,
+		&i.Metadata,
+		&i.VerifiedAt,
+	)
+	return i, err
+}
+
 const resetSandboxFailureCount = `-- name: ResetSandboxFailureCount :exec
 UPDATE sandboxes
 SET failure_count = 0, updated_at = NOW()

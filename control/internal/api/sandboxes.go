@@ -35,6 +35,12 @@ type SandboxLifecycle interface {
 	DispatchExec(ctx context.Context, sandboxID uuid.UUID, req lifecycle.ExecRequest) (string, error)
 }
 
+// SandboxMetadataWriter abstracts the metadata-merge store write
+// (sleep-not-destroy, 2026-06-11). Satisfied by *store.Queries.
+type SandboxMetadataWriter interface {
+	MergeSandboxMetadata(ctx context.Context, arg store.MergeSandboxMetadataParams) (store.Sandbox, error)
+}
+
 // SandboxReader abstracts the read-only store operations for sandbox handlers.
 type SandboxReader interface {
 	GetSandbox(ctx context.Context, id pgtype.UUID) (store.Sandbox, error)
@@ -365,6 +371,45 @@ func (s *Server) handleRestartSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// handleMergeSandboxMetadata handles PUT /v1/sandboxes/{id}/metadata.
+// Body: a flat JSON object merged into the sandbox's metadata (jsonb ||).
+// The backend calls this at pool-claim time to tag appx.projectId so the
+// idle reaper sleeps (rather than destroys) claimed sandboxes.
+func (s *Server) handleMergeSandboxMetadata(w http.ResponseWriter, r *http.Request) {
+	if s.sandboxMetaWriter == nil {
+		ServiceUnavailable(w, "sandbox metadata writer not configured")
+		return
+	}
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+	var patch map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil || len(patch) == 0 {
+		BadRequest(w, "body must be a non-empty JSON object")
+		return
+	}
+	raw, err := json.Marshal(patch)
+	if err != nil {
+		BadRequest(w, "unmarshalable patch")
+		return
+	}
+	sb, err := s.sandboxMetaWriter.MergeSandboxMetadata(r.Context(), store.MergeSandboxMetadataParams{
+		ID:    pgtype.UUID{Bytes: id, Valid: true},
+		Patch: raw,
+	})
+	if err != nil {
+		// Mirrors handleGetSandbox: a no-rows UPDATE and a real store error
+		// are both surfaced as 404 (the row either isn't there or isn't
+		// reachable); the caller treats the tag as best-effort.
+		NotFound(w, "sandbox not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, sandboxToResponse(sb))
 }
 
 // handleWakeSandbox handles POST /v1/sandboxes/{id}/wake.

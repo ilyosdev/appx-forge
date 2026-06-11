@@ -153,3 +153,15 @@ SET state = 'destroyed',
     state_version = state_version + 1
 WHERE app_name = $1
   AND state IN ('pending','starting','running','restarting');
+
+-- name: MergeSandboxMetadata :one
+-- Sleep-not-destroy (2026-06-11): merge a JSON patch into sandbox metadata.
+-- Used by the backend to tag claimed pool sandboxes with appx.projectId so
+-- the idle reaper classifies them as PROJECT (sleep, mode=stop) instead of
+-- POOL (destroy + inline row delete) — the Phase-33 class where a claimed
+-- sandbox's forge row vanished on idle-reap.
+UPDATE sandboxes
+SET metadata = metadata || sqlc.arg(patch)::jsonb,
+    updated_at = NOW()
+WHERE id = $1
+RETURNING *;

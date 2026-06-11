@@ -237,6 +237,7 @@ func main() {
 	)
 	srv.SetAgentDeps(adapter, lc)
 	srv.SetFilePushStore(&filePushAdapter{q: queries})
+	srv.SetSandboxMetadataWriter(queries)
 	srv.SetMetricsStore(adapter)
 	srv.SetRouteFetcher(caddyClient)
 	srv.SetEventStore(&eventStoreAdapter{q: queries})
