@@ -29,10 +29,13 @@ WHERE node_id = $1
   AND state IN ('pending', 'starting', 'running', 'restarting', 'destroying')
 `
 
-// CountSchedulableSandboxesByNode returns the authoritative count of
-// RAM-consuming sandboxes on a node (excludes terminal destroyed/failed and
-// RAM-freed stopped). Reflects a provision burst synchronously, unlike the
-// heartbeat-derived running_containers column.
+// Authoritative count of sandboxes that currently hold (or are about to hold)
+// a container's RAM on a node — i.e. RAM-consuming states only. Excludes
+// terminal states (destroyed, failed) and the RAM-freed stopped/sleeping
+// state. Used by the scheduler's per-node count cap so the backstop reflects
+// a provision burst SYNCHRONOUSLY (each CreateSandbox/AssignSandboxToNode is
+// committed to this table), unlike the heartbeat-derived running_containers
+// which is only refreshed every ~15s and goes stale during a burst/failover.
 func (q *Queries) CountSchedulableSandboxesByNode(ctx context.Context, nodeID pgtype.UUID) (int32, error) {
 	row := q.db.QueryRow(ctx, countSchedulableSandboxesByNode, nodeID)
 	var column_1 int32

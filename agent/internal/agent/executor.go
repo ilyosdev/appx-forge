@@ -82,6 +82,17 @@ type resourceSpec struct {
 // stopSandboxPayload is the payload for stop_sandbox commands.
 type stopSandboxPayload struct {
 	ContainerID string `json:"container_id"`
+	// Mode selects what "stop" means (sleep-not-destroy, 2026-06-11):
+	//   ""        — destroy (docker stop + rm + workdir RemoveAll + port
+	//               release). The default, so a control plane that predates
+	//               this field keeps today's behavior unchanged.
+	//   "stop"    — sleep: docker stop ONLY. Container, workdir, port
+	//               reservation and the in-memory entry are all KEPT so a
+	//               later start_sandbox can docker-start the same container
+	//               (wake ≈ sub-second; the built bundle survives on the
+	//               container fs).
+	//   "destroy" — explicit destroy (same as "").
+	Mode string `json:"mode,omitempty"`
 }
 
 // restartSandboxPayload is the payload for restart_sandbox commands.
@@ -143,11 +154,23 @@ func (e *CommandExecutor) Execute(ctx context.Context, cmd controlclient.Command
 
 // ── Command Handlers ────────────────────────────────────────────────────
 
-// executeStartSandbox allocates a port, creates a container, and tracks it.
+// executeStartSandbox starts a sandbox. Wake path (sleep-not-destroy,
+// 2026-06-11): if a stopped container for this app already exists,
+// docker-start it (sub-second — the built bundle survives on the container
+// fs) instead of remove-and-recreate. Falls through to the create path on
+// any reuse failure, so the cold path remains the safety net.
 func (e *CommandExecutor) executeStartSandbox(ctx context.Context, cmd controlclient.Command) error {
 	var payload startSandboxPayload
 	if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
 		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("invalid start_sandbox payload: %v", err))
+	}
+
+	// Wake fast-path: reuse an existing container for this app when present.
+	if reused, containerID, hostPort := e.tryStartExisting(ctx, cmd.SandboxID, payload.AppName); reused {
+		return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
+			"container_id": containerID,
+			"host_port":    hostPort,
+		})
 	}
 
 	// Allocate host port
@@ -200,7 +223,102 @@ func (e *CommandExecutor) executeStartSandbox(ctx context.Context, cmd controlcl
 	})
 }
 
-// executeStopSandbox stops and removes a container, releases its port.
+// tryStartExisting docker-starts a kept (slept) container for appName when
+// one exists. Returns (true, containerID, hostPort) on success; (false, …)
+// when there is no reusable container or the start failed — callers fall
+// through to the remove-and-recreate cold path (CreateContainer already
+// force-removes a same-name leftover, so a half-dead container can't block
+// the wake). Best-effort port re-reservation: the port may already be
+// reserved (slept in this process / boot adoption) — that's fine.
+func (e *CommandExecutor) tryStartExisting(
+	ctx context.Context,
+	sandboxID string,
+	appName string,
+) (bool, string, int) {
+	if appName == "" {
+		return false, "", 0
+	}
+	snaps, err := e.docker.ListContainers(ctx)
+	if err != nil {
+		e.logger.Warn("wake reuse: ListContainers failed — falling back to create",
+			"app_name", appName, "error", err)
+		return false, "", 0
+	}
+	for _, snap := range snaps {
+		if snap.AppName != appName {
+			continue
+		}
+		switch snap.State {
+		case "running":
+			// Idempotent: already up (e.g. duplicate start command).
+			e.adoptEntry(sandboxID, snap)
+			e.logger.Info("wake reuse: container already running",
+				"sandbox_id", sandboxID, "app_name", appName,
+				"container_id", snap.ContainerID, "host_port", snap.HostPort)
+			return true, snap.ContainerID, snap.HostPort
+		case "stopped":
+			if err := e.docker.StartContainer(ctx, snap.ContainerID); err != nil {
+				e.logger.Warn("wake reuse: docker start failed — falling back to create",
+					"app_name", appName, "container_id", snap.ContainerID, "error", err)
+				return false, "", 0
+			}
+			e.adoptEntry(sandboxID, snap)
+			e.logger.Info("sandbox woken (existing container started)",
+				"sandbox_id", sandboxID, "app_name", appName,
+				"container_id", snap.ContainerID, "host_port", snap.HostPort)
+			return true, snap.ContainerID, snap.HostPort
+		default:
+			// starting/restarting/failed — let the cold path sort it out.
+			return false, "", 0
+		}
+	}
+	return false, "", 0
+}
+
+// adoptEntry records a reused container in the in-memory map and re-reserves
+// its host port (idempotent — AllocateSpecific on an already-reserved port
+// just errors, which we ignore).
+func (e *CommandExecutor) adoptEntry(sandboxID string, snap docker.ContainerSnapshot) {
+	if snap.HostPort > 0 {
+		_ = e.ports.AllocateSpecific(snap.HostPort)
+	}
+	e.mu.Lock()
+	e.sandboxes[sandboxID] = &sandboxInfo{
+		ContainerID: snap.ContainerID,
+		HostPort:    snap.HostPort,
+		AppName:     snap.AppName,
+	}
+	e.mu.Unlock()
+}
+
+// AdoptBootSnapshot re-reserves the host ports of every container Docker
+// already knows about (running AND stopped). Called once at agent startup:
+// the port allocator is in-memory only, so without this a restarted agent
+// could hand a slept container's port to a new sandbox and the eventual
+// docker-start would fail with "address already in use". (The in-memory
+// sandbox map itself is rebuilt lazily — the wake fast-path resolves
+// containers by app name from Docker truth, not from the map.)
+func (e *CommandExecutor) AdoptBootSnapshot(snaps []docker.ContainerSnapshot) {
+	reserved := 0
+	for _, snap := range snaps {
+		if snap.HostPort <= 0 {
+			continue
+		}
+		if err := e.ports.AllocateSpecific(snap.HostPort); err == nil {
+			reserved++
+		}
+	}
+	if reserved > 0 {
+		e.logger.Info("boot adoption: re-reserved host ports of existing containers",
+			"reserved", reserved, "total_containers", len(snaps))
+	}
+}
+
+// executeStopSandbox stops a container. mode="stop" sleeps it (docker stop
+// only — container/workdir/port/in-memory entry kept for a sub-second
+// docker-start wake); any other mode destroys it (stop + rm + workdir
+// RemoveAll + port release), which is the pre-2026-06-11 behavior and the
+// default for payloads that don't carry the field.
 func (e *CommandExecutor) executeStopSandbox(ctx context.Context, cmd controlclient.Command) error {
 	var payload stopSandboxPayload
 	if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
@@ -210,6 +328,17 @@ func (e *CommandExecutor) executeStopSandbox(ctx context.Context, cmd controlcli
 	// Stop container with 10s timeout
 	if err := e.docker.StopContainer(ctx, payload.ContainerID, 10*time.Second); err != nil {
 		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("stop container failed: %v", err))
+	}
+
+	// Sleep-not-destroy: keep everything for a fast docker-start wake.
+	if payload.Mode == "stop" {
+		e.logger.Info("sandbox slept (container kept for wake)",
+			"sandbox_id", cmd.SandboxID,
+			"container_id", payload.ContainerID,
+		)
+		return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
+			"slept": true,
+		})
 	}
 
 	// Remove container

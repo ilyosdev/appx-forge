@@ -2,8 +2,10 @@ package lifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -14,15 +16,23 @@ import (
 // ── Mock IdleReaperStore ────────────────────────────────────────────
 
 type mockIdleReaperStore struct {
-	listIdleSandboxesFn   func(ctx context.Context) ([]store.Sandbox, error)
-	transitionStateFn     func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
-	recordEventFn         func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
-	createCommandFn       func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
+	listIdleSandboxesFn  func(ctx context.Context) ([]store.Sandbox, error)
+	listStoppedExpiredFn func(ctx context.Context, retentionSeconds int32) ([]store.Sandbox, error)
+	transitionStateFn    func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
+	recordEventFn        func(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
+	createCommandFn      func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
 }
 
 func (m *mockIdleReaperStore) ListIdleSandboxes(ctx context.Context) ([]store.Sandbox, error) {
 	if m.listIdleSandboxesFn != nil {
 		return m.listIdleSandboxesFn(ctx)
+	}
+	return nil, nil
+}
+
+func (m *mockIdleReaperStore) ListStoppedExpired(ctx context.Context, retentionSeconds int32) ([]store.Sandbox, error) {
+	if m.listStoppedExpiredFn != nil {
+		return m.listStoppedExpiredFn(ctx, retentionSeconds)
 	}
 	return nil, nil
 }
@@ -92,7 +102,7 @@ func TestIdleReaper_NoIdleSandboxes(t *testing.T) {
 		return store.Sandbox{}, nil
 	}
 
-	reaper := NewIdleReaper(ms, nil, nil, 0)
+	reaper := NewIdleReaper(ms, nil, nil, 0, 0)
 	err := reaper.reap(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -131,7 +141,7 @@ func TestIdleReaper_TwoIdleSandboxes(t *testing.T) {
 	}
 
 	notifier := &mockReaperNotifier{}
-	reaper := NewIdleReaper(ms, notifier, nil, 0)
+	reaper := NewIdleReaper(ms, notifier, nil, 0, 0)
 	err := reaper.reap(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -208,7 +218,7 @@ func TestIdleReaper_ContinuesOnTransitionFailure(t *testing.T) {
 	}
 
 	notifier := &mockReaperNotifier{}
-	reaper := NewIdleReaper(ms, notifier, nil, 0)
+	reaper := NewIdleReaper(ms, notifier, nil, 0, 0)
 	err := reaper.reap(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -236,7 +246,7 @@ func TestIdleReaper_CallsRouteNotifier(t *testing.T) {
 	}
 
 	notifier := &mockReaperNotifier{}
-	reaper := NewIdleReaper(ms, notifier, nil, 0)
+	reaper := NewIdleReaper(ms, notifier, nil, 0, 0)
 	err := reaper.reap(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -265,7 +275,7 @@ func TestIdleReaper_RecordsIdleTimeoutEvent(t *testing.T) {
 		return store.Event{}, nil
 	}
 
-	reaper := NewIdleReaper(ms, nil, nil, 0)
+	reaper := NewIdleReaper(ms, nil, nil, 0, 0)
 	err := reaper.reap(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -286,5 +296,92 @@ func TestIdleReaper_RecordsIdleTimeoutEvent(t *testing.T) {
 	}
 	if ev.NextState.String != "stopped" {
 		t.Errorf("expected next_state 'stopped', got %q", ev.NextState.String)
+	}
+}
+
+// ── Sleep-not-destroy (2026-06-11) ──────────────────────────────────
+
+func TestIdleReaper_ProjectSleepsPoolDestroys(t *testing.T) {
+	project := makeIdleSandbox("proj-app")
+	project.Metadata = []byte(`{"appx.projectId":"p-123"}`)
+	pool := makeIdleSandbox("pool-app")
+	pool.Metadata = []byte(`{}`)
+
+	ms := &mockIdleReaperStore{
+		listIdleSandboxesFn: func(ctx context.Context) ([]store.Sandbox, error) {
+			return []store.Sandbox{project, pool}, nil
+		},
+	}
+	var commands []store.CreateCommandParams
+	ms.createCommandFn = func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+		commands = append(commands, arg)
+		return store.Command{}, nil
+	}
+
+	reaper := NewIdleReaper(ms, &mockReaperNotifier{}, nil, 0, 0)
+	if err := reaper.reap(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(commands) != 2 {
+		t.Fatalf("expected 2 stop commands, got %d", len(commands))
+	}
+	for _, cmd := range commands {
+		var payload map[string]interface{}
+		if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+			t.Fatalf("bad payload: %v", err)
+		}
+		mode, hasMode := payload["mode"]
+		if cmd.SandboxID == project.ID {
+			if !hasMode || mode != "stop" {
+				t.Errorf("project sandbox must sleep (mode=stop), payload=%s", cmd.Payload)
+			}
+		}
+		if cmd.SandboxID == pool.ID {
+			if hasMode {
+				t.Errorf("pool sandbox must keep destroy semantics (no mode), payload=%s", cmd.Payload)
+			}
+		}
+	}
+}
+
+func TestIdleReaper_SecondTierDestroysExpired(t *testing.T) {
+	expired := makeIdleSandbox("old-slept-app")
+	expired.State = "stopped"
+
+	var askedRetention int32
+	ms := &mockIdleReaperStore{
+		listStoppedExpiredFn: func(ctx context.Context, retentionSeconds int32) ([]store.Sandbox, error) {
+			askedRetention = retentionSeconds
+			return []store.Sandbox{expired}, nil
+		},
+	}
+	var transitions []store.TransitionSandboxStateParams
+	ms.transitionStateFn = func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+		transitions = append(transitions, arg)
+		return store.Sandbox{State: arg.State}, nil
+	}
+	var commands []store.CreateCommandParams
+	ms.createCommandFn = func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+		commands = append(commands, arg)
+		return store.Command{}, nil
+	}
+
+	reaper := NewIdleReaper(ms, &mockReaperNotifier{}, nil, 0, 2*time.Hour)
+	if err := reaper.reapExpired(context.Background()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if askedRetention != 7200 {
+		t.Errorf("expected retention 7200s, got %d", askedRetention)
+	}
+	if len(transitions) != 1 || transitions[0].State != "destroyed" || transitions[0].State_2 != "stopped" {
+		t.Errorf("expected stopped->destroyed transition, got %+v", transitions)
+	}
+	if len(commands) != 1 {
+		t.Fatalf("expected 1 destroy command, got %d", len(commands))
+	}
+	var payload map[string]interface{}
+	_ = json.Unmarshal(commands[0].Payload, &payload)
+	if _, hasMode := payload["mode"]; hasMode {
+		t.Errorf("second-tier destroy must NOT carry mode=stop, payload=%s", commands[0].Payload)
 	}
 }

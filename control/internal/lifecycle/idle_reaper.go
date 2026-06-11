@@ -16,6 +16,7 @@ import (
 // IdleReaperStore abstracts the database operations needed by the idle reaper.
 type IdleReaperStore interface {
 	ListIdleSandboxes(ctx context.Context) ([]store.Sandbox, error)
+	ListStoppedExpired(ctx context.Context, retentionSeconds int32) ([]store.Sandbox, error)
 	TransitionSandboxState(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error)
 	RecordEvent(ctx context.Context, arg store.RecordEventParams) (store.Event, error)
 	CreateCommand(ctx context.Context, arg store.CreateCommandParams) (store.Command, error)
@@ -30,22 +31,32 @@ type IdleReaper struct {
 	notifier RouteNotifier
 	logger   *slog.Logger
 	interval time.Duration
+	// retention is how long a slept (stopped, kept-on-disk) sandbox may
+	// exist before the second-tier pass destroys it for real.
+	// 0 defaults to 24h.
+	retention time.Duration
 }
 
 // NewIdleReaper creates a new IdleReaper.
 // interval is how often reap() is called; 0 defaults to 60s.
-func NewIdleReaper(store IdleReaperStore, notifier RouteNotifier, logger *slog.Logger, interval time.Duration) *IdleReaper {
+// retention is how long slept sandboxes are kept before second-tier
+// destruction; 0 defaults to 24h.
+func NewIdleReaper(store IdleReaperStore, notifier RouteNotifier, logger *slog.Logger, interval time.Duration, retention time.Duration) *IdleReaper {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	if interval <= 0 {
 		interval = 60 * time.Second
 	}
+	if retention <= 0 {
+		retention = 24 * time.Hour
+	}
 	return &IdleReaper{
-		store:    store,
-		notifier: notifier,
-		logger:   logger,
-		interval: interval,
+		store:     store,
+		notifier:  notifier,
+		logger:    logger,
+		interval:  interval,
+		retention: retention,
 	}
 }
 
@@ -65,6 +76,9 @@ func (r *IdleReaper) Run(ctx context.Context) {
 		case <-ticker.C:
 			if err := r.reap(ctx); err != nil {
 				r.logger.Error("idle reap cycle failed", "error", err)
+			}
+			if err := r.reapExpired(ctx); err != nil {
+				r.logger.Error("second-tier reap cycle failed", "error", err)
 			}
 		}
 	}
@@ -101,6 +115,86 @@ func (r *IdleReaper) reap(ctx context.Context) error {
 	return nil
 }
 
+// reapExpired is the second tier (sleep-not-destroy, 2026-06-11): slept
+// sandboxes older than the retention window are destroyed for real. The
+// stopped->destroyed transition is direct per the state machine; the
+// dispatched stop command carries NO mode field, which the agent treats
+// as destroy (rm + workdir removal + port release). The heartbeat
+// reconciler's orphan pass is the backstop if the command is lost.
+func (r *IdleReaper) reapExpired(ctx context.Context) error {
+	expired, err := r.store.ListStoppedExpired(ctx, int32(r.retention.Seconds()))
+	if err != nil {
+		return err
+	}
+	destroyed := 0
+	for _, sb := range expired {
+		if err := r.destroyExpired(ctx, sb); err != nil {
+			r.logger.Warn("failed to destroy expired slept sandbox",
+				"error", err,
+				"sandbox_id", uuid.UUID(sb.ID.Bytes).String(),
+				"app_name", sb.AppName,
+			)
+			continue
+		}
+		destroyed++
+	}
+	if destroyed > 0 {
+		r.logger.Info("second-tier reap complete", "destroyed", destroyed, "total_expired", len(expired))
+	}
+	return nil
+}
+
+func (r *IdleReaper) destroyExpired(ctx context.Context, sb store.Sandbox) error {
+	sandboxID := uuid.UUID(sb.ID.Bytes)
+
+	// stopped --destroy_requested--> destroyed (direct; container is not
+	// running, the agent rm of an exited container is near-instant).
+	_, err := r.store.TransitionSandboxState(ctx, store.TransitionSandboxStateParams{
+		State:   string(models.StateDestroyed),
+		ID:      sb.ID,
+		State_2: string(models.StateStopped),
+	})
+	if err != nil {
+		return err
+	}
+
+	cmdPayload, _ := json.Marshal(map[string]interface{}{
+		"container_id": sb.ContainerID.String,
+		"reason":       "stopped_retention_expired",
+		// no mode -> agent destroys (rm + workdir + port release)
+	})
+	cmdID := uuid.New()
+	if _, err := r.store.CreateCommand(ctx, store.CreateCommandParams{
+		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},
+		NodeID:         sb.NodeID,
+		SandboxID:      sb.ID,
+		CommandType:    string(models.CmdStopSandbox),
+		Payload:        cmdPayload,
+		TimeoutSeconds: 60,
+	}); err != nil {
+		r.logger.Warn("failed to create destroy command for expired slept sandbox",
+			"error", err, "sandbox_id", sandboxID)
+		// Continue — reconciler orphan pass is the backstop.
+	}
+
+	if _, err := r.store.RecordEvent(ctx, store.RecordEventParams{
+		SandboxID: sb.ID,
+		NodeID:    sb.NodeID,
+		EventType: string(models.EventDestroyRequest),
+		Actor:     "idle-reaper",
+		PrevState: pgtype.Text{String: string(models.StateStopped), Valid: true},
+		NextState: pgtype.Text{String: string(models.StateDestroyed), Valid: true},
+		Payload:   []byte(`{"reason":"stopped_retention_expired"}`),
+	}); err != nil {
+		r.logger.Warn("failed to record retention-destroy event",
+			"error", err, "sandbox_id", sandboxID)
+	}
+
+	r.logger.Info("destroyed expired slept sandbox",
+		"sandbox_id", sandboxID, "app_name", sb.AppName)
+	return nil
+}
+
 // reapOne transitions a single sandbox from running to stopped, dispatches a
 // stop command, records an event, and notifies the route manager.
 func (r *IdleReaper) reapOne(ctx context.Context, sb store.Sandbox) error {
@@ -116,11 +210,20 @@ func (r *IdleReaper) reapOne(ctx context.Context, sb store.Sandbox) error {
 		return err
 	}
 
-	// 2. Dispatch stop_sandbox command to agent
-	cmdPayload, _ := json.Marshal(map[string]interface{}{
+	// 2. Dispatch stop_sandbox command to agent.
+	// Sleep-not-destroy (2026-06-11): PROJECT sandboxes sleep (mode=stop —
+	// container kept for a sub-second docker-start wake; second-tier reap
+	// destroys after the retention window). POOL sandboxes keep destroy
+	// semantics: they are fungible and lifecycle.go's stop-ack handler
+	// deletes their DB row inline — sleeping them would just hoard disk.
+	payloadMap := map[string]interface{}{
 		"container_id": sb.ContainerID.String,
 		"reason":       "idle_timeout",
-	})
+	}
+	if !isPoolSandbox(sb.Metadata) {
+		payloadMap["mode"] = "stop"
+	}
+	cmdPayload, _ := json.Marshal(payloadMap)
 	cmdID := uuid.New()
 	_, err = r.store.CreateCommand(ctx, store.CreateCommandParams{
 		ID:             pgtype.UUID{Bytes: cmdID, Valid: true},

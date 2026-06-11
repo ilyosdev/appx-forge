@@ -69,6 +69,20 @@ func (q *Queries) CreateCommand(ctx context.Context, arg CreateCommandParams) (C
 	return i, err
 }
 
+const deleteCommandsForSandbox = `-- name: DeleteCommandsForSandbox :exec
+DELETE FROM commands WHERE sandbox_id = $1
+`
+
+// Phase 33-Real-8 — purge command rows referencing a sandbox before
+// DELETE FROM sandboxes can succeed (the commands_sandbox_id_fkey FK
+// has no ON DELETE CASCADE). Used by the post-stop-ack pool cleanup
+// path that destroys terminal pool sandboxes inline rather than waiting
+// on cron.
+func (q *Queries) DeleteCommandsForSandbox(ctx context.Context, sandboxID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteCommandsForSandbox, sandboxID)
+	return err
+}
+
 const getCommand = `-- name: GetCommand :one
 SELECT id, node_id, sandbox_id, command_type, payload, status, dispatched_at, acked_at, result, timeout_seconds, created_at FROM commands WHERE id = $1
 `
@@ -135,17 +149,4 @@ func (q *Queries) PollPendingCommands(ctx context.Context, nodeID pgtype.UUID) (
 		return nil, err
 	}
 	return items, nil
-}
-
-// Phase 33-Real-8 — hand-edited DeleteCommandsForSandbox. Purges
-// command rows referencing the sandbox so a subsequent
-// DELETE FROM sandboxes can succeed (commands_sandbox_id_fkey FK has
-// no ON DELETE CASCADE). Keep this in sync with queries/commands.sql.
-const deleteCommandsForSandbox = `-- name: DeleteCommandsForSandbox :exec
-DELETE FROM commands WHERE sandbox_id = $1
-`
-
-func (q *Queries) DeleteCommandsForSandbox(ctx context.Context, sandboxID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, deleteCommandsForSandbox, sandboxID)
-	return err
 }

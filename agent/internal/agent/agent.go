@@ -116,6 +116,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 	a.logger.Info("startup snapshot complete", "containers", len(initial))
 
+	// Sleep-not-destroy (2026-06-11): re-reserve the host ports of every
+	// container Docker already knows about — running AND slept. The port
+	// allocator is in-memory only; before this, an agent restart could hand
+	// a kept container's port to a new sandbox (collision on docker start).
+	a.executor.AdoptBootSnapshot(initial)
+
 	// Step 1: Register with control plane (retries internally)
 	a.logger.Info("registering with control plane", "url", a.cfg.ControlURL)
 	regResp, err := a.ctrlClient.Register(ctx)

@@ -18,6 +18,10 @@ type Config struct {
 	CaddyAdminURL string `envconfig:"FORGE_CADDY_ADMIN_URL" default:"http://localhost:2019"`
 
 	IdleReaperIntervalSeconds    int `envconfig:"FORGE_IDLE_REAPER_INTERVAL_SECONDS" default:"60"`
+	// Sleep-not-destroy (2026-06-11): how long a slept (docker-stopped,
+	// kept-on-disk) sandbox survives before the second-tier reap destroys
+	// it for real. A slept container costs ~1.2MB disk and 0 RAM.
+	StoppedRetentionSeconds      int `envconfig:"FORGE_STOPPED_RETENTION_SECONDS" default:"86400"`
 	DriftDetectorIntervalSeconds int `envconfig:"FORGE_DRIFT_DETECTOR_INTERVAL_SECONDS" default:"60"`
 
 	// Hard per-node sandbox count cap enforced by the scheduler. A node

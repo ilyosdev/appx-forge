@@ -26,6 +26,8 @@ type mockDockerClient struct {
 	removeContainerFn func(ctx context.Context, containerID string) error
 	restartContainerFn func(ctx context.Context, containerID string, timeout time.Duration) error
 	getLogsFn         func(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
+	startContainerFn  func(ctx context.Context, containerID string) error
+	listContainersFn  func(ctx context.Context) ([]docker.ContainerSnapshot, error)
 	execRunFn         func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
 
 	// Track calls for assertions
@@ -35,6 +37,7 @@ type mockDockerClient struct {
 	restartCalls []string
 	logCalls     []string
 	execCalls    []execCall
+	startCalls   []string
 }
 
 // execCall captures one invocation of mockDockerClient.ExecRun so tests
@@ -61,6 +64,12 @@ func (m *mockDockerClient) CreateContainer(ctx context.Context, spec *docker.San
 }
 
 func (m *mockDockerClient) StartContainer(ctx context.Context, containerID string) error {
+	m.mu.Lock()
+	m.startCalls = append(m.startCalls, containerID)
+	m.mu.Unlock()
+	if m.startContainerFn != nil {
+		return m.startContainerFn(ctx, containerID)
+	}
 	return nil
 }
 
@@ -120,7 +129,10 @@ func (m *mockDockerClient) EventsStream(ctx context.Context, since time.Time) (<
 	return ch, errCh
 }
 
-func (m *mockDockerClient) ListContainers(_ context.Context) ([]docker.ContainerSnapshot, error) {
+func (m *mockDockerClient) ListContainers(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+	if m.listContainersFn != nil {
+		return m.listContainersFn(ctx)
+	}
 	return []docker.ContainerSnapshot{}, nil
 }
 
@@ -481,5 +493,193 @@ func TestExecuteUnknownCommandType(t *testing.T) {
 	}
 	if !strings.Contains(a.errMsg, "unknown command type") {
 		t.Errorf("expected 'unknown command type' in error, got %s", a.errMsg)
+	}
+}
+
+// ── Sleep-not-destroy (2026-06-11) ─────────────────────────────────────
+
+func TestExecuteStopSandboxModeStop_KeepsEverything(t *testing.T) {
+	dc := newMockDockerClient()
+	ack := &mockAckReporter{}
+	exec := newTestExecutor(dc, ack)
+
+	exec.mu.Lock()
+	exec.sandboxes["sandbox-sleep"] = &sandboxInfo{
+		ContainerID: "container-sleep",
+		HostPort:    40003,
+		AppName:     "sleep-app",
+	}
+	exec.mu.Unlock()
+	exec.ports.AllocateSpecific(40003)
+
+	cmd := makeCommand("stop_sandbox", "sandbox-sleep", map[string]interface{}{
+		"container_id": "container-sleep",
+		"mode":         "stop",
+	})
+	if err := exec.Execute(context.Background(), cmd); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	dc.mu.Lock()
+	if len(dc.stopCalls) != 1 || dc.stopCalls[0] != "container-sleep" {
+		t.Errorf("expected StopContainer(container-sleep), got %v", dc.stopCalls)
+	}
+	if len(dc.removeCalls) != 0 {
+		t.Errorf("mode=stop must NOT remove the container, got removeCalls=%v", dc.removeCalls)
+	}
+	dc.mu.Unlock()
+
+	if a := ack.lastAck(); a.status != "success" {
+		t.Errorf("expected ack status=success, got %s", a.status)
+	}
+
+	// Entry kept for wake.
+	exec.mu.RLock()
+	info, ok := exec.sandboxes["sandbox-sleep"]
+	exec.mu.RUnlock()
+	if !ok || info.HostPort != 40003 {
+		t.Error("mode=stop must keep the in-memory entry (port reservation included)")
+	}
+	// Port still reserved: re-reserving it must fail.
+	if err := exec.ports.AllocateSpecific(40003); err == nil {
+		t.Error("mode=stop must keep the host port reserved")
+	}
+}
+
+func TestExecuteStopSandboxNoMode_StillDestroys(t *testing.T) {
+	dc := newMockDockerClient()
+	ack := &mockAckReporter{}
+	exec := newTestExecutor(dc, ack)
+
+	exec.mu.Lock()
+	exec.sandboxes["sandbox-old"] = &sandboxInfo{
+		ContainerID: "container-old",
+		HostPort:    40004,
+		AppName:     "old-app",
+	}
+	exec.mu.Unlock()
+	exec.ports.AllocateSpecific(40004)
+
+	// Payload WITHOUT mode — a pre-field control plane.
+	cmd := makeCommand("stop_sandbox", "sandbox-old", map[string]interface{}{
+		"container_id": "container-old",
+	})
+	if err := exec.Execute(context.Background(), cmd); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	dc.mu.Lock()
+	if len(dc.removeCalls) != 1 {
+		t.Errorf("absent mode must keep destroy semantics, got removeCalls=%v", dc.removeCalls)
+	}
+	dc.mu.Unlock()
+}
+
+func TestExecuteStartSandbox_WakesStoppedContainer(t *testing.T) {
+	dc := newMockDockerClient()
+	dc.listContainersFn = func(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+		return []docker.ContainerSnapshot{
+			{AppName: "wake-app", State: "stopped", HostPort: 40005, ContainerID: "container-wake"},
+		}, nil
+	}
+	ack := &mockAckReporter{}
+	exec := newTestExecutor(dc, ack)
+
+	cmd := makeCommand("start_sandbox", "sandbox-wake", map[string]interface{}{
+		"app_name": "wake-app",
+		"image":    "appx/sandbox:v12",
+		"resources": map[string]interface{}{
+			"cpu_cores": 0.5,
+			"memory_mb": 512,
+		},
+	})
+	if err := exec.Execute(context.Background(), cmd); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	dc.mu.Lock()
+	if len(dc.startCalls) != 1 || dc.startCalls[0] != "container-wake" {
+		t.Errorf("expected StartContainer(container-wake), got %v", dc.startCalls)
+	}
+	if len(dc.createCalls) != 0 {
+		t.Errorf("wake must reuse the container, not create — got createCalls=%v", dc.createCalls)
+	}
+	dc.mu.Unlock()
+
+	a := ack.lastAck()
+	if a.status != "success" {
+		t.Fatalf("expected ack status=success, got %s", a.status)
+	}
+	result, ok := a.result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map ack result, got %T", a.result)
+	}
+	if result["container_id"] != "container-wake" {
+		t.Errorf("ack must carry the reused container_id, got %v", result["container_id"])
+	}
+	if port, ok := result["host_port"].(int); ok && port != 40005 {
+		t.Errorf("ack must carry the reused host_port, got %d", port)
+	}
+
+	// Map adopted.
+	exec.mu.RLock()
+	info, ok := exec.sandboxes["sandbox-wake"]
+	exec.mu.RUnlock()
+	if !ok || info.ContainerID != "container-wake" || info.HostPort != 40005 {
+		t.Errorf("wake must adopt the container into the map, got %+v", info)
+	}
+}
+
+func TestExecuteStartSandbox_FallsBackToCreateWhenStartFails(t *testing.T) {
+	dc := newMockDockerClient()
+	dc.listContainersFn = func(ctx context.Context) ([]docker.ContainerSnapshot, error) {
+		return []docker.ContainerSnapshot{
+			{AppName: "broken-app", State: "stopped", HostPort: 40006, ContainerID: "container-broken"},
+		}, nil
+	}
+	dc.startContainerFn = func(ctx context.Context, containerID string) error {
+		return errors.New("dead container")
+	}
+	ack := &mockAckReporter{}
+	exec := newTestExecutor(dc, ack)
+
+	cmd := makeCommand("start_sandbox", "sandbox-fall", map[string]interface{}{
+		"app_name": "broken-app",
+		"image":    "appx/sandbox:v12",
+		"resources": map[string]interface{}{
+			"cpu_cores": 0.5,
+			"memory_mb": 512,
+		},
+	})
+	if err := exec.Execute(context.Background(), cmd); err != nil {
+		t.Fatalf("Execute returned error: %v", err)
+	}
+
+	dc.mu.Lock()
+	if len(dc.createCalls) != 1 {
+		t.Errorf("failed wake must fall back to CreateContainer, got createCalls=%d", len(dc.createCalls))
+	}
+	dc.mu.Unlock()
+	if a := ack.lastAck(); a.status != "success" {
+		t.Errorf("expected fallback create to succeed, got %s", a.status)
+	}
+}
+
+func TestAdoptBootSnapshot_ReservesPorts(t *testing.T) {
+	dc := newMockDockerClient()
+	ack := &mockAckReporter{}
+	exec := newTestExecutor(dc, ack)
+
+	exec.AdoptBootSnapshot([]docker.ContainerSnapshot{
+		{AppName: "a", State: "stopped", HostPort: 40007, ContainerID: "c1"},
+		{AppName: "b", State: "running", HostPort: 40008, ContainerID: "c2"},
+		{AppName: "no-port", State: "stopped", HostPort: 0, ContainerID: "c3"},
+	})
+
+	if err := exec.ports.AllocateSpecific(40007); err == nil {
+		t.Error("boot adoption must reserve the slept container port 40007")
+	}
+	if err := exec.ports.AllocateSpecific(40008); err == nil {
+		t.Error("boot adoption must reserve the running container port 40008")
 	}
 }

@@ -68,6 +68,16 @@ WHERE state = 'running'
   AND last_active_at < NOW() - (idle_timeout_seconds || ' seconds')::INTERVAL
 ORDER BY last_active_at ASC;
 
+-- name: ListStoppedExpired :many
+-- Sleep-not-destroy (2026-06-11): slept (docker-stopped, kept-on-disk)
+-- sandboxes older than the retention window — the second-tier reaper
+-- destroys these for real. updated_at is bumped by the running->stopped
+-- transition, so this measures time-since-sleep.
+SELECT * FROM sandboxes
+WHERE state = 'stopped'
+  AND updated_at < NOW() - (sqlc.arg(retention_seconds)::int || ' seconds')::INTERVAL
+ORDER BY updated_at ASC;
+
 -- name: IncrementSandboxFailureCount :one
 UPDATE sandboxes
 SET failure_count = failure_count + 1, updated_at = NOW()
@@ -137,7 +147,7 @@ WHERE node_id = $1
 -- name: MarkSandboxDestroyed :exec
 UPDATE sandboxes
 SET state = 'destroyed',
-    metadata = metadata || jsonb_build_object('reason', $2::text),
+    metadata = metadata || jsonb_build_object('reason', sqlc.arg(reason)::text),
     verified_at = NOW(),
     updated_at = NOW(),
     state_version = state_version + 1

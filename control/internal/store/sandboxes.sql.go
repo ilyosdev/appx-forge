@@ -84,6 +84,11 @@ type AssignSandboxToNodeUnderCapParams struct {
 // (the TOCTOU window this guards against). When the node is at/over cap the
 // UPDATE matches zero rows and returns no row (pgx.ErrNoRows), so the caller
 // picks another node or returns ErrNoCapacity.
+//
+// NOTE: @cap is a named parameter (sqlc.arg) so the generated binding is a
+// typed INT field (Cap int32), NOT a UUID. A previous attempt left this as a
+// bare $3 positional which sqlc mis-bound to the node UUID, producing
+// "operator does not exist: bigint < uuid" at runtime on every capped assign.
 func (q *Queries) AssignSandboxToNodeUnderCap(ctx context.Context, arg AssignSandboxToNodeUnderCapParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, assignSandboxToNodeUnderCap, arg.NodeID, arg.ID, arg.Cap)
 	var i Sandbox
@@ -556,6 +561,192 @@ func (q *Queries) ListSandboxesByUser(ctx context.Context, userID string) ([]San
 	return items, nil
 }
 
+const listSandboxesForNode = `-- name: ListSandboxesForNode :many
+SELECT app_name, state, created_at
+FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('pending','starting','running','restarting')
+`
+
+type ListSandboxesForNodeRow struct {
+	AppName   string             `json:"app_name"`
+	State     string             `json:"state"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]ListSandboxesForNodeRow, error) {
+	rows, err := q.db.Query(ctx, listSandboxesForNode, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSandboxesForNodeRow{}
+	for rows.Next() {
+		var i ListSandboxesForNodeRow
+		if err := rows.Scan(&i.AppName, &i.State, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStoppedExpired = `-- name: ListStoppedExpired :many
+SELECT id, app_name, user_id, node_id, container_id, host_port, image, state, state_version, resources, env, idle_timeout_seconds, created_at, updated_at, last_active_at, failure_count, metadata, verified_at FROM sandboxes
+WHERE state = 'stopped'
+  AND updated_at < NOW() - ($1::int || ' seconds')::INTERVAL
+ORDER BY updated_at ASC
+`
+
+// Sleep-not-destroy (2026-06-11): slept (docker-stopped, kept-on-disk)
+// sandboxes older than the retention window — the second-tier reaper
+// destroys these for real. updated_at is bumped by the running->stopped
+// transition, so this measures time-since-sleep.
+func (q *Queries) ListStoppedExpired(ctx context.Context, retentionSeconds int32) ([]Sandbox, error) {
+	rows, err := q.db.Query(ctx, listStoppedExpired, retentionSeconds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Sandbox{}
+	for rows.Next() {
+		var i Sandbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.AppName,
+			&i.UserID,
+			&i.NodeID,
+			&i.ContainerID,
+			&i.HostPort,
+			&i.Image,
+			&i.State,
+			&i.StateVersion,
+			&i.Resources,
+			&i.Env,
+			&i.IdleTimeoutSeconds,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastActiveAt,
+			&i.FailureCount,
+			&i.Metadata,
+			&i.VerifiedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTerminalSandboxesForNode = `-- name: ListTerminalSandboxesForNode :many
+SELECT id, app_name, container_id
+FROM sandboxes
+WHERE node_id = $1
+  AND state IN ('failed', 'destroying', 'destroyed')
+  AND container_id IS NOT NULL
+  AND container_id <> ''
+`
+
+type ListTerminalSandboxesForNodeRow struct {
+	ID          pgtype.UUID `json:"id"`
+	AppName     string      `json:"app_name"`
+	ContainerID pgtype.Text `json:"container_id"`
+}
+
+// Phase 33-Real-7 — returns rows the reconciler must issue stop_sandbox
+// for: state is terminal but the agent still observes the container,
+// so the orphan needs explicit destroy dispatch.
+func (q *Queries) ListTerminalSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]ListTerminalSandboxesForNodeRow, error) {
+	rows, err := q.db.Query(ctx, listTerminalSandboxesForNode, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTerminalSandboxesForNodeRow{}
+	for rows.Next() {
+		var i ListTerminalSandboxesForNodeRow
+		if err := rows.Scan(&i.ID, &i.AppName, &i.ContainerID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markSandboxAgentLost = `-- name: MarkSandboxAgentLost :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', 'agent_lost_at_heartbeat'),
+    verified_at = NOW()
+WHERE app_name = $1
+  AND node_id = $2
+  AND state IN ('pending','starting','running','restarting')
+  AND created_at < NOW() - INTERVAL '60 seconds'
+`
+
+type MarkSandboxAgentLostParams struct {
+	AppName string      `json:"app_name"`
+	NodeID  pgtype.UUID `json:"node_id"`
+}
+
+func (q *Queries) MarkSandboxAgentLost(ctx context.Context, arg MarkSandboxAgentLostParams) error {
+	_, err := q.db.Exec(ctx, markSandboxAgentLost, arg.AppName, arg.NodeID)
+	return err
+}
+
+const markSandboxDestroyed = `-- name: MarkSandboxDestroyed :exec
+UPDATE sandboxes
+SET state = 'destroyed',
+    metadata = metadata || jsonb_build_object('reason', $2::text),
+    verified_at = NOW(),
+    updated_at = NOW(),
+    state_version = state_version + 1
+WHERE app_name = $1
+  AND state IN ('pending','starting','running','restarting')
+`
+
+type MarkSandboxDestroyedParams struct {
+	AppName string `json:"app_name"`
+	Reason  string `json:"reason"`
+}
+
+func (q *Queries) MarkSandboxDestroyed(ctx context.Context, arg MarkSandboxDestroyedParams) error {
+	_, err := q.db.Exec(ctx, markSandboxDestroyed, arg.AppName, arg.Reason)
+	return err
+}
+
+const markSandboxVerified = `-- name: MarkSandboxVerified :exec
+UPDATE sandboxes
+SET verified_at = NOW(), state = $2
+WHERE app_name = $1
+  AND verified_at < NOW()
+  AND state IN ('pending','starting','running','restarting','stopped')
+`
+
+type MarkSandboxVerifiedParams struct {
+	AppName string `json:"app_name"`
+	State   string `json:"state"`
+}
+
+// Phase 33-Real-7 — guard against silent terminal-state flip. Without
+// the state-IN clause, a heartbeat reporting state='running' for an
+// app_name whose row is failed/destroying/destroyed would silently
+// resurrect it. Terminal rows must only leave terminal state via the
+// lifecycle layer's explicit transitions.
+func (q *Queries) MarkSandboxVerified(ctx context.Context, arg MarkSandboxVerifiedParams) error {
+	_, err := q.db.Exec(ctx, markSandboxVerified, arg.AppName, arg.State)
+	return err
+}
+
 const resetSandboxFailureCount = `-- name: ResetSandboxFailureCount :exec
 UPDATE sandboxes
 SET failure_count = 0, updated_at = NOW()
@@ -629,142 +820,5 @@ type UpdateSandboxRuntimeParams struct {
 
 func (q *Queries) UpdateSandboxRuntime(ctx context.Context, arg UpdateSandboxRuntimeParams) error {
 	_, err := q.db.Exec(ctx, updateSandboxRuntime, arg.ContainerID, arg.HostPort, arg.ID)
-	return err
-}
-
-const markSandboxVerified = `-- name: MarkSandboxVerified :exec
--- Phase 33-Real-7 — guard against silent terminal-state flip. Without
--- the state-IN clause, a heartbeat reporting state='running' for an
--- app_name whose row is failed/destroying/destroyed would silently
--- resurrect it. Terminal rows must only leave terminal state via the
--- lifecycle layer's explicit transitions.
-UPDATE sandboxes
-SET verified_at = NOW(), state = $2
-WHERE app_name = $1
-  AND verified_at < NOW()
-  AND state IN ('pending','starting','running','restarting','stopped')
-`
-
-type MarkSandboxVerifiedParams struct {
-	AppName string `json:"app_name"`
-	State   string `json:"state"`
-}
-
-func (q *Queries) MarkSandboxVerified(ctx context.Context, arg MarkSandboxVerifiedParams) error {
-	_, err := q.db.Exec(ctx, markSandboxVerified, arg.AppName, arg.State)
-	return err
-}
-
-const markSandboxAgentLost = `-- name: MarkSandboxAgentLost :exec
-UPDATE sandboxes
-SET state = 'destroyed',
-    metadata = metadata || jsonb_build_object('reason', 'agent_lost_at_heartbeat'),
-    verified_at = NOW()
-WHERE app_name = $1
-  AND node_id = $2
-  AND state IN ('pending','starting','running','restarting')
-  AND created_at < NOW() - INTERVAL '60 seconds'
-`
-
-type MarkSandboxAgentLostParams struct {
-	AppName string      `json:"app_name"`
-	NodeID  pgtype.UUID `json:"node_id"`
-}
-
-func (q *Queries) MarkSandboxAgentLost(ctx context.Context, arg MarkSandboxAgentLostParams) error {
-	_, err := q.db.Exec(ctx, markSandboxAgentLost, arg.AppName, arg.NodeID)
-	return err
-}
-
-const listSandboxesForNode = `-- name: ListSandboxesForNode :many
-SELECT app_name, state, created_at
-FROM sandboxes
-WHERE node_id = $1
-  AND state IN ('pending','starting','running','restarting')
-`
-
-type ListSandboxesForNodeRow struct {
-	AppName   string             `json:"app_name"`
-	State     string             `json:"state"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-}
-
-func (q *Queries) ListSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]ListSandboxesForNodeRow, error) {
-	rows, err := q.db.Query(ctx, listSandboxesForNode, nodeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListSandboxesForNodeRow{}
-	for rows.Next() {
-		var i ListSandboxesForNodeRow
-		if err := rows.Scan(&i.AppName, &i.State, &i.CreatedAt); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-// Phase 33-Real-7 — hand-edited to add ListTerminalSandboxesForNode.
-// The sqlc CLI is not in the local dev workflow; if regeneration ever
-// runs, keep this query in queries/sandboxes.sql so the regenerated
-// output matches.
-const listTerminalSandboxesForNode = `-- name: ListTerminalSandboxesForNode :many
-SELECT id, app_name, container_id
-FROM sandboxes
-WHERE node_id = $1
-  AND state IN ('failed', 'destroying', 'destroyed')
-  AND container_id IS NOT NULL
-  AND container_id <> ''
-`
-
-type ListTerminalSandboxesForNodeRow struct {
-	ID          pgtype.UUID `json:"id"`
-	AppName     string      `json:"app_name"`
-	ContainerID pgtype.Text `json:"container_id"`
-}
-
-func (q *Queries) ListTerminalSandboxesForNode(ctx context.Context, nodeID pgtype.UUID) ([]ListTerminalSandboxesForNodeRow, error) {
-	rows, err := q.db.Query(ctx, listTerminalSandboxesForNode, nodeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListTerminalSandboxesForNodeRow{}
-	for rows.Next() {
-		var i ListTerminalSandboxesForNodeRow
-		if err := rows.Scan(&i.ID, &i.AppName, &i.ContainerID); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const markSandboxDestroyed = `-- name: MarkSandboxDestroyed :exec
-UPDATE sandboxes
-SET state = 'destroyed',
-    metadata = metadata || jsonb_build_object('reason', $2::text),
-    verified_at = NOW(),
-    updated_at = NOW(),
-    state_version = state_version + 1
-WHERE app_name = $1
-  AND state IN ('pending','starting','running','restarting')
-`
-
-type MarkSandboxDestroyedParams struct {
-	AppName string `json:"app_name"`
-	Reason  string `json:"reason"`
-}
-
-func (q *Queries) MarkSandboxDestroyed(ctx context.Context, arg MarkSandboxDestroyedParams) error {
-	_, err := q.db.Exec(ctx, markSandboxDestroyed, arg.AppName, arg.Reason)
 	return err
 }

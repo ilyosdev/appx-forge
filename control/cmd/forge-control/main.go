@@ -288,9 +288,12 @@ func main() {
 
 	// ── Idle reaper (background goroutine) ─────────────────────────────
 	idleReaper := lifecycle.NewIdleReaper(adapter, routeManager, logger,
-		time.Duration(cfg.IdleReaperIntervalSeconds)*time.Second)
+		time.Duration(cfg.IdleReaperIntervalSeconds)*time.Second,
+		time.Duration(cfg.StoppedRetentionSeconds)*time.Second)
 	go idleReaper.Run(ctx)
-	logger.Info("idle reaper started", "interval_seconds", cfg.IdleReaperIntervalSeconds)
+	logger.Info("idle reaper started",
+		"interval_seconds", cfg.IdleReaperIntervalSeconds,
+		"stopped_retention_seconds", cfg.StoppedRetentionSeconds)
 
 	// ── Drift detector (background goroutine) ──────────────────────────
 	driftStore := &driftStoreAdapter{q: queries}
@@ -797,6 +800,10 @@ func (a *storeAdapter) ListRunningSandboxesByNode(ctx context.Context, nodeID pg
 
 func (a *storeAdapter) ListIdleSandboxes(ctx context.Context) ([]store.Sandbox, error) {
 	return a.q.ListIdleSandboxes(ctx)
+}
+
+func (a *storeAdapter) ListStoppedExpired(ctx context.Context, retentionSeconds int32) ([]store.Sandbox, error) {
+	return a.q.ListStoppedExpired(ctx, retentionSeconds)
 }
 
 // ── api.MetricsStore interface ───────────────────────────────────────
