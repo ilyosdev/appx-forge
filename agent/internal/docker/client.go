@@ -105,6 +105,13 @@ type ContainerInfo struct {
 	Running   bool
 	ExitCode  int
 	StartedAt time.Time
+	// HostPort is the host side of the 8081/tcp binding, extracted from
+	// HostConfig.PortBindings — present even for STOPPED containers, unlike
+	// the ContainerList Ports field (which is empty when nothing is bound).
+	// 0 when no binding is configured. Sleep-not-destroy (2026-06-11): the
+	// wake fast-path needs the kept container's port to ack a routable
+	// upstream.
+	HostPort int
 }
 
 // ContainerEvent represents a Docker container lifecycle event.
@@ -225,6 +232,22 @@ func (d *dockerClient) InspectContainer(ctx context.Context, containerID string)
 		info.ExitCode = result.Container.State.ExitCode
 		if t, err := time.Parse(time.RFC3339Nano, result.Container.State.StartedAt); err == nil {
 			info.StartedAt = t
+		}
+	}
+
+	// Host port from the configured binding (survives docker stop, unlike
+	// the ContainerList Ports field). Sleep-not-destroy (2026-06-11).
+	if result.Container.HostConfig != nil {
+		for port, bindings := range result.Container.HostConfig.PortBindings {
+			if port.String() != "8081/tcp" {
+				continue
+			}
+			for _, b := range bindings {
+				if p, perr := strconv.Atoi(b.HostPort); perr == nil && p > 0 {
+					info.HostPort = p
+					break
+				}
+			}
 		}
 	}
 

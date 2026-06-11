@@ -139,10 +139,15 @@ WHERE app_name = $1
   AND created_at < NOW() - INTERVAL '60 seconds';
 
 -- name: ListSandboxesForNode :many
+-- 'stopped' included (sleep-not-destroy, 2026-06-11): slept sandboxes MUST
+-- be visible to the heartbeat reconciler, otherwise its orphan-no-DB-row
+-- branch sees the kept (docker-stopped) container as an orphan and destroys
+-- it within one heartbeat of the reaper sleeping it — proven live on the P4
+-- wake test (container murdered 12s after "sandbox slept").
 SELECT app_name, state, created_at
 FROM sandboxes
 WHERE node_id = $1
-  AND state IN ('pending','starting','running','restarting');
+  AND state IN ('pending','starting','running','restarting','stopped');
 
 -- name: MarkSandboxDestroyed :exec
 UPDATE sandboxes

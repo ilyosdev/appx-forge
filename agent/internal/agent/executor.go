@@ -257,6 +257,20 @@ func (e *CommandExecutor) tryStartExisting(
 				"container_id", snap.ContainerID, "host_port", snap.HostPort)
 			return true, snap.ContainerID, snap.HostPort
 		case "stopped":
+			// ContainerList reports NO ports for stopped containers — the
+			// binding only shows in the list while bound. Recover the
+			// configured port from HostConfig.PortBindings via inspect; a
+			// port-less ack would make control write a dead ip:0 route.
+			if snap.HostPort == 0 {
+				if info, ierr := e.docker.InspectContainer(ctx, snap.ContainerID); ierr == nil && info.HostPort > 0 {
+					snap.HostPort = info.HostPort
+				}
+			}
+			if snap.HostPort == 0 {
+				e.logger.Warn("wake reuse: no host port resolvable — falling back to create",
+					"app_name", appName, "container_id", snap.ContainerID)
+				return false, "", 0
+			}
 			if err := e.docker.StartContainer(ctx, snap.ContainerID); err != nil {
 				e.logger.Warn("wake reuse: docker start failed — falling back to create",
 					"app_name", appName, "container_id", snap.ContainerID, "error", err)
