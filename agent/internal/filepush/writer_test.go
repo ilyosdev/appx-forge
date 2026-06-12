@@ -507,6 +507,253 @@ func TestWriteTar_IdenticalBytesSkipWrite(t *testing.T) {
 	}
 }
 
+// --- W4: full-sync manifest prune ---
+
+// withTemplateDir points FORGE_TEMPLATE_DIR at a fresh temp dir seeded with the
+// given relative paths, and returns a cleanup func. Used so pruneStale can tell
+// template seeds from stale project files in tests.
+func withTemplateDir(t *testing.T, seeds map[string]string) func() {
+	t.Helper()
+	tmpl := t.TempDir()
+	for rel, content := range seeds {
+		full := filepath.Join(tmpl, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir template %s: %v", rel, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("seed template %s: %v", rel, err)
+		}
+	}
+	prev := os.Getenv("FORGE_TEMPLATE_DIR")
+	os.Setenv("FORGE_TEMPLATE_DIR", tmpl)
+	return func() { os.Setenv("FORGE_TEMPLATE_DIR", prev) }
+}
+
+func mustExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("expected %s to exist: %v", path, err)
+	}
+}
+
+func mustNotExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("expected %s to be deleted, stat err=%v", path, err)
+	}
+}
+
+// TestWriteFilesFull_PrunesFileNotInManifest is the W4 specimen: the project
+// moved app/(tabs)/id-detail.tsx → app/[id].tsx, so a full sync whose manifest
+// omits the old path must delete the ghost from disk.
+func TestWriteFilesFull_PrunesFileNotInManifest(t *testing.T) {
+	defer withTemplateDir(t, nil)()
+	dir := t.TempDir()
+
+	// Ghost file left from a prior push (not in the new manifest).
+	ghost := filepath.Join(dir, "app/(tabs)/id-detail.tsx")
+	if err := os.MkdirAll(filepath.Dir(ghost), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(ghost, []byte("ghost route"), 0644); err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+
+	files := []FileEntry{
+		{Path: "app/[id].tsx", Content: b64("new detail route")},
+	}
+	manifest := []string{"app/[id].tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	mustExist(t, filepath.Join(dir, "app/[id].tsx"))
+	mustNotExist(t, ghost)
+
+	if len(result.Deleted) != 1 || result.Deleted[0] != "app/(tabs)/id-detail.tsx" {
+		t.Fatalf("expected Deleted=[app/(tabs)/id-detail.tsx], got %v", result.Deleted)
+	}
+}
+
+// TestWriteFilesFull_TemplateSeedSurvives proves a file that originates from the
+// template (and is therefore not in a project manifest) is never pruned.
+func TestWriteFilesFull_TemplateSeedSurvives(t *testing.T) {
+	defer withTemplateDir(t, map[string]string{
+		"entry.js":        "import 'expo-router/entry';",
+		"app/index.tsx":   "export default function Index(){return null}",
+		"babel.config.js": "module.exports = {};",
+	})()
+	dir := t.TempDir()
+
+	// Seed the template files into the code dir (entrypoint would do this).
+	for rel, content := range map[string]string{
+		"entry.js":      "import 'expo-router/entry';",
+		"app/index.tsx": "export default function Index(){return null}",
+	} {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	// Manifest contains only a project screen — NOT the template seeds.
+	files := []FileEntry{{Path: "app/(tabs)/home.tsx", Content: b64("home")}}
+	manifest := []string{"app/(tabs)/home.tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	mustExist(t, filepath.Join(dir, "entry.js"))
+	mustExist(t, filepath.Join(dir, "app/index.tsx"))
+	mustExist(t, filepath.Join(dir, "app/(tabs)/home.tsx"))
+
+	if len(result.Deleted) != 0 {
+		t.Fatalf("template seeds must not be pruned, got Deleted=%v", result.Deleted)
+	}
+}
+
+// TestWriteFilesFull_NodeModulesUntouched proves vendored/cache/VCS dirs and
+// hidden dirs are never descended into or deleted.
+func TestWriteFilesFull_NodeModulesUntouched(t *testing.T) {
+	defer withTemplateDir(t, nil)()
+	dir := t.TempDir()
+
+	junk := map[string]string{
+		"node_modules/react/index.js": "module.exports = {}",
+		".expo/cache/blob":            "cache",
+		".git/HEAD":                   "ref: refs/heads/main",
+		".gitignore":                  "node_modules",
+	}
+	for rel, content := range junk {
+		full := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	files := []FileEntry{{Path: "app/index.tsx", Content: b64("home")}}
+	manifest := []string{"app/index.tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	for rel := range junk {
+		mustExist(t, filepath.Join(dir, rel))
+	}
+	if len(result.Deleted) != 0 {
+		t.Fatalf("excluded dirs/files must not be pruned, got Deleted=%v", result.Deleted)
+	}
+}
+
+// TestWriteFilesFull_RefusesEscapeAndProtectsConfig: the prune never deletes a
+// baked metro.config.js (it's protected, not project source).
+func TestWriteFilesFull_ProtectsMetroConfig(t *testing.T) {
+	defer withTemplateDir(t, nil)()
+	dir := t.TempDir()
+
+	cfg := filepath.Join(dir, "metro.config.js")
+	if err := os.WriteFile(cfg, []byte("module.exports = {}"), 0644); err != nil {
+		t.Fatalf("seed metro config: %v", err)
+	}
+
+	files := []FileEntry{{Path: "app/index.tsx", Content: b64("home")}}
+	manifest := []string{"app/index.tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	mustExist(t, cfg)
+	if len(result.Deleted) != 0 {
+		t.Fatalf("metro.config.js must not be pruned, got Deleted=%v", result.Deleted)
+	}
+}
+
+// TestWriteFilesFull_FailOpenWhenTemplateUnreadable: if the template dir does
+// not exist, the prune is skipped entirely (no deletions) so a missing template
+// index can never mis-delete a seed.
+func TestWriteFilesFull_FailOpenWhenTemplateUnreadable(t *testing.T) {
+	prev := os.Getenv("FORGE_TEMPLATE_DIR")
+	os.Setenv("FORGE_TEMPLATE_DIR", filepath.Join(t.TempDir(), "does-not-exist"))
+	defer os.Setenv("FORGE_TEMPLATE_DIR", prev)
+
+	dir := t.TempDir()
+	ghost := filepath.Join(dir, "app/(tabs)/id-detail.tsx")
+	if err := os.MkdirAll(filepath.Dir(ghost), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(ghost, []byte("ghost"), 0644); err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+
+	files := []FileEntry{{Path: "app/[id].tsx", Content: b64("new")}}
+	manifest := []string{"app/[id].tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	// Fail-open: nothing pruned, ghost survives.
+	mustExist(t, ghost)
+	if len(result.Deleted) != 0 {
+		t.Fatalf("expected no deletions when template unreadable, got %v", result.Deleted)
+	}
+}
+
+// TestWriteFilesFull_NudgesMetroOnPruneOnly proves a prune-only full sync (no
+// new writes, just a stale file removed) still nudges Metro so the ghost route
+// leaves its module graph.
+func TestWriteFilesFull_NudgesMetroOnPruneOnly(t *testing.T) {
+	// entry.js is a template seed — register it so the prune keeps it.
+	defer withTemplateDir(t, map[string]string{"entry.js": "import 'expo-router/entry';"})()
+	dir := t.TempDir()
+
+	// Watched root for the nudge.
+	entry := filepath.Join(dir, "entry.js")
+	if err := os.WriteFile(entry, []byte("import 'expo-router/entry';"), 0644); err != nil {
+		t.Fatalf("seed entry.js: %v", err)
+	}
+	// A current project file (identical bytes — no write) + a ghost.
+	home := filepath.Join(dir, "app/index.tsx")
+	homeContent := "export default function H(){return null}"
+	if err := os.MkdirAll(filepath.Dir(home), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(home, []byte(homeContent), 0644); err != nil {
+		t.Fatalf("seed home: %v", err)
+	}
+	ghost := filepath.Join(dir, "app/ghost.tsx")
+	if err := os.WriteFile(ghost, []byte("ghost"), 0644); err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+
+	old := time.Now().Add(-1 * time.Hour)
+	for _, p := range []string{entry, home} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("backdate %s: %v", p, err)
+		}
+	}
+
+	// Re-push identical home bytes (no write) + manifest excludes the ghost.
+	files := []FileEntry{{Path: "app/index.tsx", Content: b64(homeContent)}}
+	manifest := []string{"app/index.tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	mustNotExist(t, ghost)
+	if len(result.Deleted) != 1 {
+		t.Fatalf("expected 1 deletion, got %v", result.Deleted)
+	}
+
+	// Metro must have been nudged despite zero byte-writes.
+	info, err := os.Stat(entry)
+	if err != nil {
+		t.Fatalf("stat entry.js: %v", err)
+	}
+	if !info.ModTime().After(old) {
+		t.Errorf("prune-only full sync did not nudge Metro: entry.js mtime still %v", info.ModTime())
+	}
+}
+
 // --- helpers ---
 
 func b64(s string) string {

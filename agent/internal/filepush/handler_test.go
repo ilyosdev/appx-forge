@@ -80,6 +80,68 @@ func TestHandler_ValidSignedURL_JSONBody(t *testing.T) {
 	}
 }
 
+// TestHandler_FullSyncPrunesStale drives the W4 prune through the HTTP handler:
+// a fullSync push whose manifest omits a pre-existing file deletes it and
+// reports it in the `deleted` field.
+func TestHandler_FullSyncPrunesStale(t *testing.T) {
+	dir := t.TempDir()
+
+	// Point the template index at an empty dir (so nothing is a seed) — must
+	// exist or the prune fails open.
+	tmpl := t.TempDir()
+	prev := os.Getenv("FORGE_TEMPLATE_DIR")
+	os.Setenv("FORGE_TEMPLATE_DIR", tmpl)
+	defer os.Setenv("FORGE_TEMPLATE_DIR", prev)
+
+	// Pre-existing ghost file not in the manifest.
+	ghost := filepath.Join(dir, "app", "ghost.tsx")
+	if err := os.MkdirAll(filepath.Dir(ghost), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(ghost, []byte("ghost"), 0644); err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+
+	resolver := &mockResolver{dirs: map[string]string{"sbx-fs": dir}}
+	handler := NewHandler(testSecret, resolver, nil)
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	body := `{"fullSync":true,"manifest":["app/home.tsx"],"files":[{"path":"app/home.tsx","content":"` + b64("home") + `"}]}`
+	targetURL := srv.URL + "/v1/sandboxes/sbx-fs/files"
+	signedURL, err := auth.SignURL(targetURL, testSecret, 60*time.Second)
+	if err != nil {
+		t.Fatalf("SignURL: %v", err)
+	}
+
+	resp, err := http.Post(signedURL, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, respBody)
+	}
+
+	var result WriteResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+
+	if len(result.Deleted) != 1 || result.Deleted[0] != "app/ghost.tsx" {
+		t.Errorf("Deleted = %v, want [app/ghost.tsx]", result.Deleted)
+	}
+	if _, err := os.Stat(ghost); !os.IsNotExist(err) {
+		t.Error("ghost file should have been pruned")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app", "home.tsx")); err != nil {
+		t.Errorf("home.tsx should exist: %v", err)
+	}
+}
+
 func TestHandler_MissingSigParameter(t *testing.T) {
 	resolver := &mockResolver{dirs: map[string]string{"sbx-123": t.TempDir()}}
 	handler := NewHandler(testSecret, resolver, nil)

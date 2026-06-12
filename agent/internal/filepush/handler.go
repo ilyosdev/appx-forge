@@ -40,8 +40,16 @@ func NewHandler(hmacSecret []byte, resolver SandboxResolver, logger *slog.Logger
 }
 
 // filePushRequest is the JSON request body for JSON file pushes.
+//
+// FullSync + Manifest carry the W4 prune contract: when FullSync is true the
+// backend has sent the COMPLETE list of project paths (Manifest), so the agent
+// removes any on-disk file not in it after writing (see WriteFilesFull). Both
+// fields are optional — an old backend omits them and the push behaves exactly
+// as before (no deletions).
 type filePushRequest struct {
-	Files []FileEntry `json:"files"`
+	Files    []FileEntry `json:"files"`
+	FullSync bool        `json:"fullSync,omitempty"`
+	Manifest []string    `json:"manifest,omitempty"`
 }
 
 // errorResponse writes a JSON error to the response writer.
@@ -113,11 +121,18 @@ func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, codeDir str
 		return
 	}
 
-	result := WriteFiles(codeDir, req.Files)
+	var result WriteResult
+	if req.FullSync {
+		result = WriteFilesFull(codeDir, req.Files, req.Manifest)
+	} else {
+		result = WriteFiles(codeDir, req.Files)
+	}
 
 	h.logger.Info("file push complete",
 		"written", len(result.Written),
 		"failed", len(result.Failed),
+		"deleted", len(result.Deleted),
+		"full_sync", req.FullSync,
 	)
 
 	w.Header().Set("Content-Type", "application/json")

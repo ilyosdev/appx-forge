@@ -27,6 +27,44 @@ type FileEntry struct {
 type WriteResult struct {
 	Written []string `json:"written"`
 	Failed  []string `json:"failed"`
+	Deleted []string `json:"deleted,omitempty"`
+}
+
+// templateDir holds the readonly source seed the entrypoint copies into the
+// code directory at boot (Dockerfile bakes app/ → /opt/template). Files that
+// originate here (entry.js, app.json, app/index.tsx, …) are infrastructure,
+// not project source, so a manifest prune must NEVER remove them. Overridable
+// via FORGE_TEMPLATE_DIR for tests / non-standard images.
+func templateDir() string {
+	if d := os.Getenv("FORGE_TEMPLATE_DIR"); d != "" {
+		return d
+	}
+	return "/opt/template"
+}
+
+// WriteFilesFull writes the given entries (see WriteFiles) and then prunes any
+// stale file in codeDir that is NOT in manifest. It is the full-sync variant:
+// the backend's syncFromRevision / syncFromDb paths send the COMPLETE list of
+// project paths, so a file present on disk but absent from the manifest is a
+// project file that was deleted at the source (e.g. a route renamed away) and
+// must be removed — otherwise Metro keeps serving the ghost route after a
+// container restart re-pushes the tree (W4: sync never deleted).
+//
+// Pruning is conservative (see pruneStale): only files inside codeDir, never a
+// template seed, never under node_modules/.expo/.git or any hidden dir, never a
+// protected metro.config.*. A deletion counts as a change so Metro is nudged.
+func WriteFilesFull(codeDir string, files []FileEntry, manifest []string) WriteResult {
+	result := WriteFiles(codeDir, files)
+	deleted, changed := pruneStale(codeDir, manifest)
+	result.Deleted = deleted
+	// A prune deletion IS a change — Metro must re-crawl so the ghost route
+	// disappears. WriteFiles only nudges on its own writes; an all-identical
+	// reflush that nonetheless prunes a stale file would otherwise leave the
+	// ghost in Metro's graph until the next genuine write.
+	if changed {
+		triggerMetroRebuild(codeDir)
+	}
+	return result
 }
 
 // WriteFiles writes, creates, or deletes files in codeDir based on the given entries.
@@ -258,6 +296,151 @@ func triggerMetroRebuild(codeDir string) {
 		_ = os.Chtimes(full, now, now)
 		return
 	}
+}
+
+// prunedDirSkip names directory components a manifest prune never descends
+// into: vendored deps, Metro/Expo caches, and VCS metadata. None of these are
+// project source, none are in the manifest, and walking them would be both slow
+// and dangerous (deleting node_modules breaks the symlinked shared deps).
+var prunedDirSkip = map[string]struct{}{
+	"node_modules": {},
+	".expo":        {},
+	".git":         {},
+}
+
+// pruneStale walks codeDir and deletes every regular file that is NOT in the
+// manifest, returning the deleted relative paths and whether anything changed.
+//
+// A file survives the prune when it is any of:
+//   - in the manifest (slash-normalised) — it is current project source;
+//   - a template seed (present at the same relative path under templateDir) —
+//     infrastructure the entrypoint owns (entry.js, app.json, app/index.tsx, …);
+//   - a protected metro.config.* — baked, never project source;
+//   - under a skipped dir (node_modules/.expo/.git) or any hidden (dot) dir.
+//
+// SAFETY: deletions only ever happen inside codeDir (filepath.Walk roots there;
+// a relative path that escapes is refused). If templateDir can't be read, the
+// prune is SKIPPED ENTIRELY (fail-open) — a missing template index could
+// mis-classify a seed as stale and delete it. A delete error is logged-by-omission
+// (the path simply isn't reported deleted) and never aborts the walk.
+func pruneStale(codeDir string, manifest []string) (deleted []string, changed bool) {
+	// Build the set of paths to keep. Manifest paths are slash-normalised and
+	// leading-slash-stripped to match the on-disk relative form.
+	keep := make(map[string]struct{}, len(manifest))
+	for _, p := range manifest {
+		clean := filepath.ToSlash(filepath.Clean(strings.TrimLeft(p, "/")))
+		if clean == "." || clean == "" {
+			continue
+		}
+		keep[clean] = struct{}{}
+	}
+
+	// Index the template seed. Fail-open: an unreadable template dir means we
+	// cannot tell a seed from a stale file, so we skip pruning rather than risk
+	// deleting infrastructure.
+	tmpl, ok := templateSeedSet(templateDir())
+	if !ok {
+		return nil, false
+	}
+
+	deleted = []string{}
+	_ = filepath.Walk(codeDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Unreadable entry — skip it, never abort the whole walk.
+			if info != nil && info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		rel, relErr := filepath.Rel(codeDir, path)
+		if relErr != nil {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			return nil
+		}
+
+		base := info.Name()
+
+		if info.IsDir() {
+			// Skip vendored/cache/VCS dirs and any hidden dir wholesale.
+			if _, skip := prunedDirSkip[base]; skip {
+				return filepath.SkipDir
+			}
+			if strings.HasPrefix(base, ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Only regular files are candidates. Symlinks (e.g. node_modules) are
+		// never deleted.
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return nil
+		}
+		// Hidden files are left alone (dotfiles like .gitignore are not source).
+		if strings.HasPrefix(base, ".") {
+			return nil
+		}
+		// Defense-in-depth: refuse any path that escaped codeDir.
+		if strings.HasPrefix(rel, "../") || rel == ".." {
+			return nil
+		}
+
+		// Survivors: manifest, template seed, protected config.
+		if _, kept := keep[rel]; kept {
+			return nil
+		}
+		if _, seed := tmpl[rel]; seed {
+			return nil
+		}
+		if _, prot := protectedFiles[rel]; prot {
+			return nil
+		}
+
+		// Stale project file — remove it.
+		if err := os.Remove(path); err != nil {
+			return nil
+		}
+		deleted = append(deleted, rel)
+		changed = true
+		return nil
+	})
+
+	return deleted, changed
+}
+
+// templateSeedSet returns the set of relative file paths under dir (the readonly
+// template seed). The second return is false when dir can't be read at all, the
+// fail-open signal pruneStale uses to skip pruning entirely.
+func templateSeedSet(dir string) (map[string]struct{}, bool) {
+	if _, err := os.Stat(dir); err != nil {
+		return nil, false
+	}
+	seeds := map[string]struct{}{}
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(dir, path)
+		if relErr != nil {
+			return nil
+		}
+		seeds[filepath.ToSlash(rel)] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, false
+	}
+	return seeds, true
 }
 
 // protectedFiles are paths the control plane / SDK may never write.
