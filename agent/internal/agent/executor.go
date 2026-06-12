@@ -314,17 +314,25 @@ func (e *CommandExecutor) adoptEntry(sandboxID string, snap docker.ContainerSnap
 // containers by app name from Docker truth, not from the map.)
 func (e *CommandExecutor) AdoptBootSnapshot(snaps []docker.ContainerSnapshot) {
 	reserved := 0
+	adopted := 0
 	for _, snap := range snaps {
-		if snap.HostPort <= 0 {
-			continue
+		if snap.HostPort > 0 {
+			if err := e.ports.AllocateSpecific(snap.HostPort); err == nil {
+				reserved++
+			}
 		}
-		if err := e.ports.AllocateSpecific(snap.HostPort); err == nil {
-			reserved++
+		// Containers labeled forge.sandbox_id rebuild the in-memory sandbox
+		// map directly — without this, every push/exec against a sandbox
+		// created before the restart 404s until the container cycles.
+		if snap.SandboxID != "" && snap.AppName != "" {
+			e.adoptEntry(snap.SandboxID, snap)
+			adopted++
 		}
 	}
-	if reserved > 0 {
-		e.logger.Info("boot adoption: re-reserved host ports of existing containers",
-			"reserved", reserved, "total_containers", len(snaps))
+	if reserved > 0 || adopted > 0 {
+		e.logger.Info("boot adoption: rebuilt state from docker truth",
+			"reserved_ports", reserved, "adopted_sandboxes", adopted,
+			"total_containers", len(snaps))
 	}
 }
 
@@ -459,9 +467,7 @@ func (e *CommandExecutor) executeExec(ctx context.Context, cmd controlclient.Com
 
 	// Resolve the sandbox to a container ID. The agent only execs into
 	// sandboxes it currently tracks (no cross-node, no stale rows).
-	e.mu.RLock()
-	info, ok := e.sandboxes[cmd.SandboxID]
-	e.mu.RUnlock()
+	info, ok := e.resolveSandbox(cmd.SandboxID)
 	if !ok {
 		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("sandbox %s not running on this node", cmd.SandboxID))
 	}
@@ -524,13 +530,41 @@ func (e *CommandExecutor) ackFailure(ctx context.Context, cmdID string, errMsg s
 // CodeDir returns the code directory path for a sandbox.
 // This implements the filepush.SandboxResolver interface.
 func (e *CommandExecutor) CodeDir(sandboxID string) (string, error) {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	info, ok := e.sandboxes[sandboxID]
+	info, ok := e.resolveSandbox(sandboxID)
 	if !ok {
 		return "", fmt.Errorf("sandbox %s not found on this node", sandboxID)
 	}
 
 	return fmt.Sprintf("%s/%s/code", e.sandboxDir, info.AppName), nil
+}
+
+// resolveSandbox looks a sandbox up in the in-memory map, falling back to
+// Docker truth via the forge.sandbox_id label on a miss (restart-survivor:
+// the map is process-local, the containers are not). Adopt-on-hit so the
+// next lookup is map-fast.
+func (e *CommandExecutor) resolveSandbox(sandboxID string) (*sandboxInfo, bool) {
+	e.mu.RLock()
+	info, ok := e.sandboxes[sandboxID]
+	e.mu.RUnlock()
+	if ok {
+		return info, true
+	}
+
+	snaps, err := e.docker.ListContainers(context.Background())
+	if err != nil {
+		return nil, false
+	}
+	for _, snap := range snaps {
+		if snap.SandboxID != sandboxID {
+			continue
+		}
+		e.adoptEntry(sandboxID, snap)
+		e.logger.Info("lazy adoption: resolved sandbox from docker label",
+			"sandbox_id", sandboxID, "app_name", snap.AppName)
+		e.mu.RLock()
+		info = e.sandboxes[sandboxID]
+		e.mu.RUnlock()
+		return info, info != nil
+	}
+	return nil, false
 }

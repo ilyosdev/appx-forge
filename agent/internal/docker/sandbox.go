@@ -67,7 +67,8 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 		Env:          env,
 		ExposedPorts: network.PortSet{containerPortParsed: {}},
 		Labels: map[string]string{
-			"forge.app_name": spec.AppName,
+			"forge.app_name":   spec.AppName,
+			"forge.sandbox_id": spec.SandboxID,
 		},
 	}
 

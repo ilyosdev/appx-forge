@@ -29,6 +29,11 @@ type ContainerSnapshot struct {
 	State       string `json:"state"`
 	HostPort    int    `json:"host_port"`
 	ContainerID string `json:"container_id"`
+	// SandboxID is recovered from the forge.sandbox_id container label —
+	// empty for containers created before the label existed (2026-06-12).
+	// Lets a restarted agent rebuild its in-memory sandbox map from Docker
+	// truth instead of 404ing every push/exec until the container cycles.
+	SandboxID string `json:"sandbox_id,omitempty"`
 }
 
 // DockerLister is the interface Snapshotter needs from the Docker client.

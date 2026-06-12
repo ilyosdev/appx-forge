@@ -395,6 +395,7 @@ func (d *dockerClient) ListContainers(ctx context.Context) ([]ContainerSnapshot,
 			State:       string(canonical),
 			HostPort:    hostPort,
 			ContainerID: item.ID,
+			SandboxID:   item.Labels["forge.sandbox_id"],
 		})
 	}
 	return snapshots, nil
