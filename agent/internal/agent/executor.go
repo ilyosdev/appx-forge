@@ -538,6 +538,18 @@ func (e *CommandExecutor) CodeDir(sandboxID string) (string, error) {
 	return fmt.Sprintf("%s/%s/code", e.sandboxDir, info.AppName), nil
 }
 
+// ResolveContainerID resolves a sandbox ID to its container ID via the same
+// map+docker-label lookup the exec/filepush paths use. Exported for the logs
+// HTTP handler (logs_handler.go) so a sandbox created before the agent's last
+// restart still resolves instead of 404'ing the Logs pane.
+func (e *CommandExecutor) ResolveContainerID(sandboxID string) (string, bool) {
+	info, ok := e.resolveSandbox(sandboxID)
+	if !ok {
+		return "", false
+	}
+	return info.ContainerID, true
+}
+
 // resolveSandbox looks a sandbox up in the in-memory map, falling back to
 // Docker truth via the forge.sandbox_id label on a miss (restart-survivor:
 // the map is process-local, the containers are not). Adopt-on-hit so the

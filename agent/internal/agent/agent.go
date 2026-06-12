@@ -157,6 +157,12 @@ func (a *Agent) Run(ctx context.Context) error {
 	// Phase 30 — synchronous existence endpoint; control plane consults
 	// this on stale verified_at reads. See containers_handler.go.
 	mux.Handle("GET /v1/containers/{name}", newContainerExistsHandler(a.snapshotter))
+	// Sandbox log proxy target. The control plane's log proxy forwards to the
+	// UN-prefixed /sandboxes/{id}/logs path (control/internal/api/logs.go) — this
+	// route was missing, so every Logs-pane request 404'd at the agent and the UI
+	// showed "Container unreachable". Resolves via the map+label fallback and reads
+	// docker logs (works for stopped containers too). See logs_handler.go.
+	mux.Handle("GET /sandboxes/{id}/logs", newLogsHandler(a.executor, a.docker))
 
 	listenAddr := net.JoinHostPort(a.cfg.TailscaleIP, fmt.Sprintf("%d", a.cfg.AgentPort))
 	if a.cfg.TailscaleIP == "" {
