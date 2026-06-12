@@ -670,10 +670,45 @@ func TestWriteFilesFull_ProtectsMetroConfig(t *testing.T) {
 	}
 }
 
-// TestWriteFilesFull_FailOpenWhenTemplateUnreadable: if the template dir does
-// not exist, the prune is skipped entirely (no deletions) so a missing template
-// index can never mis-delete a seed.
-func TestWriteFilesFull_FailOpenWhenTemplateUnreadable(t *testing.T) {
+// TestWriteFilesFull_ManifestOnlyPruneWhenTemplateUnreadable: in prod the
+// template dir lives INSIDE the sandbox image, not on the agent host — the
+// manifest (which the backend unions with the template list) is the sole
+// protection. A stale file is pruned; manifest entries survive.
+func TestWriteFilesFull_ManifestOnlyPruneWhenTemplateUnreadable(t *testing.T) {
+	prev := os.Getenv("FORGE_TEMPLATE_DIR")
+	os.Setenv("FORGE_TEMPLATE_DIR", filepath.Join(t.TempDir(), "does-not-exist"))
+	defer os.Setenv("FORGE_TEMPLATE_DIR", prev)
+
+	dir := t.TempDir()
+	ghost := filepath.Join(dir, "app/(tabs)/id-detail.tsx")
+	if err := os.MkdirAll(filepath.Dir(ghost), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(ghost, []byte("ghost"), 0644); err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+	seed := filepath.Join(dir, "app/index.tsx")
+	if err := os.WriteFile(seed, []byte("seed"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	files := []FileEntry{{Path: "app/[id].tsx", Content: b64("new")}}
+	// Backend manifest = project files ∪ template list — the seed is covered.
+	manifest := []string{"app/[id].tsx", "app/index.tsx"}
+
+	result := WriteFilesFull(dir, files, manifest)
+
+	mustNotExist(t, ghost)
+	mustExist(t, seed)
+	if len(result.Deleted) != 1 {
+		t.Fatalf("expected exactly the ghost pruned, got %v", result.Deleted)
+	}
+}
+
+// TestWriteFilesFull_SkipsPruneWhenNoTemplateAndNoManifest: with neither a
+// template index nor a manifest there is no way to tell seed from stale —
+// prune must be skipped entirely.
+func TestWriteFilesFull_SkipsPruneWhenNoTemplateAndNoManifest(t *testing.T) {
 	prev := os.Getenv("FORGE_TEMPLATE_DIR")
 	os.Setenv("FORGE_TEMPLATE_DIR", filepath.Join(t.TempDir(), "does-not-exist"))
 	defer os.Setenv("FORGE_TEMPLATE_DIR", prev)
@@ -687,15 +722,11 @@ func TestWriteFilesFull_FailOpenWhenTemplateUnreadable(t *testing.T) {
 		t.Fatalf("seed ghost: %v", err)
 	}
 
-	files := []FileEntry{{Path: "app/[id].tsx", Content: b64("new")}}
-	manifest := []string{"app/[id].tsx"}
+	result := WriteFilesFull(dir, nil, nil)
 
-	result := WriteFilesFull(dir, files, manifest)
-
-	// Fail-open: nothing pruned, ghost survives.
 	mustExist(t, ghost)
 	if len(result.Deleted) != 0 {
-		t.Fatalf("expected no deletions when template unreadable, got %v", result.Deleted)
+		t.Fatalf("expected no deletions with no template and no manifest, got %v", result.Deleted)
 	}
 }
 

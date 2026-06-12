@@ -335,12 +335,18 @@ func pruneStale(codeDir string, manifest []string) (deleted []string, changed bo
 		keep[clean] = struct{}{}
 	}
 
-	// Index the template seed. Fail-open: an unreadable template dir means we
-	// cannot tell a seed from a stale file, so we skip pruning rather than risk
-	// deleting infrastructure.
+	// Index the template seed when available. The template dir exists INSIDE
+	// the sandbox image (/opt/template), not on the agent host — so in prod
+	// this is usually unreadable and protection comes from the manifest
+	// instead: the backend unions the template file list into the manifest.
+	// With neither a template index NOR a manifest we cannot tell a seed from
+	// a stale file — skip pruning rather than risk deleting infrastructure.
 	tmpl, ok := templateSeedSet(templateDir())
 	if !ok {
-		return nil, false
+		if len(keep) == 0 {
+			return nil, false
+		}
+		tmpl = map[string]struct{}{}
 	}
 
 	deleted = []string{}
