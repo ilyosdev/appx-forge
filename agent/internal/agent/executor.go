@@ -43,7 +43,22 @@ type CommandExecutor struct {
 	// In-memory map: sandboxID -> sandbox state
 	sandboxes map[string]*sandboxInfo
 	mu        sync.RWMutex
+
+	// Debounce timers for structural-push restarts, keyed by sandboxID. A real
+	// AI gen pushes in CLUSTERS (provision sync, per-phase sync, heal sync), so a
+	// restart-per-structural-push would cycle the container several times in
+	// seconds — thrashing Metro into back-to-back cold rebundles and racing the
+	// control plane's own start_sandbox acks. RestartSandbox instead (re)arms a
+	// short timer per sandbox; only the last push in a burst actually restarts.
+	restartTimers map[string]*time.Timer
+	restartMu     sync.Mutex
 }
+
+// restartDebounce is how long a sandbox must go without a new structural push
+// before its coalesced Metro restart fires. Long enough to swallow a push burst
+// (the observed clusters span ~2s), short enough that the preview's fresh crawl
+// is not meaningfully delayed. A var (not const) so tests can shorten it.
+var restartDebounce = 4 * time.Second
 
 // NewCommandExecutor creates a CommandExecutor with the given dependencies.
 func NewCommandExecutor(
@@ -54,12 +69,13 @@ func NewCommandExecutor(
 	logger *slog.Logger,
 ) *CommandExecutor {
 	return &CommandExecutor{
-		docker:     dockerClient,
-		ports:      portAlloc,
-		ctrlClient: ctrlClient,
-		sandboxDir: sandboxDir,
-		logger:     logger,
-		sandboxes:  make(map[string]*sandboxInfo),
+		docker:        dockerClient,
+		ports:         portAlloc,
+		ctrlClient:    ctrlClient,
+		sandboxDir:    sandboxDir,
+		logger:        logger,
+		sandboxes:     make(map[string]*sandboxInfo),
+		restartTimers: make(map[string]*time.Timer),
 	}
 }
 
@@ -562,38 +578,60 @@ func (e *CommandExecutor) ResolveContainerID(sandboxID string) (string, bool) {
 // push handler calls this after a STRUCTURAL push (new path or delete); a
 // content-only edit keeps the cheaper mtime-nudge so HMR stays fast.
 //
-// A plain docker restart preserves the /app/code bind mount — only the process
-// is cycled, no code is lost (the entrypoint re-seeds idempotently). The 3s
-// argument is the Docker STOP grace (Metro is stateless dev tooling with nothing
-// to flush, so a short grace minimizes the preview's dark window) — deliberately
-// shorter than the 10s used by the control-plane restart_sandbox command, which
-// has no latency-sensitive caller. Synchronous by contract — the caller relies on
-// the stale Metro being gone before the push is reported complete, so the
-// backend's readiness poll waits for the fresh crawl rather than briefly serving
-// the stale (pre-fix) bundle.
-//
-// The whole Docker call is bounded by a 30s deadline so a wedged daemon (the
-// risk is highest exactly when this fires — a memory-pressured node) cannot hang
-// the file-push HTTP handler (which has no server-level timeout); 30s sits well
-// above the 3s grace + container start and well under the backend's 120s push
-// deadline. Concurrent restarts of the same container (e.g. a control-plane
-// restart_sandbox racing this) are serialized by the Docker daemon's per-container
-// lock — a loser just errors and is logged fail-open. A heartbeat landing inside
-// the ~3-5s window briefly reports the row 'restarting'/'stopped'; the next
-// heartbeat (≤15s) flips it back and no reap/sleep side-effect fires.
+// DEBOUNCED + ASYNC: a real gen pushes in clusters, so this (re)arms a per-sandbox
+// timer (restartDebounce) and returns immediately; the actual restart fires only
+// once the pushes stop. This trades the old synchronous "stale Metro gone before
+// the push returns" guarantee for not thrashing the container — acceptable because
+// the backend's readiness poll plus the frontend's never-blank hold ride out the
+// few-second window, whereas back-to-back restarts cold-rebundled Metro repeatedly
+// and raced the control-plane acks. Always returns nil (scheduling can't fail);
+// the real restart's outcome is logged inside doRestart, fail-open.
 func (e *CommandExecutor) RestartSandbox(sandboxID string) error {
+	e.restartMu.Lock()
+	defer e.restartMu.Unlock()
+	if t, ok := e.restartTimers[sandboxID]; ok {
+		t.Stop() // a newer push arrived within the window — slide the deadline
+	}
+	e.restartTimers[sandboxID] = time.AfterFunc(restartDebounce, func() {
+		e.restartMu.Lock()
+		delete(e.restartTimers, sandboxID)
+		e.restartMu.Unlock()
+		e.doRestart(sandboxID)
+	})
+	return nil
+}
+
+// doRestart performs the coalesced Metro restart for a sandbox. Best-effort: any
+// failure is logged but never propagated (the files are already on disk; worst
+// case the preview needs a manual refresh).
+//
+// A plain docker restart preserves the /app/code bind mount — only the process is
+// cycled, no code is lost (the entrypoint re-seeds idempotently). The 3s argument
+// is the Docker STOP grace (Metro is stateless dev tooling with nothing to flush)
+// — deliberately shorter than the 10s used by the control-plane restart_sandbox
+// command, which has no latency-sensitive caller. The whole Docker call is bounded
+// by a 30s deadline so a wedged daemon (the risk is highest exactly when this fires
+// — a memory-pressured node) cannot hang a goroutine indefinitely; 30s sits well
+// above the 3s grace + container start. Concurrent restarts of the same container
+// (e.g. a control-plane restart_sandbox racing this) are serialized by the Docker
+// daemon's per-container lock — a loser just errors and is logged. A heartbeat
+// landing inside the ~3-5s window briefly reports the row 'restarting'/'stopped';
+// the next heartbeat (≤15s) flips it back and no reap/sleep side-effect fires.
+func (e *CommandExecutor) doRestart(sandboxID string) {
 	containerID, ok := e.ResolveContainerID(sandboxID)
 	if !ok {
-		return fmt.Errorf("sandbox %s not found on this node", sandboxID)
+		e.logger.Warn("debounced metro restart skipped: sandbox not found", "sandbox_id", sandboxID)
+		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := e.docker.RestartContainer(ctx, containerID, 3*time.Second); err != nil {
-		return fmt.Errorf("restart container %s: %w", containerID, err)
+		e.logger.Warn("debounced metro restart failed (preview may need a refresh)",
+			"sandbox_id", sandboxID, "container_id", containerID, "error", err)
+		return
 	}
-	e.logger.Info("sandbox restarted after structural file push",
+	e.logger.Info("sandbox restarted after structural file push (debounced)",
 		"sandbox_id", sandboxID, "container_id", containerID)
-	return nil
 }
 
 // resolveSandbox looks a sandbox up in the in-memory map, falling back to

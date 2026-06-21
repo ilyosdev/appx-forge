@@ -140,9 +140,8 @@ func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, sandboxID, 
 		result = WriteFiles(codeDir, req.Files)
 	}
 
-	// Restart Metro for a fresh crawl when the push was structural. Synchronous
-	// (before the response) so the stale Metro is gone before the backend polls
-	// readiness — see maybeRestart.
+	// Restart Metro for a fresh crawl when the push was structural. Debounced —
+	// coalesces a push burst into one restart (see maybeRestart / RestartSandbox).
 	h.maybeRestart(sandboxID, result)
 
 	h.logger.Info("file push complete",
@@ -158,16 +157,15 @@ func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, sandboxID, 
 	json.NewEncoder(w).Encode(result)
 }
 
-// maybeRestart restarts the sandbox container when the push changed the file SET
-// (new path or delete) so Metro re-crawls and sees it — the running dev server
-// (Watchman off) does not. A content-only push is left to the writer's
-// mtime-nudge (fast HMR). No-op when the resolver does not implement
-// SandboxRestarter (test stubs / legacy wiring) — the nudge then carries the
-// pre-fix behavior. Best-effort: a restart failure is logged but never fails the
-// push (the files ARE written; worst case the preview needs a manual refresh).
-// Synchronous by design: callers report the push complete only after the stale
-// Metro is down, so the backend's readiness poll waits for the fresh crawl
-// instead of briefly serving the stale bundle.
+// maybeRestart schedules a Metro restart when the push changed the file SET (new
+// path or delete) so Metro re-crawls and sees it — the running dev server
+// (Watchman off) does not. A content-only push is left to the writer's mtime-nudge
+// (fast HMR). The restart is DEBOUNCED inside RestartSandbox: a burst of structural
+// pushes (a gen's clustered syncs) coalesces into one restart, so the container is
+// not thrash-cycled. No-op when the resolver does not implement SandboxRestarter
+// (test stubs / legacy wiring) — the nudge then carries the pre-fix behavior.
+// RestartSandbox returns immediately (scheduling never fails); the eventual
+// restart is best-effort and logged fail-open.
 func (h *Handler) maybeRestart(sandboxID string, result WriteResult) {
 	if !result.Structural {
 		return

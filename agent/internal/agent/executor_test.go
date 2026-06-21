@@ -21,14 +21,14 @@ import (
 type mockDockerClient struct {
 	mu sync.Mutex
 
-	createContainerFn func(ctx context.Context, spec *docker.SandboxSpec) (string, error)
-	stopContainerFn   func(ctx context.Context, containerID string, timeout time.Duration) error
-	removeContainerFn func(ctx context.Context, containerID string) error
+	createContainerFn  func(ctx context.Context, spec *docker.SandboxSpec) (string, error)
+	stopContainerFn    func(ctx context.Context, containerID string, timeout time.Duration) error
+	removeContainerFn  func(ctx context.Context, containerID string) error
 	restartContainerFn func(ctx context.Context, containerID string, timeout time.Duration) error
-	getLogsFn         func(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
-	startContainerFn  func(ctx context.Context, containerID string) error
-	listContainersFn  func(ctx context.Context) ([]docker.ContainerSnapshot, error)
-	execRunFn         func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
+	getLogsFn          func(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
+	startContainerFn   func(ctx context.Context, containerID string) error
+	listContainersFn   func(ctx context.Context) ([]docker.ContainerSnapshot, error)
+	execRunFn          func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
 
 	// Track calls for assertions
 	createCalls  []docker.SandboxSpec
@@ -385,6 +385,71 @@ func TestExecuteRestartSandbox(t *testing.T) {
 	}
 }
 
+// TestRestartSandbox_DebouncesBurst proves the structural-push restart is
+// coalesced: a burst of RestartSandbox calls (a gen's clustered syncs) results in
+// exactly ONE docker restart, fired after the debounce window — not one per call.
+func TestRestartSandbox_DebouncesBurst(t *testing.T) {
+	old := restartDebounce
+	restartDebounce = 40 * time.Millisecond
+	defer func() { restartDebounce = old }()
+
+	dc := newMockDockerClient()
+	exec := newTestExecutor(dc, &mockAckReporter{})
+	exec.mu.Lock()
+	exec.sandboxes["sbx"] = &sandboxInfo{ContainerID: "ctr", HostPort: 40003, AppName: "app"}
+	exec.mu.Unlock()
+
+	// Burst of 5 structural pushes within the window.
+	for i := 0; i < 5; i++ {
+		if err := exec.RestartSandbox("sbx"); err != nil {
+			t.Fatalf("RestartSandbox returned error: %v", err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Nothing should have restarted yet (still inside the debounce window).
+	dc.mu.Lock()
+	n := len(dc.restartCalls)
+	dc.mu.Unlock()
+	if n != 0 {
+		t.Errorf("expected 0 restarts during the burst, got %d", n)
+	}
+
+	// After the window settles, exactly one coalesced restart.
+	time.Sleep(120 * time.Millisecond)
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if len(dc.restartCalls) != 1 || dc.restartCalls[0] != "ctr" {
+		t.Errorf("expected exactly one coalesced RestartContainer(ctr), got %v", dc.restartCalls)
+	}
+}
+
+// TestRestartSandbox_SeparateBurstsEachRestart proves bursts separated by more
+// than the window each get their own restart (one per settle, no permanent
+// suppression).
+func TestRestartSandbox_SeparateBurstsEachRestart(t *testing.T) {
+	old := restartDebounce
+	restartDebounce = 30 * time.Millisecond
+	defer func() { restartDebounce = old }()
+
+	dc := newMockDockerClient()
+	exec := newTestExecutor(dc, &mockAckReporter{})
+	exec.mu.Lock()
+	exec.sandboxes["sbx"] = &sandboxInfo{ContainerID: "ctr", HostPort: 40004, AppName: "app"}
+	exec.mu.Unlock()
+
+	exec.RestartSandbox("sbx")
+	time.Sleep(80 * time.Millisecond) // let burst 1 fire
+	exec.RestartSandbox("sbx")
+	time.Sleep(80 * time.Millisecond) // let burst 2 fire
+
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if len(dc.restartCalls) != 2 {
+		t.Errorf("expected 2 restarts (one per burst), got %d: %v", len(dc.restartCalls), dc.restartCalls)
+	}
+}
+
 func TestExecuteGetLogs(t *testing.T) {
 	dc := newMockDockerClient()
 	ack := &mockAckReporter{}
@@ -452,7 +517,7 @@ func TestExecuteExpiredCommand(t *testing.T) {
 		SandboxID:      "sandbox-expired",
 		Payload:        json.RawMessage(`{}`),
 		IssuedAt:       time.Now().Add(-2 * time.Minute), // 2 minutes ago
-		TimeoutSeconds: 60,                                // 60s timeout = expired
+		TimeoutSeconds: 60,                               // 60s timeout = expired
 	}
 
 	err := exec.Execute(context.Background(), cmd)
