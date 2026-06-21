@@ -31,6 +31,20 @@ func (m *mockResolver) CodeDir(sandboxID string) (string, error) {
 	return dir, nil
 }
 
+// mockRestartResolver implements both SandboxResolver and SandboxRestarter,
+// recording each restart so tests can assert the structural-push → fresh-crawl
+// wiring (the production CommandExecutor satisfies both interfaces the same way).
+type mockRestartResolver struct {
+	mockResolver
+	restarted  []string // sandboxIDs restarted, in order
+	restartErr error    // when set, RestartSandbox returns it (fail-open test)
+}
+
+func (m *mockRestartResolver) RestartSandbox(sandboxID string) error {
+	m.restarted = append(m.restarted, sandboxID)
+	return m.restartErr
+}
+
 var testSecret = []byte("test-hmac-secret-key-32bytes!!!!!")
 
 func TestHandler_ValidSignedURL_JSONBody(t *testing.T) {
@@ -375,6 +389,88 @@ func TestHandler_NoBody(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+// postSigned signs and POSTs a JSON body to the handler, returning the response.
+func postSigned(t *testing.T, srvURL, sandboxID, body string) *http.Response {
+	t.Helper()
+	target := srvURL + "/v1/sandboxes/" + sandboxID + "/files"
+	signed, err := auth.SignURL(target, testSecret, 60*time.Second)
+	if err != nil {
+		t.Fatalf("SignURL: %v", err)
+	}
+	resp, err := http.Post(signed, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	return resp
+}
+
+// TestHandler_StructuralPushRestartsMetro proves the fresh-crawl wiring: a push
+// that CREATES a new path triggers exactly one RestartSandbox for that sandbox.
+func TestHandler_StructuralPushRestartsMetro(t *testing.T) {
+	dir := t.TempDir()
+	resolver := &mockRestartResolver{mockResolver: mockResolver{dirs: map[string]string{"sbx-1": dir}}}
+	srv := httptest.NewServer(NewHandler(testSecret, resolver, nil))
+	defer srv.Close()
+
+	body := `{"files":[{"path":"components/New.tsx","content":"` + b64("export const New = 1") + `"}]}`
+	resp := postSigned(t, srv.URL, "sbx-1", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if len(resolver.restarted) != 1 || resolver.restarted[0] != "sbx-1" {
+		t.Errorf("expected one restart of sbx-1, got %v", resolver.restarted)
+	}
+}
+
+// TestHandler_ContentOnlyPushDoesNotRestart proves a content-only edit to an
+// existing file is left to the mtime-nudge — no needless container restart.
+func TestHandler_ContentOnlyPushDoesNotRestart(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "App.tsx"), []byte("v1"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	resolver := &mockRestartResolver{mockResolver: mockResolver{dirs: map[string]string{"sbx-2": dir}}}
+	srv := httptest.NewServer(NewHandler(testSecret, resolver, nil))
+	defer srv.Close()
+
+	body := `{"files":[{"path":"App.tsx","content":"` + b64("v2") + `"}]}`
+	resp := postSigned(t, srv.URL, "sbx-2", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	if len(resolver.restarted) != 0 {
+		t.Errorf("content-only push must not restart, got %v", resolver.restarted)
+	}
+}
+
+// TestHandler_RestartErrorIsFailOpen proves a restart failure does NOT fail the
+// push — the files are written, so the response is still 200 and the new file is
+// on disk (worst case the preview needs a manual refresh).
+func TestHandler_RestartErrorIsFailOpen(t *testing.T) {
+	dir := t.TempDir()
+	resolver := &mockRestartResolver{
+		mockResolver: mockResolver{dirs: map[string]string{"sbx-3": dir}},
+		restartErr:   fmt.Errorf("docker daemon unreachable"),
+	}
+	srv := httptest.NewServer(NewHandler(testSecret, resolver, nil))
+	defer srv.Close()
+
+	body := `{"files":[{"path":"components/New.tsx","content":"` + b64("export const New = 1") + `"}]}`
+	resp := postSigned(t, srv.URL, "sbx-3", body)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("restart error must not fail the push; expected 200, got %d", resp.StatusCode)
+	}
+	if len(resolver.restarted) != 1 {
+		t.Errorf("expected restart attempt, got %v", resolver.restarted)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "components/New.tsx")); err != nil {
+		t.Errorf("file must be written despite restart error: %v", err)
 	}
 }
 

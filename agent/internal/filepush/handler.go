@@ -18,6 +18,18 @@ type SandboxResolver interface {
 	CodeDir(sandboxID string) (string, error)
 }
 
+// SandboxRestarter restarts the container backing a sandbox so its Metro dev
+// server re-crawls and picks up newly-pushed files. The agent's CommandExecutor
+// (the SandboxResolver passed in production) also implements this, so the handler
+// discovers it with a type assertion — no constructor change. When the resolver
+// does NOT implement it (test stubs / legacy wiring), a structural push falls
+// back to the writer's mtime-nudge alone, which is the pre-fix behavior.
+type SandboxRestarter interface {
+	// RestartSandbox restarts the sandbox's container synchronously and returns
+	// an error if the sandbox is unknown or the restart fails.
+	RestartSandbox(sandboxID string) error
+}
+
 // Handler is the HTTP handler for the file push endpoint.
 // It validates HMAC signed URLs and writes files to sandbox bind-mount directories.
 type Handler struct {
@@ -99,16 +111,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case strings.HasPrefix(contentType, "application/json"):
-		h.handleJSON(w, r, codeDir)
+		h.handleJSON(w, r, sandboxID, codeDir)
 	case strings.HasPrefix(contentType, "application/x-tar"):
-		h.handleTar(w, r, codeDir)
+		h.handleTar(w, r, sandboxID, codeDir)
 	default:
 		errorResponse(w, http.StatusBadRequest, fmt.Sprintf("unsupported content type: %s", contentType))
 	}
 }
 
 // handleJSON parses a JSON file push request and writes files.
-func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, codeDir string) {
+func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, sandboxID, codeDir string) {
 	if r.Body == nil || r.ContentLength == 0 {
 		errorResponse(w, http.StatusBadRequest, "empty request body")
 		return
@@ -128,11 +140,17 @@ func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, codeDir str
 		result = WriteFiles(codeDir, req.Files)
 	}
 
+	// Restart Metro for a fresh crawl when the push was structural. Synchronous
+	// (before the response) so the stale Metro is gone before the backend polls
+	// readiness — see maybeRestart.
+	h.maybeRestart(sandboxID, result)
+
 	h.logger.Info("file push complete",
 		"written", len(result.Written),
 		"failed", len(result.Failed),
 		"deleted", len(result.Deleted),
 		"full_sync", req.FullSync,
+		"structural", result.Structural,
 	)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -140,8 +158,34 @@ func (h *Handler) handleJSON(w http.ResponseWriter, r *http.Request, codeDir str
 	json.NewEncoder(w).Encode(result)
 }
 
+// maybeRestart restarts the sandbox container when the push changed the file SET
+// (new path or delete) so Metro re-crawls and sees it — the running dev server
+// (Watchman off) does not. A content-only push is left to the writer's
+// mtime-nudge (fast HMR). No-op when the resolver does not implement
+// SandboxRestarter (test stubs / legacy wiring) — the nudge then carries the
+// pre-fix behavior. Best-effort: a restart failure is logged but never fails the
+// push (the files ARE written; worst case the preview needs a manual refresh).
+// Synchronous by design: callers report the push complete only after the stale
+// Metro is down, so the backend's readiness poll waits for the fresh crawl
+// instead of briefly serving the stale bundle.
+func (h *Handler) maybeRestart(sandboxID string, result WriteResult) {
+	if !result.Structural {
+		return
+	}
+	restarter, ok := h.resolver.(SandboxRestarter)
+	if !ok {
+		return
+	}
+	if err := restarter.RestartSandbox(sandboxID); err != nil {
+		h.logger.Warn("metro restart after structural push failed (preview may need a refresh)",
+			"sandbox_id", sandboxID, "error", err)
+		return
+	}
+	h.logger.Info("metro restarted after structural push", "sandbox_id", sandboxID)
+}
+
 // handleTar extracts a tar.gz archive and writes files.
-func (h *Handler) handleTar(w http.ResponseWriter, r *http.Request, codeDir string) {
+func (h *Handler) handleTar(w http.ResponseWriter, r *http.Request, sandboxID, codeDir string) {
 	if r.Body == nil || r.ContentLength == 0 {
 		errorResponse(w, http.StatusBadRequest, "empty request body")
 		return
@@ -154,9 +198,13 @@ func (h *Handler) handleTar(w http.ResponseWriter, r *http.Request, codeDir stri
 		return
 	}
 
+	// Fresh-crawl restart on a structural tar push (see maybeRestart).
+	h.maybeRestart(sandboxID, result)
+
 	h.logger.Info("tar push complete",
 		"written", len(result.Written),
 		"failed", len(result.Failed),
+		"structural", result.Structural,
 	)
 
 	w.Header().Set("Content-Type", "application/json")

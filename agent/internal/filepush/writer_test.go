@@ -785,6 +785,119 @@ func TestWriteFilesFull_NudgesMetroOnPruneOnly(t *testing.T) {
 	}
 }
 
+// --- structural-change detection (Metro fresh-crawl trigger) ---
+
+// A brand-new path is invisible to the running Metro (Watchman off) until a
+// fresh crawl, so it must be reported structural so the handler restarts.
+func TestWriteFiles_NewFileIsStructural(t *testing.T) {
+	dir := t.TempDir()
+	result := WriteFiles(dir, []FileEntry{
+		{Path: "components/ErrorBoundary.tsx", Content: b64("export class ErrorBoundary {}")},
+	})
+	if len(result.Written) != 1 {
+		t.Fatalf("expected 1 written, got %v", result.Written)
+	}
+	if !result.Structural {
+		t.Errorf("creating a new path must be structural")
+	}
+}
+
+// Overwriting an EXISTING file with different bytes is a content-only change —
+// Metro already has the path in its graph, so the cheap nudge suffices. Must NOT
+// be structural (no needless container restart on every edit).
+func TestWriteFiles_ContentOnlyChangeNotStructural(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "app/index.tsx")
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("export default function H(){return 1}"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	result := WriteFiles(dir, []FileEntry{
+		{Path: "app/index.tsx", Content: b64("export default function H(){return 2}")},
+	})
+	if result.Structural {
+		t.Errorf("content-only change to an existing file must NOT be structural")
+	}
+}
+
+// Deleting an existing file changes the file set → structural (Metro must
+// re-crawl to evict the ghost from its graph).
+func TestWriteFiles_DeleteIsStructural(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "app/old.tsx")
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("x"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	result := WriteFiles(dir, []FileEntry{{Path: "app/old.tsx", Delete: true}})
+	if !result.Structural {
+		t.Errorf("deleting an existing file must be structural")
+	}
+}
+
+// Deleting an already-absent file is a no-op (desired end-state holds) and must
+// NOT be structural — no restart for a phantom delete.
+func TestWriteFiles_DeleteMissingNotStructural(t *testing.T) {
+	dir := t.TempDir()
+	result := WriteFiles(dir, []FileEntry{{Path: "app/ghost.tsx", Delete: true}})
+	if result.Structural {
+		t.Errorf("deleting an absent file must NOT be structural")
+	}
+}
+
+// An all-identical reflush (the wake case) mutates nothing → not structural.
+func TestWriteFiles_IdenticalReflushNotStructural(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "app/index.tsx")
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	content := "export default function H(){return null}"
+	if err := os.WriteFile(target, []byte(content), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	result := WriteFiles(dir, []FileEntry{{Path: "app/index.tsx", Content: b64(content)}})
+	if result.Structural {
+		t.Errorf("identical-byte reflush must NOT be structural")
+	}
+}
+
+// A prune deletion in a full sync changes the file set → structural.
+func TestWriteFilesFull_PruneIsStructural(t *testing.T) {
+	defer withTemplateDir(t, map[string]string{"entry.js": "import 'expo-router/entry';"})()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "entry.js"), []byte("import 'expo-router/entry';"), 0644); err != nil {
+		t.Fatalf("seed entry.js: %v", err)
+	}
+	home := filepath.Join(dir, "app/index.tsx")
+	homeContent := "export default function H(){return null}"
+	if err := os.MkdirAll(filepath.Dir(home), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(home, []byte(homeContent), 0644); err != nil {
+		t.Fatalf("seed home: %v", err)
+	}
+	ghost := filepath.Join(dir, "app/ghost.tsx")
+	if err := os.WriteFile(ghost, []byte("ghost"), 0644); err != nil {
+		t.Fatalf("seed ghost: %v", err)
+	}
+	// Re-push identical home bytes (no write); manifest excludes the ghost → prune.
+	result := WriteFilesFull(dir,
+		[]FileEntry{{Path: "app/index.tsx", Content: b64(homeContent)}},
+		[]string{"app/index.tsx"},
+	)
+	if len(result.Deleted) != 1 {
+		t.Fatalf("expected 1 prune deletion, got %v", result.Deleted)
+	}
+	if !result.Structural {
+		t.Errorf("a prune deletion must be structural")
+	}
+}
+
 // --- helpers ---
 
 func b64(s string) string {

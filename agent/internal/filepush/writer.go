@@ -28,6 +28,16 @@ type WriteResult struct {
 	Written []string `json:"written"`
 	Failed  []string `json:"failed"`
 	Deleted []string `json:"deleted,omitempty"`
+	// Structural is true when this push CREATED a brand-new file path or DELETED
+	// one — i.e. the project's file SET changed, not just the contents of an
+	// existing file. Watchman is disabled in the baked Metro config, so the
+	// running Metro dev server does NOT reliably pick up new files written to the
+	// bind mount; the mtime-nudge (triggerMetroRebuild) re-resolves graph-reachable
+	// files but misses the project entry and any file Metro never crawled. The
+	// push handler restarts the container (a guaranteed fresh crawl) when this is
+	// set; a content-only change is left to the cheaper nudge so HMR stays fast.
+	// Additive field — an old backend client simply ignores it.
+	Structural bool `json:"structural,omitempty"`
 }
 
 // templateDir holds the readonly source seed the entrypoint copies into the
@@ -57,11 +67,12 @@ func WriteFilesFull(codeDir string, files []FileEntry, manifest []string) WriteR
 	result := WriteFiles(codeDir, files)
 	deleted, changed := pruneStale(codeDir, manifest)
 	result.Deleted = deleted
-	// A prune deletion IS a change — Metro must re-crawl so the ghost route
-	// disappears. WriteFiles only nudges on its own writes; an all-identical
-	// reflush that nonetheless prunes a stale file would otherwise leave the
-	// ghost in Metro's graph until the next genuine write.
+	// A prune deletion changes the file SET → structural, so the handler restarts
+	// Metro for a fresh crawl (the only dependable way to evict a ghost route from
+	// the dev server's graph). Keep the nudge too: harmless before a restart, and
+	// the sole signal if no restarter is wired.
 	if changed {
+		result.Structural = true
 		triggerMetroRebuild(codeDir)
 	}
 	return result
@@ -90,6 +101,12 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 	// all-identical reflush triggers no Metro rebuild.
 	changed := 0
 
+	// Whether any operation changed the project's file SET — a brand-new path
+	// created or an existing path removed. Content-only edits to existing files
+	// do NOT count. The running Metro (Watchman off) can't see new paths until a
+	// fresh crawl, so a structural push must restart the container, not just nudge.
+	structural := false
+
 	for _, f := range files {
 		if !isValidPath(f.Path) {
 			result.Failed = append(result.Failed, f.Path)
@@ -111,6 +128,7 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 			} else {
 				result.Written = append(result.Written, f.Path)
 				changed++
+				structural = true // removed a path → file set changed → fresh crawl
 			}
 			continue
 		}
@@ -120,6 +138,16 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 			result.Failed = append(result.Failed, f.Path)
 			continue
 		}
+
+		// A brand-new path is one Metro never crawled — the structural case the
+		// running dev server (Watchman off) can't pick up without a fresh crawl.
+		// Detect it BEFORE the write so a created file forces a container restart,
+		// not just the mtime-nudge (which only re-resolves already-graphed files).
+		// A non-IsNotExist stat error (perm/IO) falls through to non-structural —
+		// fail-safe to the nudge, never a spurious restart. The backend serializes
+		// pushes per sandbox, so there is no concurrent writer to race the stat.
+		_, statErr := os.Stat(fullPath)
+		isNewPath := os.IsNotExist(statErr)
 
 		// Skip the write when the file already holds exactly these bytes. Avoids
 		// the mtime bump that makes Metro's mtime-keyed TreeFS re-crawl on every
@@ -143,12 +171,20 @@ func WriteFiles(codeDir string, files []FileEntry) WriteResult {
 
 		result.Written = append(result.Written, f.Path)
 		changed++
+		if isNewPath {
+			structural = true // created a path → file set changed → fresh crawl
+		}
 	}
+
+	result.Structural = structural
 
 	// Nudge Metro to re-bundle even when inotify misses new files in nested
 	// app/** subdirs (Watchman is disabled in the baked Metro config). Only when
 	// something actually changed on disk — an all-identical reflush (the wake
-	// case) leaves mtimes untouched and must not force a cold rebundle.
+	// case) leaves mtimes untouched and must not force a cold rebundle. The nudge
+	// runs for structural pushes too: it is one cheap chtimes, harmless before the
+	// handler's restart, and preserves the pre-fix partial behavior if no restarter
+	// is wired (e.g. tests).
 	if changed > 0 {
 		triggerMetroRebuild(codeDir)
 	}
@@ -194,6 +230,8 @@ func WriteTar(codeDir string, r io.Reader) (WriteResult, error) {
 
 	// See WriteFiles: only a real on-disk mutation may trigger a Metro rebuild.
 	changed := 0
+	// See WriteFiles: a created (or removed) path changes the file set → structural.
+	structural := false
 
 	for {
 		hdr, err := tr.Next()
@@ -227,6 +265,10 @@ func WriteTar(codeDir string, r io.Reader) (WriteResult, error) {
 			continue
 		}
 
+		// New path (Metro never crawled it) → structural; detect before the write.
+		_, statErr := os.Stat(fullPath)
+		isNewPath := os.IsNotExist(statErr)
+
 		// Identical-byte skip: file already holds these bytes → no write, no
 		// mtime bump (the wake reflush fix; see WriteFiles).
 		if sameBytes(fullPath, data) {
@@ -247,7 +289,12 @@ func WriteTar(codeDir string, r io.Reader) (WriteResult, error) {
 
 		result.Written = append(result.Written, name)
 		changed++
+		if isNewPath {
+			structural = true
+		}
 	}
+
+	result.Structural = structural
 
 	// Nudge Metro to re-bundle (see WriteFiles) — only on a real change.
 	if changed > 0 {

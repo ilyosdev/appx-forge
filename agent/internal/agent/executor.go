@@ -550,6 +550,52 @@ func (e *CommandExecutor) ResolveContainerID(sandboxID string) (string, bool) {
 	return info.ContainerID, true
 }
 
+// RestartSandbox restarts the container backing a sandbox so its Metro dev
+// server re-crawls the project from scratch. Implements filepush.SandboxRestarter.
+//
+// Why this exists: the baked Metro config disables Watchman to save 300MB-1GB
+// per container, so the running `expo start` relies on inotify. A file push that
+// CREATES new paths (a fresh gen's screens/components, a newly-added module) is
+// written straight to the bind mount and is NOT reliably picked up by the running
+// Metro's file map — only a fresh crawl sees it, which is why the preview shows
+// "Unable to resolve module …" for files that are physically on disk. The file
+// push handler calls this after a STRUCTURAL push (new path or delete); a
+// content-only edit keeps the cheaper mtime-nudge so HMR stays fast.
+//
+// A plain docker restart preserves the /app/code bind mount — only the process
+// is cycled, no code is lost (the entrypoint re-seeds idempotently). The 3s
+// argument is the Docker STOP grace (Metro is stateless dev tooling with nothing
+// to flush, so a short grace minimizes the preview's dark window) — deliberately
+// shorter than the 10s used by the control-plane restart_sandbox command, which
+// has no latency-sensitive caller. Synchronous by contract — the caller relies on
+// the stale Metro being gone before the push is reported complete, so the
+// backend's readiness poll waits for the fresh crawl rather than briefly serving
+// the stale (pre-fix) bundle.
+//
+// The whole Docker call is bounded by a 30s deadline so a wedged daemon (the
+// risk is highest exactly when this fires — a memory-pressured node) cannot hang
+// the file-push HTTP handler (which has no server-level timeout); 30s sits well
+// above the 3s grace + container start and well under the backend's 120s push
+// deadline. Concurrent restarts of the same container (e.g. a control-plane
+// restart_sandbox racing this) are serialized by the Docker daemon's per-container
+// lock — a loser just errors and is logged fail-open. A heartbeat landing inside
+// the ~3-5s window briefly reports the row 'restarting'/'stopped'; the next
+// heartbeat (≤15s) flips it back and no reap/sleep side-effect fires.
+func (e *CommandExecutor) RestartSandbox(sandboxID string) error {
+	containerID, ok := e.ResolveContainerID(sandboxID)
+	if !ok {
+		return fmt.Errorf("sandbox %s not found on this node", sandboxID)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := e.docker.RestartContainer(ctx, containerID, 3*time.Second); err != nil {
+		return fmt.Errorf("restart container %s: %w", containerID, err)
+	}
+	e.logger.Info("sandbox restarted after structural file push",
+		"sandbox_id", sandboxID, "container_id", containerID)
+	return nil
+}
+
 // resolveSandbox looks a sandbox up in the in-memory map, falling back to
 // Docker truth via the forge.sandbox_id label on a miss (restart-survivor:
 // the map is process-local, the containers are not). Adopt-on-hit so the
