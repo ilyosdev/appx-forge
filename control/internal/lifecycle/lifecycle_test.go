@@ -1628,6 +1628,142 @@ func TestWakeSandbox_BumpFailure_StillWakes(t *testing.T) {
 	}
 }
 
+// ── Wake idempotency (concurrent racers: Caddy / sync / auto-revive) ──
+
+// A slept sandbox is woken by several racers at once. The first flips
+// stopped→starting and dispatches the start command; a second racing wake
+// arriving on an already-starting/running/restarting row must be a no-op
+// success (mirrors SleepSandbox no-op'ing already-stopped) — never a 500 —
+// and must NOT dispatch a second start_sandbox command.
+func TestWakeSandbox_AlreadyWaking_NoOp(t *testing.T) {
+	for _, state := range []string{"starting", "running", "restarting"} {
+		t.Run(state, func(t *testing.T) {
+			sandboxID := uuid.New()
+			pgSandboxID := makePgUUID(sandboxID)
+
+			transitionCalls := 0
+			commandCalls := 0
+			bumpCalls := 0
+
+			ms := &mockStore{
+				getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+					return store.Sandbox{ID: pgSandboxID, State: state, AppName: "raced-app"}, nil
+				},
+				transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+					transitionCalls++
+					return store.Sandbox{ID: pgSandboxID, State: arg.State}, nil
+				},
+				createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+					commandCalls++
+					return store.Command{ID: arg.ID}, nil
+				},
+				updateSandboxLastActiveFn: func(ctx context.Context, id pgtype.UUID) error {
+					bumpCalls++
+					return nil
+				},
+			}
+
+			svc := New(ms, nil)
+			if err := svc.WakeSandbox(context.Background(), sandboxID); err != nil {
+				t.Fatalf("racing wake on %s must be a no-op success, got: %v", state, err)
+			}
+			if transitionCalls != 0 {
+				t.Fatalf("no-op wake must not transition state, got %d transitions", transitionCalls)
+			}
+			if commandCalls != 0 {
+				t.Fatalf("no-op wake must not double-dispatch start_sandbox, got %d commands", commandCalls)
+			}
+			// Still refresh activity so a wake landing on a running sandbox
+			// keeps it off the reaper's next tick.
+			if bumpCalls != 1 {
+				t.Fatalf("expected 1 last_active_at bump on idempotent wake, got %d", bumpCalls)
+			}
+		})
+	}
+}
+
+// Truly-unwakeable states (destroyed/destroying/failed/pending) must still
+// reject with ErrInvalidState — idempotency only covers wake-equivalent states.
+func TestWakeSandbox_IllegalState_StillErrors(t *testing.T) {
+	for _, state := range []string{"destroyed", "destroying", "failed", "pending"} {
+		t.Run(state, func(t *testing.T) {
+			sandboxID := uuid.New()
+			pgSandboxID := makePgUUID(sandboxID)
+
+			ms := &mockStore{
+				getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+					return store.Sandbox{ID: pgSandboxID, State: state, AppName: "dead-app"}, nil
+				},
+			}
+
+			svc := New(ms, nil)
+			err := svc.WakeSandbox(context.Background(), sandboxID)
+			if !errors.Is(err, ErrInvalidState) {
+				t.Fatalf("wake on %s must return ErrInvalidState, got: %v", state, err)
+			}
+		})
+	}
+}
+
+// The stopped→starting transition can lose the optimistic-lock race to a
+// concurrent wake writer (pgx.ErrNoRows). Mirror HandleAck: re-read, and if
+// the row already advanced into a wake-equivalent state, treat as success.
+func TestWakeSandbox_TransitionRaceLost_TreatedAsSuccess(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	getCalls := 0
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			getCalls++
+			// First read sees stopped; the re-read after the lost CAS sees the
+			// concurrent writer's advance to running.
+			if getCalls == 1 {
+				return store.Sandbox{ID: pgSandboxID, State: "stopped", AppName: "raced-app"}, nil
+			}
+			return store.Sandbox{ID: pgSandboxID, State: "running", AppName: "raced-app"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+		createCommandFn: func(ctx context.Context, arg store.CreateCommandParams) (store.Command, error) {
+			t.Fatal("lost-race wake must not dispatch a start command")
+			return store.Command{}, nil
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.WakeSandbox(context.Background(), sandboxID); err != nil {
+		t.Fatalf("lost CAS with concurrent advance to running must be success, got: %v", err)
+	}
+}
+
+// A lost CAS whose re-read lands somewhere genuinely wrong (e.g. destroyed)
+// must still surface the transition error rather than swallow it.
+func TestWakeSandbox_TransitionRaceLost_UnexpectedState_Errors(t *testing.T) {
+	sandboxID := uuid.New()
+	pgSandboxID := makePgUUID(sandboxID)
+
+	getCalls := 0
+	ms := &mockStore{
+		getSandboxFn: func(ctx context.Context, id pgtype.UUID) (store.Sandbox, error) {
+			getCalls++
+			if getCalls == 1 {
+				return store.Sandbox{ID: pgSandboxID, State: "stopped", AppName: "raced-app"}, nil
+			}
+			return store.Sandbox{ID: pgSandboxID, State: "destroyed", AppName: "raced-app"}, nil
+		},
+		transitionStateFn: func(ctx context.Context, arg store.TransitionSandboxStateParams) (store.Sandbox, error) {
+			return store.Sandbox{}, pgx.ErrNoRows
+		},
+	}
+
+	svc := New(ms, nil)
+	if err := svc.WakeSandbox(context.Background(), sandboxID); err == nil {
+		t.Fatal("lost CAS landing on destroyed must surface an error")
+	}
+}
+
 // Start acks refresh activity (covers crash-restarts and the wake's
 // stopped→starting→running tail); stop acks must NOT.
 func TestHandleAck_StartBumpsLastActive_StopDoesNot(t *testing.T) {

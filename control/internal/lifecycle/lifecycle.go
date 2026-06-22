@@ -1372,7 +1372,10 @@ func (ls *LifecycleService) DestroySandbox(ctx context.Context, sandboxID uuid.U
 // ── WakeSandbox ──────────────────────────────────────────────────────
 
 // WakeSandbox re-starts a stopped sandbox by firing EventScheduled and
-// dispatching a new start_sandbox command. Only valid from StateStopped.
+// dispatching a new start_sandbox command. Idempotent: a sandbox already in a
+// wake-equivalent state (starting/running/restarting) is a no-op success so a
+// racing wake never 500s; only dead states (destroyed/destroying/failed/pending)
+// are rejected.
 func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID) error {
 	pgSandboxID := pgtype.UUID{Bytes: sandboxID, Valid: true}
 
@@ -1381,7 +1384,30 @@ func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID
 		return fmt.Errorf("get sandbox: %w", err)
 	}
 
-	if sandbox.State != string(models.StateStopped) {
+	currentState := models.SandboxState(sandbox.State)
+
+	// Idempotent: a slept sandbox is woken by several racers at once (Caddy
+	// wake-by-host, backend /container/sync, auto-revive). The first racer flips
+	// stopped → starting and dispatches the start command; the others arrive to
+	// find the row already in a wake-equivalent state. Treat that as a no-op
+	// success — mirrors SleepSandbox no-op'ing an already-stopped sandbox — so a
+	// second racing wake never 500s. We still bump last_active_at so a wake
+	// landing on a running sandbox refreshes activity (best-effort, like the
+	// real path below), but we must NOT dispatch a second start_sandbox command
+	// (that would double-apply the wake).
+	switch currentState {
+	case models.StateStarting, models.StateRunning, models.StateRestarting:
+		if err := ls.store.UpdateSandboxLastActive(ctx, pgSandboxID); err != nil {
+			ls.logger.Warn("failed to bump last_active_at on idempotent wake",
+				"error", err, "sandbox_id", sandboxID)
+		}
+		ls.logger.Info("wake no-op: sandbox already waking/awake",
+			"sandbox_id", sandboxID, "app_name", sandbox.AppName, "current_state", currentState)
+		return nil
+	case models.StateStopped:
+		// Fall through to the real wake path below.
+	default:
+		// destroyed / destroying / failed / pending — genuinely not wakeable.
 		return fmt.Errorf("%w: sandbox must be stopped to wake, current state: %s", ErrInvalidState, sandbox.State)
 	}
 
@@ -1392,6 +1418,22 @@ func (ls *LifecycleService) WakeSandbox(ctx context.Context, sandboxID uuid.UUID
 		State_2: sandbox.State,
 	})
 	if err != nil {
+		// Optimistic-lock miss: a concurrent wake/event writer advanced the row
+		// out of stopped between our read and write. Mirror HandleAck — re-read;
+		// if the row is now in a wake-equivalent state, the other racer is
+		// already driving the wake, so treat this as an idempotent no-op success
+		// instead of bubbling a 500. Only a row that landed somewhere unexpected
+		// (e.g. destroyed) still errors.
+		if errors.Is(err, pgx.ErrNoRows) {
+			if refreshed, ferr := ls.store.GetSandbox(ctx, pgSandboxID); ferr == nil {
+				switch models.SandboxState(refreshed.State) {
+				case models.StateStarting, models.StateRunning, models.StateRestarting:
+					ls.logger.Info("wake transition skipped: state already advanced (concurrent)",
+						"sandbox_id", sandboxID, "current_state", refreshed.State)
+					return nil
+				}
+			}
+		}
 		return fmt.Errorf("transition state: %w", err)
 	}
 
