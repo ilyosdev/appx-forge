@@ -12,10 +12,17 @@ const crypto = require('node:crypto');
 const projectRoot = '/app/code';
 const config = getDefaultConfig(projectRoot);
 
-// jest-worker pool collapsed into main process. Saves 300-500 MB on 4-core hosts
-// (default spawns os.availableParallelism()/2 workers, each ~150-250 MB).
-// Bundle wall-clock regresses 30-50% -- acceptable for dev preview.
-config.maxWorkers = 1;
+// Transform worker pool. maxWorkers=1 (single worker, no jest-worker pool)
+// minimised RAM but made the cold web-bundle compile pathologically slow — a
+// ~2700-module web bundle took ~7.8 MINUTES single-threaded, which (before the
+// backend prewarm + frontend spinner gate) showed as a black/slow preview.
+// 2026-06-23: bumped 1 → 2. A second worker (~150-250 MB) lands a cold compile
+// near ~650-730 MB, comfortably under the 1024 MB container cap (observed
+// ~477 MB at maxWorkers=1), and roughly halves cold-compile wall-clock. The
+// backend now also prewarms this bundle at provision/wake time so the user
+// rarely waits on a cold compile at all. Do NOT raise to 3+ without re-checking
+// peak RSS against the 1 GiB cap (Metro OOMs at the ceiling).
+config.maxWorkers = 2;
 
 // ios/android/native for Expo Go; web for browser iframe preview.
 config.resolver.platforms = ['ios', 'android', 'native', 'web'];
