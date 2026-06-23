@@ -44,19 +44,27 @@ config.watcher = { ...(config.watcher || {}), useWatchman: false };
 // text instead of the user app. Intercept GET `/` for browser-style Accept
 // headers and serve a minimal Expo web bootstrap HTML wrapper; pass everything
 // else through to Metro so Expo Go still gets manifest.
-// Blank-root watchdog. The runtime-error hook in app/entry.js only fires on a
-// THROWN error; an empty module graph or an Expo Router "Unmatched Route" tree
-// renders nothing yet throws nothing → silent black screen while the backend
-// reports "ready". This inline script (runs in the raw browser context, so it
-// works even if the Metro bundle never mounts anything) checks #root ~4s after
-// load and, if still blank, posts the SAME envelope app/entry.js uses
-// ({type:'appx:runtime-error', source, message, timestamp}) so the existing
-// AppX frontend handler (PhonePreviewPanel.tsx → handlePreviewRuntimeError)
-// picks it up. Fires at most once.
+// Boot watchdog + app-ready ping. The runtime-error hook in app/entry.js only
+// fires on a THROWN error; an empty module graph or an Expo Router "Unmatched
+// Route" tree renders nothing yet throws nothing → silent black screen while the
+// backend reports "ready". This inline script runs in the raw browser context
+// (so it works even if the Metro bundle never mounts) and POLLS #root:
+//  - on real mounted content → posts {type:'appx:app-ready'} — the POSITIVE boot
+//    signal the AppX frontend uses to clear the loading spinner and cancel its
+//    hung-bundle auto-remount (PhonePreviewPanel.tsx). This is what kills the
+//    "bundle 200 but iframe stuck black / black-during-compile" reload-black.
+//  - on an Expo Router unmatched route → posts {type:'appx:runtime-error'}.
+//  - if #root is STILL blank after MAX_MS → posts the same runtime-error.
+// MAX_MS is generous on purpose: a cold Metro compile of the ~7.6MB web bundle
+// takes ~30s, so the OLD single 4s check fired a premature false "rendered
+// nothing" on every cold load (the bundle hadn't even executed yet). The poll +
+// long ceiling fixes that. Fires exactly once (positive OR negative).
 const BLANK_ROOT_WATCHDOG =
   '<script>\n' +
   '(function(){\n' +
-  '  var DELAY_MS = 4000;\n' +
+  '  var POLL_MS = 400;\n' +
+  '  var MAX_MS = 60000;\n' +
+  '  var started = Date.now();\n' +
   '  var fired = false;\n' +
   '  function isUnmatchedRoute(root){\n' +
   '    try {\n' +
@@ -64,25 +72,36 @@ const BLANK_ROOT_WATCHDOG =
   "      return t.indexOf('Unmatched Route') !== -1 || t.indexOf('This screen does not exist') !== -1;\n" +
   '    } catch (e) { return false; }\n' +
   '  }\n' +
-  '  function check(){\n' +
-  '    if (fired) return;\n' +
-  "    var root = document.getElementById('root');\n" +
-  '    var blank = !root || root.childElementCount === 0;\n' +
-  '    var unmatched = root && isUnmatchedRoute(root);\n' +
-  '    if (!blank && !unmatched) return;\n' +
-  '    fired = true;\n' +
+  '  function post(payload){\n' +
   '    try {\n' +
   '      if (window.parent && window.parent !== window) {\n' +
-  '        window.parent.postMessage({\n' +
-  "          type: 'appx:runtime-error',\n" +
-  "          source: 'blank-root',\n" +
-  "          message: unmatched ? 'App mounted but rendered an unmatched route' : 'App mounted but rendered nothing',\n" +
-  '          timestamp: Date.now()\n' +
-  "        }, '*');\n" +
+  "        window.parent.postMessage(payload, '*');\n" +
   '      }\n' +
   '    } catch (e) { /* cross-origin or disabled — never break preview */ }\n' +
   '  }\n' +
-  '  setTimeout(check, DELAY_MS);\n' +
+  '  function check(){\n' +
+  '    if (fired) return;\n' +
+  "    var root = document.getElementById('root');\n" +
+  '    var hasContent = !!root && root.childElementCount > 0;\n' +
+  '    var unmatched = !!root && isUnmatchedRoute(root);\n' +
+  '    if (hasContent && !unmatched) {\n' +
+  '      fired = true;\n' +
+  "      post({ type: 'appx:app-ready', source: 'boot', timestamp: Date.now() });\n" +
+  '      return;\n' +
+  '    }\n' +
+  '    if (unmatched) {\n' +
+  '      fired = true;\n' +
+  "      post({ type: 'appx:runtime-error', source: 'blank-root', message: 'App mounted but rendered an unmatched route', timestamp: Date.now() });\n" +
+  '      return;\n' +
+  '    }\n' +
+  '    if (Date.now() - started >= MAX_MS) {\n' +
+  '      fired = true;\n' +
+  "      post({ type: 'appx:runtime-error', source: 'blank-root', message: 'App mounted but rendered nothing', timestamp: Date.now() });\n" +
+  '      return;\n' +
+  '    }\n' +
+  '    setTimeout(check, POLL_MS);\n' +
+  '  }\n' +
+  '  setTimeout(check, POLL_MS);\n' +
   '})();\n' +
   '</script>\n';
 
