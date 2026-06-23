@@ -409,7 +409,33 @@ func (s *Server) handleMergeSandboxMetadata(w http.ResponseWriter, r *http.Reque
 		NotFound(w, "sandbox not found")
 		return
 	}
+
+	// Wave-2 (2026-06-23): setting appx.projectId is the pool-CLAIM signal.
+	// A just-claimed warm sandbox still carries last_active_at from its idle
+	// warm life, so the idle reaper could sleep/destroy it in the window
+	// between claim and the project's first code push. Mirror the wake handler
+	// (handleWakeSandbox) and bump last_active_at on claim so the freshly
+	// claimed sandbox gets a full idle window to become active. Best-effort —
+	// a failed bump only risks an earlier reap, never a failed tag.
+	if claimsProject(patch) && s.filePushStore != nil {
+		if err := s.filePushStore.UpdateSandboxLastActive(r.Context(), pgtype.UUID{Bytes: id, Valid: true}); err != nil {
+			s.logger.Warn("metadata-merge: failed to bump last_active_at on claim",
+				"error", err, "sandbox_id", idStr)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, sandboxToResponse(sb))
+}
+
+// claimsProject reports whether a metadata patch sets a non-empty
+// appx.projectId — i.e. it's a pool-claim tag (vs any other metadata merge).
+func claimsProject(patch map[string]interface{}) bool {
+	v, ok := patch["appx.projectId"]
+	if !ok {
+		return false
+	}
+	s, isStr := v.(string)
+	return isStr && s != ""
 }
 
 // handleWakeSandbox handles POST /v1/sandboxes/{id}/wake.
