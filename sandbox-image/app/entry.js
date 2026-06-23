@@ -151,4 +151,64 @@
   } catch (_e) {}
 })();
 
+// ── Boot watchdog (reload-black cure) ────────────────────────────────────────
+// Posts a POSITIVE paint signal the AppX preview frontend uses to clear its
+// loading spinner — and, by its ABSENCE, to drive the hung-bundle auto-remount
+// (PhonePreviewPanel.tsx). This lives in the bundle ENTRY rather than the served
+// HTML shell on purpose: Expo SDK 54 (`web.output:"single"`) generates its own
+// web index.html from app.json and serves it for `/`, shadowing any Metro
+// `enhanceMiddleware` wrapper — so a shell-level <script> never reaches the
+// browser (verified in prod: the served page is Expo's, titled "Appx Sandbox").
+// entry.js IS the served bundle's first module, so this runs the instant the
+// bundle executes.
+//   - #root paints real content      -> {type:'appx:app-ready', source:'boot'}
+//   - Expo Router 'Unmatched Route'   -> {type:'appx:runtime-error', source:'blank-root', message:'…unmatched route'}
+//   - #root still empty at the ceiling-> {type:'appx:runtime-error', source:'blank-root', message:'…rendered nothing'}
+// Fires exactly once. A bundle that never loads (502 / hung upstream) can't run
+// this — the frontend's spinner fallback + known-ping fast-heal cover that
+// reload case. MAX_MS is generous: a cold web bundle can take ~30s, so a short
+// timeout would false-positive "rendered nothing" before the app even mounts.
+(function installAppxBootWatchdog() {
+  try {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+    if (!window.parent || window.parent === window) return;
+    var POLL_MS = 400;
+    var MAX_MS = 60000;
+    var started = Date.now();
+    var fired = false;
+    function postParent(payload) {
+      try { window.parent.postMessage(payload, '*'); } catch (_e) {}
+    }
+    function isUnmatched(root) {
+      try {
+        var t = root.textContent || '';
+        return t.indexOf('Unmatched Route') !== -1 || t.indexOf('This screen does not exist') !== -1;
+      } catch (_e) { return false; }
+    }
+    function check() {
+      if (fired) return;
+      var root = document.getElementById('root');
+      var hasContent = !!root && root.childElementCount > 0;
+      var unmatched = !!root && isUnmatched(root);
+      if (hasContent && !unmatched) {
+        fired = true;
+        postParent({ type: 'appx:app-ready', source: 'boot', timestamp: Date.now() });
+        return;
+      }
+      if (unmatched) {
+        fired = true;
+        postParent({ type: 'appx:runtime-error', source: 'blank-root', message: 'App mounted but rendered an unmatched route', timestamp: Date.now() });
+        return;
+      }
+      if (Date.now() - started >= MAX_MS) {
+        fired = true;
+        postParent({ type: 'appx:runtime-error', source: 'blank-root', message: 'App mounted but rendered nothing', timestamp: Date.now() });
+        return;
+      }
+      setTimeout(check, POLL_MS);
+    }
+    setTimeout(check, POLL_MS);
+  } catch (_e) { /* never break boot */ }
+})();
+
 import 'expo-router/entry';
