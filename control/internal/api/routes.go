@@ -48,6 +48,7 @@ func (s *Server) RegisterRoutes() {
 				r.Post("/sandboxes/{id}/sleep", s.handleSleepSandbox)
 				r.Post("/sandboxes/{id}/activity", s.handleTouchSandboxActivity)
 				r.Post("/sandboxes/{id}/files", s.handleFilePush)
+				r.Get("/sandboxes/{id}/dist", s.handleDistFetch)
 
 				// Exec endpoints — optionally accept a scoped JWT in the
 				// X-Exec-Token header (in addition to the global Bearer).

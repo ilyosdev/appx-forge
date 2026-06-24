@@ -14,6 +14,7 @@ import (
 
 	"github.com/appx/forge/agent/internal/config"
 	"github.com/appx/forge/agent/internal/controlclient"
+	"github.com/appx/forge/agent/internal/distout"
 	"github.com/appx/forge/agent/internal/docker"
 	"github.com/appx/forge/agent/internal/events"
 	"github.com/appx/forge/agent/internal/filepush"
@@ -32,6 +33,7 @@ type Agent struct {
 	heartbeat   *health.HeartbeatSender
 	puller      *docker.ImagePuller
 	filePush    *filepush.Handler
+	distOut     *distout.Handler
 	ports       *ports.Allocator
 	httpServer  *http.Server
 	snapshotter *docker.Snapshotter // Phase 30 — shared by heartbeat sender + /v1/containers/{name} handler + startup reachability check
@@ -79,6 +81,10 @@ func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 	// 8. File push handler -- executor implements SandboxResolver via CodeDir
 	filePushHandler := filepush.NewHandler([]byte(cfg.HMACSecret), executor, logger)
 
+	// 8b. Dist-out handler -- streams the built dist/ out for static-preview
+	// publish (ADR-0003). Reuses the executor's CodeDir resolver + HMAC scheme.
+	distOutHandler := distout.NewHandler([]byte(cfg.HMACSecret), executor, logger)
+
 	return &Agent{
 		cfg:         cfg,
 		docker:      dockerClient,
@@ -88,6 +94,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 		heartbeat:   heartbeatSender,
 		puller:      puller,
 		filePush:    filePushHandler,
+		distOut:     distOutHandler,
 		ports:       portAlloc,
 		snapshotter: snapshotter,
 		logger:      logger,
@@ -154,6 +161,8 @@ func (a *Agent) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 	mux.Handle("POST /v1/sandboxes/{id}/files", a.filePush)
+	// Dist-out: stream the built dist/ for static-preview publish (ADR-0003).
+	mux.Handle("GET /v1/sandboxes/{id}/dist", a.distOut)
 	// Phase 30 — synchronous existence endpoint; control plane consults
 	// this on stale verified_at reads. See containers_handler.go.
 	mux.Handle("GET /v1/containers/{name}", newContainerExistsHandler(a.snapshotter))
