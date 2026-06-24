@@ -38,6 +38,9 @@ type ExecRequest struct {
 	// does not interpret it — it is re-marshalled verbatim into the agent
 	// command payload alongside the other exec fields.
 	CPUBurst bool `json:"cpu_burst,omitempty"`
+	// User is an optional pass-through (empty = agent default appuser). The
+	// web export sets "root"; control forwards it verbatim to the agent.
+	User string `json:"user,omitempty"`
 }
 
 // DispatchExec creates an exec command targeted at the sandbox's node and

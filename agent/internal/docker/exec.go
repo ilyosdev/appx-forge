@@ -56,6 +56,13 @@ type ExecSpec struct {
 	// ContainerUpdate); fail-safe — any burst/restore error is logged and the
 	// exec proceeds at the current cap, never aborting.
 	CPUBurst bool
+
+	// User is the OPTIONAL user (or uid[:gid]) the exec process runs as.
+	// Empty = the image's default USER (appuser). The web export sets "root"
+	// so it can rewrite the root-owned synced app.json (to bake the serve
+	// sub-path into experiments.baseUrl), then drops to appuser via `su` for
+	// the actual bundle so the shared Metro cache keeps appuser ownership.
+	User string
 }
 
 // ExecResult captures the outcome of an exec invocation.
@@ -114,6 +121,7 @@ func ExecRun(ctx context.Context, client execClient, containerID string, spec Ex
 		Cmd:          spec.Cmd,
 		Env:          spec.Env,
 		WorkingDir:   spec.WorkingDir,
+		User:         spec.User,
 		AttachStdout: true,
 		AttachStderr: true,
 	})

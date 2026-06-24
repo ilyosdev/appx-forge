@@ -583,6 +583,9 @@ type execRequest struct {
 	// cap for this exec. Optional (omitted = false). Pass-through only — control
 	// forwards it to the agent verbatim via lifecycle.ExecRequest.
 	CPUBurst bool `json:"cpu_burst,omitempty"`
+	// User runs the exec as a specific user (empty = agent default appuser).
+	// Optional pass-through — forwarded verbatim via lifecycle.ExecRequest.
+	User string `json:"user,omitempty"`
 }
 
 // execAcceptResponse is the 202 Accepted body returned by handleExecSandbox.
@@ -670,6 +673,7 @@ func (s *Server) handleExecSandbox(w http.ResponseWriter, r *http.Request) {
 		Env:            req.Env,
 		TimeoutSeconds: req.TimeoutSeconds,
 		CPUBurst:       req.CPUBurst,
+		User:           req.User,
 	})
 	if err != nil {
 		switch {

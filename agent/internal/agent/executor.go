@@ -135,6 +135,10 @@ type execPayload struct {
 	// CPU cap for the duration of this exec (then restore it). Optional;
 	// omitted = false = no burst. Set by the web export to speed cold builds.
 	CPUBurst bool `json:"cpu_burst,omitempty"`
+	// User runs the exec as a specific user (empty = image default appuser).
+	// Optional pass-through. The web export sets "root" to rewrite the
+	// root-owned synced app.json before dropping to appuser via `su`.
+	User string `json:"user,omitempty"`
 }
 
 // ── Execute ─────────────────────────────────────────────────────────────
@@ -505,6 +509,7 @@ func (e *CommandExecutor) executeExec(ctx context.Context, cmd controlclient.Com
 		WorkingDir:     payload.Cwd,
 		TimeoutSeconds: payload.TimeoutSeconds,
 		CPUBurst:       payload.CPUBurst,
+		User:           payload.User,
 	})
 	if err != nil {
 		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("exec error: %v", err))
