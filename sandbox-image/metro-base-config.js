@@ -45,6 +45,27 @@ config.resolver.nodeModulesPaths = ['/opt/expo-shared-deps/node_modules'];
 config.resolver.useWatchman = false;
 config.watcher = { ...(config.watcher || {}), useWatchman: false };
 
+// Resolve the `@/...` path alias to the project root. Gen'd apps import via
+// `@/constants/colors` etc. (tsconfig "paths": {"@/*": ["./*"]}), but the gen
+// scaffold's tsconfig loses those paths on sync AND Metro does not honor
+// tsconfig paths under this custom resolver — so `@/...` fails to resolve and
+// the web bundle 500s (blank preview). Resolve it explicitly here: works for
+// BOTH the dev server and `expo export`, for EVERY project, independent of the
+// per-file gen-time rewrite. Non-`@/` modules fall through to the default
+// resolver unchanged.
+const __defaultResolveRequest = config.resolver.resolveRequest;
+config.resolver.resolveRequest = (context, moduleName, platform) => {
+  if (moduleName === '@' || moduleName.startsWith('@/')) {
+    const target = path.resolve(projectRoot, moduleName.replace(/^@\/?/, ''));
+    return context.resolveRequest(context, target, platform);
+  }
+  return (__defaultResolveRequest || context.resolveRequest)(
+    context,
+    moduleName,
+    platform,
+  );
+};
+
 // W3 — content negotiation at `/`. Browsers iframe-loading a sandbox URL expect
 // an HTML wrapper that boots the JS bundle; Expo Go expects an Expo manifest JSON.
 // Default Metro serves manifest at `/`, which caused iframes to render raw JSON

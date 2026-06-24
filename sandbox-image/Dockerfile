@@ -1,5 +1,18 @@
-# Forge Sandbox Image v17 (shared cacheVersion + per-build CPU burst).
+# Forge Sandbox Image v19 (semver@7 deps rebuild + @/ resolver + cacheVersion + burst).
 # See .planning/phases/19-shared-bundler/19-B3-SPEC.md for B3 rationale.
+#
+# v19 (2026-06-24): rebuild the shared-deps layer from app/package.json (which
+# pins semver ^7.7.2) so semver@7 HOISTS to the top-level. The deployed image's
+# deps had regressed to semver@6.3.1 (no functions/ subfolder), so reanimated 4's
+# validate-worklets-version → `import semver/functions/satisfies` could not
+# resolve → web bundle 500 → blank preview for every reanimated app. (The "v5
+# fix" pin was in the repo but never rebuilt into the deployed image.)
+#
+# v18 change (2026-06-24): metro-base-config.js resolves the `@/...` path alias
+# to the project root. Gen'd apps import via `@/constants/colors` but the gen
+# scaffold tsconfig loses its "paths" on sync and Metro ignores tsconfig paths
+# under our custom resolver → `@/` failed to resolve → web bundle 500 → blank
+# preview (dev AND static export). Now resolved explicitly in the resolver.
 #
 # v17 changes (2026-06-24) — web-preview speed:
 #   - metro-base-config.js: config.cacheVersion='appx-shared-v1' (stable
