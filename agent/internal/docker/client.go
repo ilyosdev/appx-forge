@@ -409,8 +409,23 @@ func (d *dockerClient) ExecRun(ctx context.Context, containerID string, spec Exe
 func (d *dockerClient) applyCPUBurst(containerID string) (restore func(), ok bool) {
 	originalNanos, tracked := getOriginalCPUCap(containerID)
 	if !tracked {
-		d.logBurst("cpu-burst: container not tracked, skipping burst", "container_id", containerID)
-		return nil, false
+		// The in-memory tracker is process-local, so an agent restart empties it
+		// for every still-running container — leaving them unburstable (a cold web
+		// export then runs at the 0.5-CPU cap and times out). Recover the cap from
+		// the live container instead of giving up: its current NanoCPUs IS the
+		// create-time cap whenever it is not mid-burst. Skip only when the cap is
+		// unreadable, unlimited (0), or already the burst value (a leaked in-flight
+		// burst whose true original we cannot recover from inspect alone).
+		current, ierr := d.inspectNanoCPUs(containerID)
+		if ierr != nil || current <= 0 || current == cpuBurstNanos {
+			d.logBurst("cpu-burst: untracked + cap unrecoverable, skipping burst",
+				"container_id", containerID, "current_nanos", current, "inspect_err", ierr)
+			return nil, false
+		}
+		storeOriginalCPUCap(containerID, current)
+		originalNanos = current
+		d.logBurst("cpu-burst: re-tracked cap from live inspect (post-restart recovery)",
+			"container_id", containerID, "original_nanos", originalNanos)
 	}
 	if originalNanos == cpuBurstNanos {
 		// Already at (or above) the burst cap — nothing to do, nothing to restore.
@@ -439,6 +454,22 @@ func (d *dockerClient) applyCPUBurst(containerID string) (restore func(), ok boo
 				"container_id", containerID, "original_nanos", originalNanos, "error", restoreErr)
 		}
 	}, true
+}
+
+// inspectNanoCPUs returns the container's current NanoCPUs cap from a live
+// inspect (0 = unlimited or HostConfig unavailable). Used by applyCPUBurst to
+// recover the original cap after an agent restart emptied the in-memory tracker.
+func (d *dockerClient) inspectNanoCPUs(containerID string) (int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), cpuUpdateTimeout)
+	defer cancel()
+	res, err := d.cli.ContainerInspect(ctx, containerID, dockerclient.ContainerInspectOptions{})
+	if err != nil {
+		return 0, err
+	}
+	if res.Container.HostConfig == nil {
+		return 0, nil
+	}
+	return res.Container.HostConfig.NanoCPUs, nil
 }
 
 // logBurst logs a CPU-burst diagnostic at warn level, tolerating a nil logger.
