@@ -89,4 +89,12 @@ if [ -n "$APP_NAME" ]; then
   echo "[entrypoint] EXPO_PACKAGER_PROXY_URL=${EXPO_PACKAGER_PROXY_URL}"
 fi
 
+# NOTE (v17): no node-boot cache pre-warm. A cold `expo export` cannot finish
+# under the 0.5-CPU cap within a sane timeout (it would time out and thrash,
+# re-attempting on every first-boot container). Instead the per-build CPU burst
+# (ExecSpec.CPUBurst, set by the backend WebExportService) makes the FIRST real
+# export on a fresh node fast AND warms the shared /mnt/metro-cache under the
+# stable cacheVersion='appx-shared-v1' for every later project. See
+# docs/bigpicture/server2-preview-speed-research-2026-06-24.md.
+
 exec "$@"

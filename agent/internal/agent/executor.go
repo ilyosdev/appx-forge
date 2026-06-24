@@ -131,6 +131,10 @@ type execPayload struct {
 	Cwd            string            `json:"cwd"`
 	Env            map[string]string `json:"env,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds"`
+	// CPUBurst, when true, asks the agent to temporarily raise the sandbox's
+	// CPU cap for the duration of this exec (then restore it). Optional;
+	// omitted = false = no burst. Set by the web export to speed cold builds.
+	CPUBurst bool `json:"cpu_burst,omitempty"`
 }
 
 // ── Execute ─────────────────────────────────────────────────────────────
@@ -500,6 +504,7 @@ func (e *CommandExecutor) executeExec(ctx context.Context, cmd controlclient.Com
 		Env:            envSlice,
 		WorkingDir:     payload.Cwd,
 		TimeoutSeconds: payload.TimeoutSeconds,
+		CPUBurst:       payload.CPUBurst,
 	})
 	if err != nil {
 		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("exec error: %v", err))

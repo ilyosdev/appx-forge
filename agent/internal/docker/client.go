@@ -7,14 +7,29 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"strconv"
 	"time"
 
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	dockerclient "github.com/moby/moby/client"
 
 	"github.com/appx/forge/shared-go/models"
 )
+
+// cpuBurstNanos is the CPU cap a container is raised to during a CPUBurst exec.
+// 4 cores (4e9 NanoCPUs) is a safe, predictable ceiling on the 8-core Server-2
+// fleet: it leaves headroom for the host + other sandboxes while cutting a cold
+// web export's transform time well below the 0.5-core baseline. The cap is
+// restored to the container's original value as soon as the exec returns.
+const cpuBurstNanos int64 = 4e9
+
+// cpuUpdateTimeout bounds each ContainerUpdate call (burst + restore) so a slow
+// daemon can't stall the exec path. Burst failure is non-fatal (exec runs at the
+// current cap); restore failure leaves the container bursted until its next
+// start_sandbox re-applies the spec cap — both are safe.
+const cpuUpdateTimeout = 5 * time.Second
 
 // Client defines the interface for Docker container operations.
 // All methods are context-aware and return errors on failure.
@@ -147,6 +162,7 @@ type rawDockerClient interface {
 type dockerClient struct {
 	cli       *dockerclient.Client // nil when using rawClient directly
 	rawClient rawDockerClient
+	logger    *slog.Logger // optional; used by the CPU-burst exec path. Nil-safe.
 }
 
 // raw returns the underlying Docker SDK client, preferring rawClient if set.
@@ -159,7 +175,10 @@ func (d *dockerClient) raw() rawDockerClient {
 
 // NewDockerClient creates a new Docker client using environment defaults.
 // It negotiates the API version with the Docker daemon automatically.
-func NewDockerClient() (*dockerClient, error) {
+//
+// logger is optional (may be nil) and is used only by the CPU-burst exec path
+// to record non-fatal burst/restore failures.
+func NewDockerClient(logger *slog.Logger) (*dockerClient, error) {
 	cli, err := dockerclient.NewClientWithOpts(
 		dockerclient.FromEnv,
 		dockerclient.WithAPIVersionNegotiation(),
@@ -167,14 +186,37 @@ func NewDockerClient() (*dockerClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker: create client: %w", err)
 	}
-	return &dockerClient{cli: cli, rawClient: cli}, nil
+	return &dockerClient{cli: cli, rawClient: cli, logger: logger}, nil
 }
 
 // StartContainer starts a previously created container.
+//
+// Defense-in-depth for the per-build CPU burst: if a burst's restore failed
+// (a ContainerUpdate hiccup, or the agent was SIGKILL'd mid-export), the
+// container is left pinned at cpuBurstNanos and Docker persists that HostConfig
+// across stop→start. On every wake we re-assert the tracked original cap, so a
+// leaked burst can never outlive a sleep→wake cycle (the realistic path: a
+// bursted pool container goes idle, sleeps, and wakes). Best-effort + nil-safe;
+// a failure here only means the (rare) leak persists until the next wake and
+// never blocks the start. Untracked containers (e.g. after an agent restart
+// that emptied the in-memory tracker) are skipped — those were never bursted by
+// this process, so they sit at their create-time cap already.
 func (d *dockerClient) StartContainer(ctx context.Context, containerID string) error {
 	_, err := d.raw().ContainerStart(ctx, containerID, dockerclient.ContainerStartOptions{})
 	if err != nil {
 		return fmt.Errorf("docker: start container %s: %w", containerID, err)
+	}
+	if d.cli != nil {
+		if original, ok := getOriginalCPUCap(containerID); ok {
+			upCtx, cancel := context.WithTimeout(context.Background(), cpuUpdateTimeout)
+			if _, uerr := d.cli.ContainerUpdate(upCtx, containerID, dockerclient.ContainerUpdateOptions{
+				Resources: &container.Resources{NanoCPUs: original},
+			}); uerr != nil {
+				d.logBurst("cpu-burst: failed to re-assert cap on start",
+					"container_id", containerID, "error", uerr)
+			}
+			cancel()
+		}
 	}
 	return nil
 }
@@ -199,6 +241,8 @@ func (d *dockerClient) RemoveContainer(ctx context.Context, containerID string) 
 	if err != nil {
 		return fmt.Errorf("docker: remove container %s: %w", containerID, err)
 	}
+	// Drop the CPU-burst cap entry so the tracker can't leak across churn.
+	clearCPUCap(containerID)
 	return nil
 }
 
@@ -342,8 +386,66 @@ func (d *dockerClient) Close() error {
 // directly (not d.raw()) because exec is not part of the rawClient
 // mock surface — tests for exec live in exec_test.go and construct a
 // fake execClient.
+//
+// When spec.CPUBurst is set, the container's CPU cap is raised to cpuBurstNanos
+// for the duration of the exec and restored to its original value via a defer.
+// The burst is entirely best-effort: a missing tracker entry, a nil SDK handle,
+// or a ContainerUpdate failure all fall back to running the exec at the current
+// cap. Restore is guaranteed on every exit path (return, error, panic) by defer.
 func (d *dockerClient) ExecRun(ctx context.Context, containerID string, spec ExecSpec) (*ExecResult, error) {
+	if spec.CPUBurst && d.cli != nil {
+		if restore, ok := d.applyCPUBurst(containerID); ok {
+			defer restore()
+		}
+	}
 	return ExecRun(ctx, d.cli, containerID, spec)
+}
+
+// applyCPUBurst raises containerID's CPU cap to cpuBurstNanos and returns a
+// restore closure plus whether the burst was applied. ok == false means no
+// burst happened (no tracked cap, or the update failed) and the caller must NOT
+// defer the returned closure. Errors are logged (nil-safe) and never surfaced —
+// the exec must proceed regardless.
+func (d *dockerClient) applyCPUBurst(containerID string) (restore func(), ok bool) {
+	originalNanos, tracked := getOriginalCPUCap(containerID)
+	if !tracked {
+		d.logBurst("cpu-burst: container not tracked, skipping burst", "container_id", containerID)
+		return nil, false
+	}
+	if originalNanos == cpuBurstNanos {
+		// Already at (or above) the burst cap — nothing to do, nothing to restore.
+		return nil, false
+	}
+
+	burstCtx, cancel := context.WithTimeout(context.Background(), cpuUpdateTimeout)
+	_, err := d.cli.ContainerUpdate(burstCtx, containerID, dockerclient.ContainerUpdateOptions{
+		Resources: &container.Resources{NanoCPUs: cpuBurstNanos},
+	})
+	cancel()
+	if err != nil {
+		d.logBurst("cpu-burst: failed to apply burst, running at current cap",
+			"container_id", containerID, "error", err)
+		return nil, false
+	}
+
+	return func() {
+		restoreCtx, cancelRestore := context.WithTimeout(context.Background(), cpuUpdateTimeout)
+		_, restoreErr := d.cli.ContainerUpdate(restoreCtx, containerID, dockerclient.ContainerUpdateOptions{
+			Resources: &container.Resources{NanoCPUs: originalNanos},
+		})
+		cancelRestore()
+		if restoreErr != nil {
+			d.logBurst("cpu-burst: failed to restore original cap (will reset on next start_sandbox)",
+				"container_id", containerID, "original_nanos", originalNanos, "error", restoreErr)
+		}
+	}, true
+}
+
+// logBurst logs a CPU-burst diagnostic at warn level, tolerating a nil logger.
+func (d *dockerClient) logBurst(msg string, args ...any) {
+	if d.logger != nil {
+		d.logger.Warn(msg, args...)
+	}
 }
 
 // ListContainers returns all Forge-managed containers (running + stopped)

@@ -1,5 +1,16 @@
-# Forge Sandbox Image v14 (wake reflush fix — no cold rebundle on docker-start).
+# Forge Sandbox Image v17 (shared cacheVersion + per-build CPU burst).
 # See .planning/phases/19-shared-bundler/19-B3-SPEC.md for B3 rationale.
+#
+# v17 changes (2026-06-24) — web-preview speed:
+#   - metro-base-config.js: config.cacheVersion='appx-shared-v1' (stable
+#     cross-tenant key) so the shared host /mnt/metro-cache FileStore dedups
+#     framework transforms across ALL sandboxes (was per-project package.json
+#     name → zero reuse → every cold export re-transformed ~2200 modules).
+#   - Per-build CPU burst (agent ExecSpec.CPUBurst, set by the backend web
+#     export) makes the FIRST real export on a fresh node run at a raised CPU
+#     cap (~4 cores) so it finishes fast AND warms /mnt/metro-cache for every
+#     later project's near-warm export. (No separate entrypoint pre-warm: a cold
+#     export can't finish under the 0.5-CPU cap within a sane timeout.)
 #
 # v14 fix (2026-06-12): sleep-not-destroy wakes a sandbox via docker stop→start
 # against the SAME preserved /app/code bind mount. The entrypoint then re-ran

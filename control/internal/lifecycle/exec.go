@@ -33,6 +33,11 @@ type ExecRequest struct {
 	Cwd            string            `json:"cwd,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds"`
+	// CPUBurst is an optional pass-through flag (omitted = false). When true,
+	// the agent temporarily raises the sandbox CPU cap for this exec. Control
+	// does not interpret it — it is re-marshalled verbatim into the agent
+	// command payload alongside the other exec fields.
+	CPUBurst bool `json:"cpu_burst,omitempty"`
 }
 
 // DispatchExec creates an exec command targeted at the sandbox's node and

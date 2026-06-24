@@ -579,6 +579,10 @@ type execRequest struct {
 	Cwd            string            `json:"cwd,omitempty"`
 	Env            map[string]string `json:"env,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	// CPUBurst, when true, asks the agent to temporarily raise the sandbox CPU
+	// cap for this exec. Optional (omitted = false). Pass-through only — control
+	// forwards it to the agent verbatim via lifecycle.ExecRequest.
+	CPUBurst bool `json:"cpu_burst,omitempty"`
 }
 
 // execAcceptResponse is the 202 Accepted body returned by handleExecSandbox.
@@ -665,6 +669,7 @@ func (s *Server) handleExecSandbox(w http.ResponseWriter, r *http.Request) {
 		Cwd:            req.Cwd,
 		Env:            req.Env,
 		TimeoutSeconds: req.TimeoutSeconds,
+		CPUBurst:       req.CPUBurst,
 	})
 	if err != nil {
 		switch {

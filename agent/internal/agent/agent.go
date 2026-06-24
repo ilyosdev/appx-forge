@@ -45,7 +45,7 @@ type Agent struct {
 // that happens in Run().
 func New(cfg *config.Config, logger *slog.Logger) (*Agent, error) {
 	// 1. Docker client
-	dockerClient, err := docker.NewDockerClient()
+	dockerClient, err := docker.NewDockerClient(logger)
 	if err != nil {
 		return nil, fmt.Errorf("agent: create docker client: %w", err)
 	}

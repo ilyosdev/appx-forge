@@ -46,6 +46,16 @@ type ExecSpec struct {
 	// TimeoutSeconds caps the exec wall-clock duration. Values outside
 	// [execTimeoutMinSeconds, execTimeoutMaxSeconds] are clamped.
 	TimeoutSeconds int
+
+	// CPUBurst is an OPTIONAL flag (omitted = false = no burst). When true,
+	// the container's CPU cap is raised to a burst value for the duration of
+	// this exec, then restored to the original cap via a defer. Used by the
+	// web export to speed cold Metro transforms (~2200 framework modules at
+	// the 0.5-CPU baseline take minutes). Honoured only by the concrete
+	// dockerClient.ExecRun (which holds the moby SDK handle needed for
+	// ContainerUpdate); fail-safe — any burst/restore error is logged and the
+	// exec proceeds at the current cap, never aborting.
+	CPUBurst bool
 }
 
 // ExecResult captures the outcome of an exec invocation.

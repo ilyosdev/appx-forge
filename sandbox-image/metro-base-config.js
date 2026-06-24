@@ -174,16 +174,25 @@ config.server = {
 // framework files (react-native, expo-*) dedup across every tenant on the host.
 config.cacheStores = [new FileStore({ root: '/mnt/metro-cache' })];
 
-// Per-project cache namespace prevents cross-project cache poisoning
-// (expo/expo#30930). Derived from the project's package.json name; falls back
-// to a fixed tag if the file is unreadable for any reason.
-let cacheVersion = 'appx-sandbox';
-try {
-  cacheVersion = require(path.join(projectRoot, 'package.json')).name || cacheVersion;
-} catch {
-  /* intentional: project may not have package.json yet on first boot */
-}
-config.cacheVersion = cacheVersion;
+// Cross-tenant shared transform cache: cacheVersion MUST be identical across
+// EVERY project so framework transforms (react-native, expo-*, react) — which
+// are byte-identical for all tenants (shared read-only /opt/expo-shared-deps +
+// this same baked babel/metro config) — dedup in the shared /mnt/metro-cache
+// FileStore (bind-mounted host volume, same across all sandboxes).
+//
+// It was previously derived from the project's package.json `name`, which is
+// UNIQUE per project (e.g. "food-save-kz", "crypto-portfolio-tracker") → the
+// cacheVersion differed per project → ZERO cross-project reuse → every cold
+// `expo export` re-transformed all ~2200 modules (~8 min at the 0.5-CPU sandbox
+// cap, > the build timeout). Metro keys each transform by file CONTENT + (this
+// single shared) transformer options, so a stable cacheVersion cannot
+// cross-contaminate files that differ; expo#30930's "poisoning" was a
+// per-project babel/config divergence that does not exist here — every sandbox
+// bakes this exact /opt/metro-base-config.js.
+//
+// BUMP this tag (…-v1 → -v2) whenever /opt/expo-shared-deps or the babel /
+// transform config changes, so stale transforms are not reused after a rebuild.
+config.cacheVersion = 'appx-shared-v1';
 
 // Stable module IDs by SHA-1 of relative path. Makes cache keys stable across
 // container restarts and across fleet-node instances (B4 foundation).

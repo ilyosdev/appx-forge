@@ -8,11 +8,49 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	dockerclient "github.com/moby/moby/client"
 )
+
+// ── CPU Burst Cap Tracking ───────────────────────────────────────────────
+
+// containerCPUCaps records the original NanoCPUs cap each sandbox was created
+// with, keyed by Docker container ID. The per-build CPU burst (ExecSpec.CPUBurst)
+// temporarily raises a container's cap and must restore the exact original value
+// afterwards — this map is that source of truth. Protected by cpuCapsMu.
+var (
+	containerCPUCaps = make(map[string]int64)
+	cpuCapsMu        sync.RWMutex
+)
+
+// storeOriginalCPUCap saves a container's original NanoCPUs cap. Called once
+// from CreateContainer, before any exec can run.
+func storeOriginalCPUCap(containerID string, nanos int64) {
+	cpuCapsMu.Lock()
+	defer cpuCapsMu.Unlock()
+	containerCPUCaps[containerID] = nanos
+}
+
+// getOriginalCPUCap returns the stored original NanoCPUs cap for a container,
+// and whether it was tracked. An untracked container (ok == false) means the
+// caller should skip the burst rather than guess a cap.
+func getOriginalCPUCap(containerID string) (int64, bool) {
+	cpuCapsMu.RLock()
+	defer cpuCapsMu.RUnlock()
+	nanos, ok := containerCPUCaps[containerID]
+	return nanos, ok
+}
+
+// clearCPUCap removes a container from the cap tracker. Called on container
+// removal so the map can't grow unbounded across sandbox churn.
+func clearCPUCap(containerID string) {
+	cpuCapsMu.Lock()
+	defer cpuCapsMu.Unlock()
+	delete(containerCPUCaps, containerID)
+}
 
 // ── Sandbox Container Lifecycle ──────────────────────────────────────────
 
@@ -123,6 +161,10 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 	if err != nil {
 		return "", fmt.Errorf("docker: start container %s: %w", containerName, err)
 	}
+
+	// Record the original CPU cap so a per-build CPU burst (ExecSpec.CPUBurst)
+	// can restore the exact value after the exec completes.
+	storeOriginalCPUCap(result.ID, int64(spec.CPUCores*1e9))
 
 	return result.ID, nil
 }
