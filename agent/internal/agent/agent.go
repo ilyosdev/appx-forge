@@ -159,6 +159,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		"node_id", regResp.NodeID,
 		"heartbeat_interval", regResp.HeartbeatIntervalSeconds,
 	)
+	// Surface the control-assigned node id to the executor so the start_hmr ack
+	// can carry it (the backend builds the per-turn HMR Caddy dial from it).
+	a.executor.SetNodeID(regResp.NodeID)
 
 	// Step 2: Start heartbeat sender (goroutine, stops on ctx cancel)
 	go a.heartbeat.Start(ctx)

@@ -40,6 +40,13 @@ type CommandExecutor struct {
 	sandboxDir string
 	logger     *slog.Logger
 
+	// nodeID is this agent's control-assigned node id, set post-registration via
+	// SetNodeID. Surfaced in the start_hmr ack so the backend can build the Caddy
+	// upstream dial (<nodeIp>:<host_port>) for the per-turn HMR box without a
+	// separate sandbox→node lookup. Empty until registration completes (commands
+	// are only polled after registration, so executeStartHmr always sees it set).
+	nodeID string
+
 	// In-memory map: sandboxID -> sandbox state
 	sandboxes map[string]*sandboxInfo
 	mu        sync.RWMutex
@@ -88,6 +95,13 @@ func NewCommandExecutor(
 		restartTimers: make(map[string]*time.Timer),
 		buildDirs:     make(map[string]string),
 	}
+}
+
+// SetNodeID records this agent's control-assigned node id (from registration) so
+// the start_hmr ack can carry it. Called once, post-registration, before the
+// command poll loop dispatches any command.
+func (e *CommandExecutor) SetNodeID(id string) {
+	e.nodeID = id
 }
 
 // ── Command Payloads ────────────────────────────────────────────────────
@@ -989,6 +1003,10 @@ func (e *CommandExecutor) executeStartHmr(ctx context.Context, cmd controlclient
 	return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
 		"hmr_container_id": workerID,
 		"host_port":        hostPort,
+		// node_id lets the backend build the Caddy upstream dial
+		// (<nodeIp>:<host_port>) for the per-turn HMR route. Without it the
+		// backend's spinUp rejects the ack as "not a live box" → no-op.
+		"node_id": e.nodeID,
 	})
 }
 
