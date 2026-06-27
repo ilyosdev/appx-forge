@@ -616,10 +616,12 @@ type execResultResponse struct {
 	// BuildID is set only for build_export results — it identifies the build
 	// snapshot whose dist/ the backend then fetches via ?build=<id>.
 	BuildID string `json:"build_id,omitempty"`
-	// HmrContainerID / HostPort are set only for start_hmr results — the
-	// backend reads HostPort to add the ephemeral Caddy route.
+	// HmrContainerID / HostPort / NodeID are set only for start_hmr results —
+	// the backend builds the ephemeral Caddy upstream dial (<nodeIp>:<HostPort>)
+	// from NodeID + HostPort. spinUp rejects the box if NodeID is missing.
 	HmrContainerID string `json:"hmr_container_id,omitempty"`
 	HostPort       *int   `json:"host_port,omitempty"`
+	NodeID         string `json:"node_id,omitempty"`
 }
 
 // handleExecSandbox handles POST /v1/sandboxes/{id}/exec.
@@ -1034,6 +1036,9 @@ func (s *Server) handleGetExecResult(w http.ResponseWriter, r *http.Request) {
 				if f, ok := resultMap["host_port"].(float64); ok {
 					hp := int(f)
 					resp.HostPort = &hp
+				}
+				if s, ok := resultMap["node_id"].(string); ok {
+					resp.NodeID = s
 				}
 			} else {
 				s.logger.Warn("exec result parse failed",
