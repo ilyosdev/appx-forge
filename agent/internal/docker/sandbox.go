@@ -24,6 +24,14 @@ import (
 // never reaped mid-export.
 const buildIDLabel = "forge.build_id"
 
+// hmrIDLabel is the Docker label stamped on per-turn ephemeral HMR containers
+// (instead of forge.app_name). Same isolation rationale as buildIDLabel:
+// ListContainers (and therefore the heartbeat snapshot + orphan reconciler)
+// keys exclusively on forge.app_name, so a forge.hmr_id-labeled container is
+// invisible to drift detection and is never reaped mid-turn. The HMR reaper +
+// stop_hmr handler reach it via ListHmrWorkers instead.
+const hmrIDLabel = "forge.hmr_id"
+
 // ── CPU Burst Cap Tracking ───────────────────────────────────────────────
 
 // containerCPUCaps records the original NanoCPUs cap each sandbox was created
@@ -345,6 +353,116 @@ func SnapshotCodeDir(ctx context.Context, buildsDir, buildID, srcCodeDir string)
 	}
 
 	return destCode, nil
+}
+
+// ── HMR Worker Lifecycle (per-turn ephemeral dev Metro) ──────────────────
+
+// CreateHmrWorker creates and starts a per-turn ephemeral HMR container — a dev
+// Metro (`expo start`) that exists only while a turn is active and shows
+// uncommitted edits via HMR. It is CreateBuildWorker INVERTED on four axes:
+//
+//	build worker                  hmr worker
+//	────────────────────────────  ────────────────────────────────────────
+//	entrypoint/CMD → sleep        KEEP image default (tini → entrypoint.sh,
+//	                              CMD `npx expo start --port 8081`)
+//	no ports                      expose + bind 8081 → 0.0.0.0:HostPort
+//	bind a SNAPSHOT of code       bind the LIVE code dir (uncommitted edits)
+//	label forge.build_id          label forge.hmr_id
+//
+// Like the build worker it is labeled OUT of the forge.app_name namespace, so
+// it is invisible to ListContainers / the heartbeat reconciler / OrphanHunter
+// (the box outlives its start command; only stop_hmr or the HMR reaper removes
+// it). It is named forge-hmr-<TurnID>, a namespace distinct from forge-<app>,
+// so the idempotent pre-clean below can never remove a live dev container.
+//
+// Same hardening as CreateContainer (CapDrop/CapAdd/seccomp/no-new-privileges/
+// PidsLimit) via the shared helpers. storeOriginalCPUCap is recorded so the
+// StartContainer cap re-assert path stays consistent (HMR boxes don't burst,
+// but tracking is harmless and keeps the cap map coherent on removal).
+func (d *dockerClient) CreateHmrWorker(ctx context.Context, spec *HmrWorkerSpec) (string, error) {
+	if spec == nil {
+		return "", fmt.Errorf("docker: hmr worker spec is nil")
+	}
+	if spec.TurnID == "" {
+		return "", fmt.Errorf("docker: hmr worker spec missing turn ID")
+	}
+	if strings.Contains(spec.TurnID, "..") || strings.ContainsAny(spec.TurnID, "/\\") {
+		return "", fmt.Errorf("docker: invalid hmr turn ID %q", spec.TurnID)
+	}
+	if spec.Image == "" {
+		return "", fmt.Errorf("docker: hmr worker spec missing image")
+	}
+	if spec.CodePath == "" {
+		return "", fmt.Errorf("docker: hmr worker spec missing code path")
+	}
+	if spec.HostPort <= 0 {
+		return "", fmt.Errorf("docker: hmr worker spec missing host port")
+	}
+
+	// Env map → []string (the box runs the image CMD directly; env must be set
+	// at create time since there is no later exec to carry it).
+	env := make([]string, 0, len(spec.Env))
+	for k, v := range spec.Env {
+		env = append(env, k+"="+v)
+	}
+
+	cfg := &container.Config{
+		Image: spec.Image,
+		// KEEP the image default entrypoint + CMD (no override) so
+		// `npx expo start --port 8081` runs and entrypoint.sh seeds normally.
+		Env:          env,
+		ExposedPorts: network.PortSet{containerPortParsed: {}},
+		Labels: map[string]string{
+			hmrIDLabel: spec.TurnID,
+		},
+	}
+
+	hostCfg := &container.HostConfig{
+		PortBindings: network.PortMap{
+			containerPortParsed: []network.PortBinding{{
+				HostIP:   netip.MustParseAddr("0.0.0.0"),
+				HostPort: strconv.Itoa(spec.HostPort),
+			}},
+		},
+		Binds: []string{
+			// LIVE code dir (NOT a snapshot) — this is what makes in-turn
+			// uncommitted edits reach Metro HMR.
+			spec.CodePath + ":/app/code",
+			// Shared Metro transform cache — same cross-tenant trust as dev
+			// sandboxes; keeps the cold `expo start` boot fast.
+			"/mnt/metro-cache:/mnt/metro-cache",
+		},
+		Resources:      hardenedResources(spec.MemoryMB, spec.CPUCores),
+		SecurityOpt:    hardenedSecurityOpt(spec.SeccompPath),
+		CapDrop:        hardenedCapDrop(),
+		CapAdd:         hardenedCapAdd(),
+		ReadonlyRootfs: false, // Metro writes cache to the RW bind
+	}
+
+	containerName := "forge-hmr-" + spec.TurnID
+
+	// Idempotent: remove any leftover HMR box of the same name. Safe — the
+	// forge-hmr- prefix can never collide with a live forge-<app> sandbox.
+	_, _ = d.raw().ContainerRemove(ctx, containerName, dockerclient.ContainerRemoveOptions{Force: true})
+
+	result, err := d.raw().ContainerCreate(ctx, dockerclient.ContainerCreateOptions{
+		Config:     cfg,
+		HostConfig: hostCfg,
+		Name:       containerName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("docker: create hmr worker %s: %w", containerName, err)
+	}
+
+	if _, err := d.raw().ContainerStart(ctx, result.ID, dockerclient.ContainerStartOptions{}); err != nil {
+		return "", fmt.Errorf("docker: start hmr worker %s: %w", containerName, err)
+	}
+
+	// Track the original CPU cap so StartContainer's cap re-assert stays
+	// coherent and RemoveContainer can clear it.
+	storeOriginalCPUCap(result.ID, int64(spec.CPUCores*1e9))
+
+	return result.ID, nil
 }
 
 // ── Bind Mount Setup ─────────────────────────────────────────────────────

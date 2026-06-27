@@ -61,6 +61,11 @@ func (s *Server) RegisterRoutes() {
 					}
 					r.Post("/sandboxes/{id}/exec", s.handleExecSandbox)
 					r.Post("/sandboxes/{id}/build-export", s.handleBuildExport)
+					// Per-turn ephemeral HMR (Step 3). start dispatches a live
+					// dev Metro box; stop tears it down. Both reuse the shared
+					// exec poll endpoint to surface their acks.
+					r.Post("/sandboxes/{id}/hmr", s.handleStartHmr)
+					r.Delete("/sandboxes/{id}/hmr/{turn}", s.handleStopHmr)
 					r.Get("/sandboxes/{id}/exec/{cmd_id}", s.handleGetExecResult)
 				})
 

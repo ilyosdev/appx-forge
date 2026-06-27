@@ -35,6 +35,8 @@ type SandboxLifecycle interface {
 	SleepSandbox(ctx context.Context, id uuid.UUID) error
 	DispatchExec(ctx context.Context, sandboxID uuid.UUID, req lifecycle.ExecRequest) (string, error)
 	DispatchBuildExport(ctx context.Context, sandboxID uuid.UUID, req lifecycle.BuildExportRequest) (string, error)
+	DispatchStartHmr(ctx context.Context, sandboxID uuid.UUID, req lifecycle.StartHmrRequest) (string, error)
+	DispatchStopHmr(ctx context.Context, sandboxID uuid.UUID, req lifecycle.StopHmrRequest) (string, error)
 }
 
 // SandboxMetadataWriter abstracts the metadata-merge store write
@@ -614,6 +616,10 @@ type execResultResponse struct {
 	// BuildID is set only for build_export results — it identifies the build
 	// snapshot whose dist/ the backend then fetches via ?build=<id>.
 	BuildID string `json:"build_id,omitempty"`
+	// HmrContainerID / HostPort are set only for start_hmr results — the
+	// backend reads HostPort to add the ephemeral Caddy route.
+	HmrContainerID string `json:"hmr_container_id,omitempty"`
+	HostPort       *int   `json:"host_port,omitempty"`
 }
 
 // handleExecSandbox handles POST /v1/sandboxes/{id}/exec.
@@ -793,6 +799,138 @@ func (s *Server) handleBuildExport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// startHmrRequest is the JSON body for POST /v1/sandboxes/{id}/hmr. The image
+// is resolved from the dev sandbox row server-side.
+type startHmrRequest struct {
+	TurnID string            `json:"turn_id"`
+	Env    map[string]string `json:"env,omitempty"`
+}
+
+// handleStartHmr handles POST /v1/sandboxes/{id}/hmr.
+// Dispatches a start_hmr command (per-turn ephemeral dev Metro box) to the agent
+// hosting the sandbox and returns 202 Accepted with the new command_id. The
+// caller polls GET /v1/sandboxes/{id}/exec/{cmd_id} for the result, which
+// carries {hmr_container_id, host_port} once complete; the backend then adds the
+// ephemeral Caddy route and emits preview:hmr-ready.
+//
+// Unlike exec, this does NOT require the sandbox to be running: the box binds
+// the on-disk live code dir, which persists across a slept sandbox.
+func (s *Server) handleStartHmr(w http.ResponseWriter, r *http.Request) {
+	if s.lifecycle == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+	if s.sandboxReader == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	sandboxID, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	var req startHmrRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		BadRequest(w, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.TurnID) == "" {
+		BadRequest(w, "turn_id is required")
+		return
+	}
+
+	// Verify the sandbox exists (cleaner 404) before dispatching; lifecycle
+	// validates node assignment.
+	pgID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	if _, err := s.sandboxReader.GetSandbox(r.Context(), pgID); err != nil {
+		NotFound(w, "sandbox not found")
+		return
+	}
+
+	cmdID, err := s.lifecycle.DispatchStartHmr(r.Context(), sandboxID, lifecycle.StartHmrRequest{
+		TurnID: req.TurnID,
+		Env:    req.Env,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, lifecycle.ErrNotFound):
+			NotFound(w, "sandbox not found")
+		case errors.Is(err, lifecycle.ErrSandboxNotAssigned):
+			ServiceUnavailable(w, "sandbox not assigned to a node")
+		default:
+			s.logger.Error("start_hmr dispatch failed", "error", err, "sandbox_id", idStr)
+			WriteProblem(w, http.StatusInternalServerError,
+				"urn:forge:error:internal", "Internal Server Error", "failed to dispatch start_hmr command")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, execAcceptResponse{
+		CommandID: cmdID,
+		Status:    "queued",
+	})
+}
+
+// handleStopHmr handles DELETE /v1/sandboxes/{id}/hmr/{turn}.
+// Dispatches a stop_hmr command (force-remove the per-turn box + release its
+// port) to the agent hosting the sandbox and returns 202 Accepted with the new
+// command_id. Idempotent agent-side: a turn whose box is already gone acks
+// success.
+func (s *Server) handleStopHmr(w http.ResponseWriter, r *http.Request) {
+	if s.lifecycle == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+	if s.sandboxReader == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	sandboxID, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	turnID := chi.URLParam(r, "turn")
+	if strings.TrimSpace(turnID) == "" {
+		BadRequest(w, "turn is required")
+		return
+	}
+
+	pgID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	if _, err := s.sandboxReader.GetSandbox(r.Context(), pgID); err != nil {
+		NotFound(w, "sandbox not found")
+		return
+	}
+
+	cmdID, err := s.lifecycle.DispatchStopHmr(r.Context(), sandboxID, lifecycle.StopHmrRequest{
+		TurnID: turnID,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, lifecycle.ErrNotFound):
+			NotFound(w, "sandbox not found")
+		case errors.Is(err, lifecycle.ErrSandboxNotAssigned):
+			ServiceUnavailable(w, "sandbox not assigned to a node")
+		default:
+			s.logger.Error("stop_hmr dispatch failed", "error", err, "sandbox_id", idStr)
+			WriteProblem(w, http.StatusInternalServerError,
+				"urn:forge:error:internal", "Internal Server Error", "failed to dispatch stop_hmr command")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, execAcceptResponse{
+		CommandID: cmdID,
+		Status:    "queued",
+	})
+}
+
 // handleGetExecResult handles GET /v1/sandboxes/{id}/exec/{cmd_id}.
 // Returns the current status of the exec command and, once acked, the
 // stdout/stderr/exit_code/duration extracted from the agent's ack result.
@@ -833,11 +971,13 @@ func (s *Server) handleGetExecResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only return results for exec + build_export commands (the latter reuses
-	// this poll endpoint so waitForExec is shared verbatim). Other command types
-	// (start_sandbox, stop_sandbox, restart_sandbox) have their own UX and
-	// shouldn't leak through this endpoint shape.
-	if cmd.CommandType != "exec" && cmd.CommandType != string(models.CmdBuildExport) {
+	// Only return results for exec + build_export + start_hmr commands (the
+	// latter two reuse this poll endpoint so waitForExec is shared verbatim).
+	// Other command types (start_sandbox, stop_sandbox, restart_sandbox,
+	// stop_hmr) have their own UX and shouldn't leak through this endpoint shape.
+	if cmd.CommandType != "exec" &&
+		cmd.CommandType != string(models.CmdBuildExport) &&
+		cmd.CommandType != string(models.CmdStartHmr) {
 		NotFound(w, "command not found")
 		return
 	}
@@ -887,6 +1027,13 @@ func (s *Server) handleGetExecResult(w http.ResponseWriter, r *http.Request) {
 				}
 				if s, ok := resultMap["build_id"].(string); ok {
 					resp.BuildID = s
+				}
+				if s, ok := resultMap["hmr_container_id"].(string); ok {
+					resp.HmrContainerID = s
+				}
+				if f, ok := resultMap["host_port"].(float64); ok {
+					hp := int(f)
+					resp.HostPort = &hp
 				}
 			} else {
 				s.logger.Warn("exec result parse failed",

@@ -170,6 +170,30 @@ type buildExportPayload struct {
 	Image string `json:"image,omitempty"`
 }
 
+// startHmrPayload is the payload for start_hmr commands. The agent resolves the
+// dev sandbox's app name + LIVE code dir (and, if Image is empty, its image)
+// the same way build_export does; the box keeps the image's dev Metro CMD and
+// is bound to the live code dir so uncommitted edits HMR during the turn.
+type startHmrPayload struct {
+	// TurnID names + labels the box (forge-hmr-<TurnID> / forge.hmr_id). It is
+	// the join key for the eventual stop_hmr.
+	TurnID string `json:"turn_id"`
+	// Image is the dev sandbox's exact image. Optional — the agent inspects the
+	// live dev container when empty (never the agent default).
+	Image string `json:"image,omitempty"`
+	// Env is passed through to the HMR container at create time (backend owns
+	// HMR env semantics, e.g. APP_NAME / EXPO_PACKAGER_PROXY_URL).
+	Env map[string]string `json:"env,omitempty"`
+}
+
+// stopHmrPayload is the payload for stop_hmr commands. The agent force-removes
+// forge-hmr-<TurnID> and releases its host port. The box is located by the
+// forge.hmr_id label via ListHmrWorkers, so a stop survives an agent restart
+// (which loses any in-memory state).
+type stopHmrPayload struct {
+	TurnID string `json:"turn_id"`
+}
+
 // ── Execute ─────────────────────────────────────────────────────────────
 
 // Execute dispatches a command to the appropriate handler based on type.
@@ -200,6 +224,10 @@ func (e *CommandExecutor) Execute(ctx context.Context, cmd controlclient.Command
 		return e.executeExec(ctx, cmd)
 	case "build_export":
 		return e.executeBuildExport(ctx, cmd)
+	case "start_hmr":
+		return e.executeStartHmr(ctx, cmd)
+	case "stop_hmr":
+		return e.executeStopHmr(ctx, cmd)
 	case "prune":
 		return e.executePrune(ctx, cmd)
 	default:
@@ -388,6 +416,37 @@ func (e *CommandExecutor) AdoptBootSnapshot(snaps []docker.ContainerSnapshot) {
 		e.logger.Info("boot adoption: rebuilt state from docker truth",
 			"reserved_ports", reserved, "adopted_sandboxes", adopted,
 			"total_containers", len(snaps))
+	}
+}
+
+// AdoptHmrPorts re-reserves the host ports of every surviving per-turn HMR box.
+// Called once at agent startup alongside AdoptBootSnapshot. Necessary because
+// AdoptBootSnapshot works off the startup ContainerSnapshot, which lists only
+// forge.app_name containers (sandboxes) — HMR boxes carry forge.hmr_id, not
+// forge.app_name, so they are absent from that snapshot and their published
+// ports would never be re-reserved in the in-memory allocator. Since HMR boxes
+// are deliberately kept alive across an agent restart (ReapHmr uses a retention
+// window, not nuke-all), a survivor still holds its host port in Docker while
+// the allocator believes it free → the next Allocate() could hand it out and
+// docker-start fails "address already in use". Flag-safe: when ISOLATED_HMR is
+// off there are no HMR boxes, so the list is empty and this is a no-op.
+func (e *CommandExecutor) AdoptHmrPorts(ctx context.Context) {
+	workers, err := e.docker.ListHmrWorkers(ctx)
+	if err != nil {
+		e.logger.Warn("boot adoption: list hmr workers failed — hmr ports not re-reserved", "error", err)
+		return
+	}
+	reserved := 0
+	for _, w := range workers {
+		if w.HostPort > 0 {
+			if allocErr := e.ports.AllocateSpecific(w.HostPort); allocErr == nil {
+				reserved++
+			}
+		}
+	}
+	if reserved > 0 {
+		e.logger.Info("boot adoption: re-reserved hmr host ports",
+			"reserved_ports", reserved, "total_hmr_boxes", len(workers))
 	}
 }
 
@@ -839,6 +898,195 @@ func dirSize(root string) (int64, error) {
 		return nil
 	})
 	return total, err
+}
+
+// ── Per-Turn Ephemeral HMR (live dev Metro for an active turn) ────────────
+
+// hmrWorkerMemoryMB / hmrWorkerCPUCores are the HMR box's own cgroup (its own
+// 2GiB/2cpu, never shared with the dev sandbox). Matches the build worker's
+// budget — a v19 `expo start` is comfortable here.
+const (
+	hmrWorkerMemoryMB int64   = 2048
+	hmrWorkerCPUCores float64 = 2.0
+)
+
+// executeStartHmr starts a per-turn ephemeral HMR container: a dev Metro
+// (`expo start`) bound to the project's LIVE code dir so uncommitted edits HMR
+// during the turn. It mirrors executeBuildExport's resolve (sandbox → app name
+// → live code dir → image) but INVERTS the container shape (keeps the image's
+// dev Metro CMD, exposes a host port, binds live code, labels forge.hmr_id).
+//
+// Unlike build_export, there is NO defer-teardown: the box must OUTLIVE this
+// command (it serves the iframe for the rest of the turn + grace). Teardown is
+// an explicit later stop_hmr, with ReapHmr as the crash/leak backstop.
+//
+// Acks {hmr_container_id, host_port} on success. The backend already knows the
+// node (it dispatched this command to the dev sandbox's node row), so node IP
+// is resolved backend-side, not echoed here.
+func (e *CommandExecutor) executeStartHmr(ctx context.Context, cmd controlclient.Command) error {
+	var payload startHmrPayload
+	if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("invalid start_hmr payload: %v", err))
+	}
+	if payload.TurnID == "" {
+		return e.ackFailure(ctx, cmd.ID, "start_hmr missing turn_id")
+	}
+
+	// Resolve the dev sandbox so we can locate its LIVE code dir and (if needed)
+	// its image. The HMR box runs on the SAME node — the command was dispatched
+	// to the dev sandbox's node.
+	info, ok := e.resolveSandbox(cmd.SandboxID)
+	if !ok {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("sandbox %s not running on this node", cmd.SandboxID))
+	}
+
+	// Resolve the image: prefer the payload (dev sandbox's exact image), fall
+	// back to inspecting the live dev container. NEVER the agent default.
+	image := payload.Image
+	if image == "" {
+		if dev, ierr := e.docker.InspectContainer(ctx, info.ContainerID); ierr == nil && dev.Image != "" {
+			image = dev.Image
+		}
+	}
+	if image == "" {
+		return e.ackFailure(ctx, cmd.ID, "could not resolve dev sandbox image for hmr worker")
+	}
+
+	liveCodeDir := fmt.Sprintf("%s/%s/code", e.sandboxDir, info.AppName)
+
+	hostPort, err := e.ports.Allocate()
+	if err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("port allocation failed: %v", err))
+	}
+
+	workerID, err := e.docker.CreateHmrWorker(ctx, &docker.HmrWorkerSpec{
+		TurnID:   payload.TurnID,
+		Image:    image,
+		CodePath: liveCodeDir,
+		HostPort: hostPort,
+		MemoryMB: hmrWorkerMemoryMB,
+		CPUCores: hmrWorkerCPUCores,
+		Env:      payload.Env,
+		// SeccompPath intentionally matches the live sandbox path (empty
+		// today) — HMR boxes must not diverge from sandbox hardening.
+	})
+	if err != nil {
+		if releaseErr := e.ports.Release(hostPort); releaseErr != nil {
+			e.logger.Warn("start_hmr: failed to release port after create failure",
+				"port", hostPort, "error", releaseErr)
+		}
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("create hmr worker failed: %v", err))
+	}
+
+	e.logger.Info("hmr worker started",
+		"turn_id", payload.TurnID,
+		"sandbox_id", cmd.SandboxID,
+		"container_id", workerID,
+		"host_port", hostPort,
+		"app_name", info.AppName,
+	)
+
+	return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
+		"hmr_container_id": workerID,
+		"host_port":        hostPort,
+	})
+}
+
+// executeStopHmr force-removes the per-turn HMR box forge-hmr-<turn_id> and
+// releases its host port. The box is located by the forge.hmr_id label via
+// ListHmrWorkers, so a stop survives an agent restart (no in-memory state).
+// Idempotent: a turn whose box is already gone acks success.
+func (e *CommandExecutor) executeStopHmr(ctx context.Context, cmd controlclient.Command) error {
+	var payload stopHmrPayload
+	if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("invalid stop_hmr payload: %v", err))
+	}
+	if payload.TurnID == "" {
+		return e.ackFailure(ctx, cmd.ID, "stop_hmr missing turn_id")
+	}
+
+	removed := e.removeHmrByTurn(ctx, payload.TurnID)
+	if !removed {
+		// Fallback: force-remove by deterministic container name even if the
+		// label list missed it (e.g. a partially-created box). Best-effort.
+		containerName := "forge-hmr-" + payload.TurnID
+		if rmErr := e.docker.RemoveContainer(ctx, containerName); rmErr != nil {
+			e.logger.Info("stop_hmr: no live box found for turn (already gone)",
+				"turn_id", payload.TurnID)
+		}
+	}
+
+	return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
+		"turn_id": payload.TurnID,
+		"stopped": true,
+	})
+}
+
+// removeHmrByTurn force-removes the HMR box labeled forge.hmr_id==turnID and
+// releases its published host port. Returns true if a matching box was found
+// and removal was attempted. Port release is best-effort (the port may not be
+// reserved in this process after an agent restart — that error is ignored).
+func (e *CommandExecutor) removeHmrByTurn(ctx context.Context, turnID string) bool {
+	workers, err := e.docker.ListHmrWorkers(ctx)
+	if err != nil {
+		e.logger.Warn("stop_hmr: list hmr workers failed", "turn_id", turnID, "error", err)
+		return false
+	}
+	for _, w := range workers {
+		if w.HmrID != turnID {
+			continue
+		}
+		if rmErr := e.docker.RemoveContainer(ctx, w.ContainerID); rmErr != nil {
+			e.logger.Warn("stop_hmr: failed to remove hmr worker",
+				"turn_id", turnID, "container_id", w.ContainerID, "error", rmErr)
+		} else {
+			e.logger.Info("hmr worker stopped",
+				"turn_id", turnID, "container_id", w.ContainerID)
+		}
+		if w.HostPort > 0 {
+			if relErr := e.ports.Release(w.HostPort); relErr != nil {
+				// Expected after an agent restart (port not in this process's
+				// allocator) — informational only.
+				e.logger.Info("stop_hmr: host port not released (likely not reserved this process)",
+					"turn_id", turnID, "port", w.HostPort, "error", relErr)
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// ReapHmr is the backstop that bounds leaked per-turn HMR boxes (covers a
+// backend crash that never sent stop_hmr, a lost ack, or an agent restart). It
+// force-removes forge.hmr_id containers older than retention and releases their
+// ports. Mirrors ReapBuilds' worker sweep; HMR has no on-disk snapshot to GC
+// (it binds the live code dir, owned by the dev sandbox). Safe against in-flight
+// turns: retention sits well above a turn + grace window.
+func (e *CommandExecutor) ReapHmr(ctx context.Context, retention time.Duration) {
+	cutoff := time.Now().Add(-retention)
+
+	workers, err := e.docker.ListHmrWorkers(ctx)
+	if err != nil {
+		e.logger.Warn("hmr reaper: list hmr workers failed", "error", err)
+		return
+	}
+	for _, w := range workers {
+		if w.CreatedUnix > 0 && time.Unix(w.CreatedUnix, 0).After(cutoff) {
+			continue // still young — likely an active turn
+		}
+		rmCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if rmErr := e.docker.RemoveContainer(rmCtx, w.ContainerID); rmErr != nil {
+			e.logger.Warn("hmr reaper: failed to remove leaked box",
+				"turn_id", w.HmrID, "container_id", w.ContainerID, "error", rmErr)
+		} else {
+			e.logger.Info("hmr reaper: removed leaked box",
+				"turn_id", w.HmrID, "container_id", w.ContainerID)
+			if w.HostPort > 0 {
+				_ = e.ports.Release(w.HostPort)
+			}
+		}
+		cancel()
+	}
 }
 
 // executePrune is a placeholder for Docker container/image pruning.

@@ -31,6 +31,8 @@ type mockDockerClient struct {
 	execRunFn           func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
 	createBuildWorkerFn func(ctx context.Context, spec *docker.BuildWorkerSpec) (string, error)
 	listBuildWorkersFn  func(ctx context.Context) ([]docker.BuildWorkerInfo, error)
+	createHmrWorkerFn   func(ctx context.Context, spec *docker.HmrWorkerSpec) (string, error)
+	listHmrWorkersFn    func(ctx context.Context) ([]docker.HmrWorkerInfo, error)
 
 	// Track calls for assertions
 	createCalls  []docker.SandboxSpec
@@ -161,6 +163,20 @@ func (m *mockDockerClient) ListBuildWorkers(ctx context.Context) ([]docker.Build
 		return m.listBuildWorkersFn(ctx)
 	}
 	return []docker.BuildWorkerInfo{}, nil
+}
+
+func (m *mockDockerClient) CreateHmrWorker(ctx context.Context, spec *docker.HmrWorkerSpec) (string, error) {
+	if m.createHmrWorkerFn != nil {
+		return m.createHmrWorkerFn(ctx, spec)
+	}
+	return "hmr-worker-abc123", nil
+}
+
+func (m *mockDockerClient) ListHmrWorkers(ctx context.Context) ([]docker.HmrWorkerInfo, error) {
+	if m.listHmrWorkersFn != nil {
+		return m.listHmrWorkersFn(ctx)
+	}
+	return []docker.HmrWorkerInfo{}, nil
 }
 
 func (m *mockDockerClient) Close() error {

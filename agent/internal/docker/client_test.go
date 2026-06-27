@@ -49,6 +49,12 @@ func (m *mockClient) CreateBuildWorker(_ context.Context, _ *BuildWorkerSpec) (s
 func (m *mockClient) ListBuildWorkers(_ context.Context) ([]BuildWorkerInfo, error) {
 	return nil, nil
 }
+func (m *mockClient) CreateHmrWorker(_ context.Context, _ *HmrWorkerSpec) (string, error) {
+	return "", nil
+}
+func (m *mockClient) ListHmrWorkers(_ context.Context) ([]HmrWorkerInfo, error) {
+	return nil, nil
+}
 func (m *mockClient) Close() error { return nil }
 
 // TestMockClientSatisfiesInterface verifies that the mockClient implements Client.

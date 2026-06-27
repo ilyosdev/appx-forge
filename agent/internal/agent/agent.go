@@ -128,12 +128,25 @@ func (a *Agent) Run(ctx context.Context) error {
 	// allocator is in-memory only; before this, an agent restart could hand
 	// a kept container's port to a new sandbox (collision on docker start).
 	a.executor.AdoptBootSnapshot(initial)
+	// HMR boxes carry forge.hmr_id (not forge.app_name) so they are absent from
+	// the snapshot above; re-reserve their ports separately. Survivors of an
+	// agent restart still hold their host port in Docker — without this the
+	// allocator would believe it free and a later Allocate() would collide on
+	// docker start. No-op when ISOLATED_HMR is off (no HMR boxes exist).
+	a.executor.AdoptHmrPorts(ctx)
 
 	// Build-export cleanup: on startup, force-remove every leaked build worker
 	// + snapshot (the in-memory buildDirs resolver did not survive the restart,
 	// so no in-flight build can be completed anyway). Then run a periodic reaper
 	// as the steady-state backstop bounding disk + leaked cgroups.
 	a.executor.ReapBuilds(ctx, 0)
+	// HMR boxes are reaped on a retention window only (NOT nuked at boot like
+	// build workers): unlike a build worker — useless after a restart loses its
+	// buildDirs map — an HMR box still serves the live preview after an agent
+	// restart (it binds the live code dir + runs Metro independently), so we
+	// must not kill a still-active turn's box on boot. The retention sweep below
+	// + the backend's stop_hmr handle the steady state.
+	a.executor.ReapHmr(ctx, hmrReapRetention)
 	go a.buildReaperLoop(ctx)
 
 	// Step 1: Register with control plane (retries internally)
@@ -282,10 +295,16 @@ func (a *Agent) pollLoop(ctx context.Context) {
 const (
 	buildReapInterval  = 5 * time.Minute
 	buildReapRetention = 15 * time.Minute
+	// hmrReapRetention bounds a leaked per-turn HMR box's lifetime (the
+	// crash/lost-ack/missed-stop_hmr backstop). Set well above a turn + grace
+	// window so the reaper never races an active turn; the backend's stop_hmr is
+	// the primary teardown, this is defense in depth. Swept on the shared build
+	// reaper tick.
+	hmrReapRetention = 30 * time.Minute
 )
 
 // buildReaperLoop periodically reaps stale build snapshots + leaked build-worker
-// containers. Stops when ctx is cancelled.
+// containers, plus leaked per-turn HMR boxes. Stops when ctx is cancelled.
 func (a *Agent) buildReaperLoop(ctx context.Context) {
 	ticker := time.NewTicker(buildReapInterval)
 	defer ticker.Stop()
@@ -295,6 +314,7 @@ func (a *Agent) buildReaperLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			a.executor.ReapBuilds(ctx, buildReapRetention)
+			a.executor.ReapHmr(ctx, hmrReapRetention)
 		}
 	}
 }

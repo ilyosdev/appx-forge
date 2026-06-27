@@ -77,6 +77,18 @@ func (m *mockLifecycle) DispatchBuildExport(ctx context.Context, sandboxID uuid.
 	return "", nil
 }
 
+// DispatchStartHmr satisfies the SandboxLifecycle interface (added with the
+// per-turn ephemeral HMR endpoint). Stub returns empty cmd ID.
+func (m *mockLifecycle) DispatchStartHmr(ctx context.Context, sandboxID uuid.UUID, req lifecycle.StartHmrRequest) (string, error) {
+	return "", nil
+}
+
+// DispatchStopHmr satisfies the SandboxLifecycle interface (added with the
+// per-turn ephemeral HMR endpoint). Stub returns empty cmd ID.
+func (m *mockLifecycle) DispatchStopHmr(ctx context.Context, sandboxID uuid.UUID, req lifecycle.StopHmrRequest) (string, error) {
+	return "", nil
+}
+
 // ── Mock Sandbox Reader ─────────────────────────────────────────────
 
 type mockSandboxReader struct {

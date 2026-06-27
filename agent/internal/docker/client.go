@@ -92,6 +92,23 @@ type Client interface {
 	// — the orphan reconciler never sees them (no app_name label).
 	ListBuildWorkers(ctx context.Context) ([]BuildWorkerInfo, error)
 
+	// CreateHmrWorker creates and starts a PER-TURN EPHEMERAL HMR container —
+	// a dev Metro (`expo start`) bound to the project's LIVE code dir. It is
+	// CreateBuildWorker "inverted": it KEEPS the image's default
+	// entrypoint/CMD (so `expo start --port 8081` actually runs), exposes +
+	// binds port 8081 to a host port, binds the LIVE code dir (not a
+	// snapshot), and is labeled with `forge.hmr_id` (NOT `forge.app_name`) so
+	// it stays invisible to the heartbeat snapshot and the orphan reconciler.
+	// Same security hardening as CreateContainer. Returns the container ID.
+	CreateHmrWorker(ctx context.Context, spec *HmrWorkerSpec) (string, error)
+
+	// ListHmrWorkers returns every per-turn ephemeral HMR container (labeled
+	// `forge.hmr_id`) visible to the daemon. Deliberately absent from
+	// ListContainers (which keys on `forge.app_name`), so the heartbeat
+	// reconciler never reaps them; the agent's HMR reaper uses this method to
+	// force-remove boxes leaked by a crash/restart or a missed stop_hmr.
+	ListHmrWorkers(ctx context.Context) ([]HmrWorkerInfo, error)
+
 	// Close releases the underlying Docker client resources.
 	Close() error
 }
@@ -187,6 +204,55 @@ type BuildWorkerInfo struct {
 	ContainerID string
 	BuildID     string
 	CreatedUnix int64 // container creation time (Unix seconds); 0 if unknown
+}
+
+// HmrWorkerSpec defines the parameters for a per-turn ephemeral HMR container.
+// It mirrors the security-relevant subset of SandboxSpec but, unlike
+// BuildWorkerSpec, KEEPS the image's dev Metro (no entrypoint/CMD override) and
+// binds a host port + the LIVE code dir (HMR must show uncommitted edits).
+type HmrWorkerSpec struct {
+	// TurnID names the container `forge-hmr-<TurnID>` and is stamped as the
+	// `forge.hmr_id` label. Distinct from the forge-<app> namespace so the
+	// idempotent pre-clean can never target a live dev sandbox, and so the
+	// heartbeat snapshot (keyed on forge.app_name) never reports it.
+	TurnID string
+
+	// Image is the Docker image — MUST be the dev sandbox's exact image
+	// (resolved by the caller), never the agent default.
+	Image string
+
+	// CodePath is the host path of the project's LIVE code dir, bind-mounted
+	// read-write at /app/code. Binding the live dir (NOT a snapshot) is what
+	// lets in-turn uncommitted edits reach Metro HMR.
+	CodePath string
+
+	// HostPort is the host port the container's internal 8081 is bound to,
+	// allocated by the caller via the port allocator.
+	HostPort int
+
+	// MemoryMB / CPUCores are the worker's own cgroup limits (its own
+	// 2GiB/2cpu, never shared with the dev sandbox).
+	MemoryMB int64
+	CPUCores float64
+
+	// Env is passed through to the container at create time (the box runs the
+	// image CMD directly — there is no exec to carry env later). The backend
+	// owns HMR env semantics (e.g. APP_NAME / EXPO_PACKAGER_PROXY_URL).
+	Env map[string]string
+
+	// SeccompPath is the seccomp profile path — passed through identically to
+	// CreateContainer to keep hardening parity (see hardenedSecurityOpt).
+	SeccompPath string
+}
+
+// HmrWorkerInfo is a minimal view of an HMR container used by the HMR reaper
+// and the stop_hmr handler to locate what to force-remove + which port to
+// release.
+type HmrWorkerInfo struct {
+	ContainerID string
+	HmrID       string // the forge.hmr_id label value (the turn ID)
+	HostPort    int    // published host port (0 if none/unknown)
+	CreatedUnix int64  // container creation time (Unix seconds); 0 if unknown
 }
 
 // ContainerEvent represents a Docker container lifecycle event.
@@ -623,6 +689,40 @@ func (d *dockerClient) ListBuildWorkers(ctx context.Context) ([]BuildWorkerInfo,
 		workers = append(workers, BuildWorkerInfo{
 			ContainerID: item.ID,
 			BuildID:     buildID,
+			CreatedUnix: item.Created,
+		})
+	}
+	return workers, nil
+}
+
+// ListHmrWorkers returns every per-turn ephemeral HMR container (labeled
+// `forge.hmr_id`). Like ListBuildWorkers, these are deliberately absent from
+// ListContainers (which keys on `forge.app_name`), so the heartbeat reconciler
+// never reaps them; the HMR reaper + stop_hmr handler use this method to locate
+// boxes by turn ID and recover their published host port for release.
+func (d *dockerClient) ListHmrWorkers(ctx context.Context) ([]HmrWorkerInfo, error) {
+	result, err := d.raw().ContainerList(ctx, dockerclient.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("docker: list hmr workers: %w", err)
+	}
+
+	workers := make([]HmrWorkerInfo, 0)
+	for _, item := range result.Items {
+		hmrID := item.Labels[hmrIDLabel]
+		if hmrID == "" {
+			continue // not an HMR worker
+		}
+		hostPort := 0
+		for _, p := range item.Ports {
+			if p.PublicPort != 0 {
+				hostPort = int(p.PublicPort)
+				break
+			}
+		}
+		workers = append(workers, HmrWorkerInfo{
+			ContainerID: item.ID,
+			HmrID:       hmrID,
+			HostPort:    hostPort,
 			CreatedUnix: item.Created,
 		})
 	}
