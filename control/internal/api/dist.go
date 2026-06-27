@@ -3,6 +3,7 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -50,6 +51,14 @@ func (s *Server) handleDistFetch(w http.ResponseWriter, r *http.Request) {
 	sandboxUUID := uuid.UUID(pgID.Bytes)
 	agentURL := fmt.Sprintf("http://%s:%d/v1/sandboxes/%s/dist",
 		node.TailscaleIp.String(), node.AgentListenPort, sandboxUUID.String())
+
+	// Build-scoped fetch: forward ?build=<id> so the agent streams the build
+	// snapshot's dist/ instead of the live sandbox's. The param MUST be part of
+	// the signed URL (HMAC covers the full query string) — appended before
+	// SignURL so the agent's VerifyURL over the same RequestURI matches.
+	if buildID := r.URL.Query().Get("build"); buildID != "" {
+		agentURL = fmt.Sprintf("%s?build=%s", agentURL, url.QueryEscape(buildID))
+	}
 
 	// 120s TTL (vs file-push 60s): VerifyURL checks expiry only at request
 	// start, but the backend follows this redirect and then reads a multi-MB

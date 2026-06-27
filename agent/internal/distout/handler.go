@@ -73,9 +73,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	codeDir, err := h.resolver.CodeDir(sandboxID)
+	// Build-scoped fetch: ?build=<id> resolves the build's SNAPSHOT code dir
+	// (CodeDir(buildID) -> .../builds/<id>/code) instead of the live sandbox's,
+	// so the isolated cold export's dist/ is streamed and the live sandbox's
+	// dist/ is never produced or touched. The build param is part of the
+	// HMAC-signed string (it is in r.RequestURI), so VerifyURL above already
+	// covered it. Falls back to the sandbox ID when absent.
+	resolveID := sandboxID
+	if buildID := r.URL.Query().Get("build"); buildID != "" {
+		resolveID = buildID
+	}
+
+	codeDir, err := h.resolver.CodeDir(resolveID)
 	if err != nil {
-		h.logger.Info("dist-out sandbox not found", "sandbox_id", sandboxID, "error", err)
+		h.logger.Info("dist-out target not found", "resolve_id", resolveID, "error", err)
 		http.Error(w, "sandbox not found on this node", http.StatusNotFound)
 		return
 	}

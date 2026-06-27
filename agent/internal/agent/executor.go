@@ -52,6 +52,16 @@ type CommandExecutor struct {
 	// short timer per sandbox; only the last push in a burst actually restarts.
 	restartTimers map[string]*time.Timer
 	restartMu     sync.Mutex
+
+	// buildDirs maps a build ID to its on-disk snapshot CODE directory
+	// (.../builds/<buildID>/code) for the isolated cold export. The dist-out
+	// handler resolves CodeDir(buildID) through this map so the build-scoped
+	// dist fetch streams the snapshot's dist/ rather than the live sandbox's.
+	// Process-local: an agent restart loses it (the dist fetch then 404s,
+	// which the backend treats as a failed/superseded build) and the build
+	// reaper sweeps the leaked snapshot dir + worker container.
+	buildDirs map[string]string
+	buildMu   sync.RWMutex
 }
 
 // restartDebounce is how long a sandbox must go without a new structural push
@@ -76,6 +86,7 @@ func NewCommandExecutor(
 		logger:        logger,
 		sandboxes:     make(map[string]*sandboxInfo),
 		restartTimers: make(map[string]*time.Timer),
+		buildDirs:     make(map[string]string),
 	}
 }
 
@@ -141,6 +152,24 @@ type execPayload struct {
 	User string `json:"user,omitempty"`
 }
 
+// buildExportPayload is the payload for build_export commands. It mirrors
+// execPayload (the export semantics — coldCommand + APPX_BASE_URL env — stay in
+// the backend as the single source of truth) and adds an optional Image: the
+// dev sandbox's EXACT image, so the worker is never built from the agent's
+// stale default. When Image is empty the agent falls back to inspecting the
+// live dev container's image.
+type buildExportPayload struct {
+	Command        string            `json:"command"`
+	Cwd            string            `json:"cwd"`
+	Env            map[string]string `json:"env,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds"`
+	CPUBurst       bool              `json:"cpu_burst,omitempty"`
+	User           string            `json:"user,omitempty"`
+	// Image is the dev sandbox's image (e.g. appx/sandbox:v19). Optional —
+	// the agent inspects the live dev container when empty.
+	Image string `json:"image,omitempty"`
+}
+
 // ── Execute ─────────────────────────────────────────────────────────────
 
 // Execute dispatches a command to the appropriate handler based on type.
@@ -169,6 +198,8 @@ func (e *CommandExecutor) Execute(ctx context.Context, cmd controlclient.Command
 		return e.executeGetLogs(ctx, cmd)
 	case "exec":
 		return e.executeExec(ctx, cmd)
+	case "build_export":
+		return e.executeBuildExport(ctx, cmd)
 	case "prune":
 		return e.executePrune(ctx, cmd)
 	default:
@@ -525,6 +556,291 @@ func (e *CommandExecutor) executeExec(ctx context.Context, cmd controlclient.Com
 	})
 }
 
+// ── Build Export (isolated cold web export) ──────────────────────────────
+
+// buildWorkerMemoryMB / buildWorkerCPUCores are the build worker's own cgroup
+// (proven sufficient: an export-alone v19 box peaks ~303MiB; 2GiB is ample).
+// CPUBurst on the export exec lifts CPU to 4 cores for the export's duration.
+const (
+	buildWorkerMemoryMB int64   = 2048
+	buildWorkerCPUCores float64 = 2.0
+)
+
+// executeBuildExport runs a cold `expo export` in a SEPARATE ephemeral
+// build-worker container against a SNAPSHOT of the project code, so the
+// exporter never shares a cgroup with the running dev Metro (the dual-Metro
+// OOM fix). Flow: resolve dev sandbox -> resolve image -> snapshot code ->
+// create worker -> ExecRun export -> ack with build_id; the backend then
+// fetches the snapshot's dist/ via the build-scoped dist endpoint.
+//
+// Cleanup is defer-guaranteed on every exit path: the worker container is
+// ALWAYS force-removed; the snapshot dir is removed on any failure and RETAINED
+// on success (it holds dist/ for the fetch) where the build reaper is the
+// backstop that bounds disk if the backend never fetches.
+func (e *CommandExecutor) executeBuildExport(ctx context.Context, cmd controlclient.Command) error {
+	var payload buildExportPayload
+	if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("invalid build_export payload: %v", err))
+	}
+	if payload.Command == "" {
+		return e.ackFailure(ctx, cmd.ID, "empty command")
+	}
+	if payload.Cwd == "" {
+		// Match the exec default so the SAME coldCommand string behaves
+		// identically to the in-container path.
+		payload.Cwd = "/app"
+	}
+	if payload.TimeoutSeconds <= 0 {
+		payload.TimeoutSeconds = 120
+	}
+	if payload.TimeoutSeconds > 300 {
+		payload.TimeoutSeconds = 300
+	}
+
+	// Resolve the dev sandbox so we can locate its code dir and (if needed)
+	// its image. The worker runs on the SAME node — the command was dispatched
+	// to the dev sandbox's node.
+	info, ok := e.resolveSandbox(cmd.SandboxID)
+	if !ok {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("sandbox %s not running on this node", cmd.SandboxID))
+	}
+
+	// Resolve the image: prefer the payload (dev sandbox's exact image), fall
+	// back to inspecting the live dev container. NEVER the agent default.
+	image := payload.Image
+	if image == "" {
+		if dev, ierr := e.docker.InspectContainer(ctx, info.ContainerID); ierr == nil && dev.Image != "" {
+			image = dev.Image
+		}
+	}
+	if image == "" {
+		return e.ackFailure(ctx, cmd.ID, "could not resolve dev sandbox image for build worker")
+	}
+
+	buildID := cmd.ID // reuse the command ID as the build ID (deterministic)
+	srcCodeDir := fmt.Sprintf("%s/%s/code", e.sandboxDir, info.AppName)
+
+	// Snapshot the live code dir into an isolated builds tree (outside the
+	// per-app sandbox tree so a dev-sandbox destroy/GC can't wipe it).
+	snapshotCode, err := docker.SnapshotCodeDir(ctx, e.buildsDir(), buildID, srcCodeDir)
+	if err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("snapshot code dir failed: %v", err))
+	}
+
+	// success gates snapshot retention: on any error path below the deferred
+	// cleanup removes the snapshot; only a clean export keeps it for the fetch.
+	success := false
+	defer func() {
+		if !success {
+			e.unregisterBuild(buildID)
+			if rmErr := os.RemoveAll(filepath.Join(e.buildsDir(), buildID)); rmErr != nil {
+				e.logger.Warn("build export: failed to remove snapshot after failure",
+					"build_id", buildID, "error", rmErr)
+			}
+		}
+	}()
+
+	// Create the ephemeral worker (no dev Metro, own cgroup, snapshot bind).
+	workerID, err := e.docker.CreateBuildWorker(ctx, &docker.BuildWorkerSpec{
+		BuildID:  buildID,
+		Image:    image,
+		CodePath: snapshotCode,
+		MemoryMB: buildWorkerMemoryMB,
+		CPUCores: buildWorkerCPUCores,
+		// SeccompPath intentionally matches the live sandbox path (empty
+		// today) — build workers must not diverge from sandbox hardening.
+	})
+	if err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("create build worker failed: %v", err))
+	}
+	// ALWAYS tear the worker down (force remove also clears its CPU-cap entry).
+	defer func() {
+		rmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if rmErr := e.docker.RemoveContainer(rmCtx, workerID); rmErr != nil {
+			e.logger.Warn("build export: failed to remove build worker",
+				"build_id", buildID, "container_id", workerID, "error", rmErr)
+		}
+	}()
+
+	// Register the snapshot so the dist-out handler can resolve CodeDir(buildID)
+	// -> snapshot code dir for the build-scoped fetch.
+	e.registerBuild(buildID, snapshotCode)
+
+	// Run the export inside the worker — the proven export-alone path.
+	cmdArgs := []string{"sh", "-c", payload.Command}
+	envSlice := make([]string, 0, len(payload.Env))
+	for k, v := range payload.Env {
+		envSlice = append(envSlice, k+"="+v)
+	}
+
+	result, err := e.docker.ExecRun(ctx, workerID, docker.ExecSpec{
+		Cmd:            cmdArgs,
+		Env:            envSlice,
+		WorkingDir:     payload.Cwd,
+		TimeoutSeconds: payload.TimeoutSeconds,
+		CPUBurst:       payload.CPUBurst,
+		User:           payload.User,
+	})
+	if err != nil {
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf("build export exec error: %v", err))
+	}
+
+	// Measure the produced artifact. For build_export, success MUST mean
+	// "artifact produced" — not merely "the exporter process returned". ExecRun
+	// returns err==nil for a timed-out export (ExitCode=-1) and for a non-zero /
+	// OOM-killed export (ExitCode=137, etc.), so neither the err==nil check above
+	// nor a plain ackSuccess is sufficient. A dist-size read failure (missing
+	// dist/) is therefore treated as a zero-byte artifact, i.e. a failed export.
+	var distBytes int64
+	if size, derr := dirSize(filepath.Join(snapshotCode, "dist")); derr == nil {
+		distBytes = size
+	}
+
+	// Only a clean exit (0) that actually wrote a non-empty dist/ counts as a
+	// successful build. Anything else acks failure with the exit code so the
+	// deferred cleanup drops the useless/partial snapshot and the backend gets
+	// an unambiguous failure rather than fetching an empty/partial tar.
+	if result.ExitCode != 0 || distBytes == 0 {
+		var reason string
+		switch {
+		case result.ExitCode == -1:
+			reason = fmt.Sprintf("export timed out after %ds", payload.TimeoutSeconds)
+		case result.ExitCode == 137:
+			reason = "export OOM-killed (exit 137)"
+		case result.ExitCode != 0:
+			reason = fmt.Sprintf("export exited non-zero (exit %d)", result.ExitCode)
+		default:
+			reason = "export produced empty dist/ (0 bytes)"
+		}
+		e.logger.Warn("build export failed",
+			"build_id", buildID, "sandbox_id", cmd.SandboxID,
+			"exit_code", result.ExitCode, "duration_ms", result.DurationMs,
+			"dist_bytes", distBytes, "reason", reason,
+		)
+		return e.ackFailure(ctx, cmd.ID, fmt.Sprintf(
+			"build export failed: %s (exit_code=%d, dist_bytes=%d)",
+			reason, result.ExitCode, distBytes,
+		))
+	}
+
+	// Retain the snapshot for the dist fetch; the build reaper bounds disk.
+	success = true
+
+	e.logger.Info("build export complete",
+		"build_id", buildID, "sandbox_id", cmd.SandboxID,
+		"exit_code", result.ExitCode, "duration_ms", result.DurationMs,
+		"dist_bytes", distBytes,
+	)
+
+	return e.ackSuccess(ctx, cmd.ID, map[string]interface{}{
+		"exit_code":   result.ExitCode,
+		"stdout":      string(result.Stdout),
+		"stderr":      string(result.Stderr),
+		"duration_ms": result.DurationMs,
+		"build_id":    buildID,
+		"dist_bytes":  distBytes,
+	})
+}
+
+// buildsDir is the isolated root for build snapshots, a SIBLING of the sandbox
+// tree (e.g. sandboxDir=/var/lib/forge/sandboxes -> /var/lib/forge/builds).
+// Kept outside the per-app tree so a dev-sandbox destroy / idle-reap / workdir
+// GC can never delete an in-flight build's snapshot.
+func (e *CommandExecutor) buildsDir() string {
+	return filepath.Join(filepath.Dir(e.sandboxDir), "builds")
+}
+
+// registerBuild records a build ID -> snapshot code dir mapping.
+func (e *CommandExecutor) registerBuild(buildID, codeDir string) {
+	e.buildMu.Lock()
+	e.buildDirs[buildID] = codeDir
+	e.buildMu.Unlock()
+}
+
+// unregisterBuild drops a build ID from the resolver map.
+func (e *CommandExecutor) unregisterBuild(buildID string) {
+	e.buildMu.Lock()
+	delete(e.buildDirs, buildID)
+	e.buildMu.Unlock()
+}
+
+// ReapBuilds is the backstop that bounds build-snapshot disk + leaked worker
+// containers (covers an agent crash/restart mid-build, or a backend that never
+// fetched the dist). It force-removes build-worker containers older than
+// retention and removes snapshot dirs older than retention. Safe against
+// in-flight builds: a cold export + fetch completes in well under retention.
+func (e *CommandExecutor) ReapBuilds(ctx context.Context, retention time.Duration) {
+	cutoff := time.Now().Add(-retention)
+
+	// 1. Leaked worker containers (invisible to the heartbeat reconciler).
+	workers, err := e.docker.ListBuildWorkers(ctx)
+	if err != nil {
+		e.logger.Warn("build reaper: list build workers failed", "error", err)
+	} else {
+		for _, wkr := range workers {
+			if wkr.CreatedUnix > 0 && time.Unix(wkr.CreatedUnix, 0).After(cutoff) {
+				continue // still young — likely in-flight
+			}
+			rmCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			if rmErr := e.docker.RemoveContainer(rmCtx, wkr.ContainerID); rmErr != nil {
+				e.logger.Warn("build reaper: failed to remove leaked worker",
+					"build_id", wkr.BuildID, "container_id", wkr.ContainerID, "error", rmErr)
+			} else {
+				e.logger.Info("build reaper: removed leaked worker",
+					"build_id", wkr.BuildID, "container_id", wkr.ContainerID)
+			}
+			cancel()
+		}
+	}
+
+	// 2. Leaked snapshot dirs.
+	dir := e.buildsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			e.logger.Warn("build reaper: read builds dir failed", "dir", dir, "error", err)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		fi, ierr := entry.Info()
+		if ierr != nil {
+			continue
+		}
+		if fi.ModTime().After(cutoff) {
+			continue // young — likely in-flight or awaiting fetch
+		}
+		buildID := entry.Name()
+		e.unregisterBuild(buildID)
+		path := filepath.Join(dir, buildID)
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			e.logger.Warn("build reaper: failed to remove snapshot", "path", path, "error", rmErr)
+		} else {
+			e.logger.Info("build reaper: removed stale snapshot", "build_id", buildID)
+		}
+	}
+}
+
+// dirSize returns the cumulative size of regular files under root. Symlinks are
+// not followed (Walk uses Lstat). Used as a best-effort dist artifact gauge.
+func dirSize(root string) (int64, error) {
+	var total int64
+	err := filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
+}
+
 // executePrune is a placeholder for Docker container/image pruning.
 func (e *CommandExecutor) executePrune(ctx context.Context, cmd controlclient.Command) error {
 	e.logger.Info("prune command received (v1: no-op)")
@@ -553,12 +869,26 @@ func (e *CommandExecutor) ackFailure(ctx context.Context, cmdID string, errMsg s
 
 // ── Sandbox Lookup ──────────────────────────────────────────────────────
 
-// CodeDir returns the code directory path for a sandbox.
-// This implements the filepush.SandboxResolver interface.
-func (e *CommandExecutor) CodeDir(sandboxID string) (string, error) {
-	info, ok := e.resolveSandbox(sandboxID)
+// CodeDir returns the code directory path for a sandbox OR a build snapshot.
+// This implements the filepush.SandboxResolver / distout.codeDirResolver
+// interfaces.
+//
+// Build-scoped resolution comes first: when id matches a registered build (the
+// dist-out handler passes ?build=<id>), it returns that build's snapshot CODE
+// dir (.../builds/<id>/code) so the build-scoped dist fetch streams the
+// snapshot's dist/, never the live sandbox's. Otherwise id is treated as a
+// sandbox ID and resolved to <sandboxDir>/<app>/code.
+func (e *CommandExecutor) CodeDir(id string) (string, error) {
+	e.buildMu.RLock()
+	dir, isBuild := e.buildDirs[id]
+	e.buildMu.RUnlock()
+	if isBuild {
+		return dir, nil
+	}
+
+	info, ok := e.resolveSandbox(id)
 	if !ok {
-		return "", fmt.Errorf("sandbox %s not found on this node", sandboxID)
+		return "", fmt.Errorf("sandbox %s not found on this node", id)
 	}
 
 	return fmt.Sprintf("%s/%s/code", e.sandboxDir, info.AppName), nil

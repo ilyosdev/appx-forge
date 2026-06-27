@@ -71,6 +71,12 @@ func (m *mockLifecycle) DispatchExec(ctx context.Context, sandboxID uuid.UUID, r
 	return "", nil
 }
 
+// DispatchBuildExport satisfies the SandboxLifecycle interface (added with the
+// isolated build-export endpoint). Stub returns empty cmd ID.
+func (m *mockLifecycle) DispatchBuildExport(ctx context.Context, sandboxID uuid.UUID, req lifecycle.BuildExportRequest) (string, error) {
+	return "", nil
+}
+
 // ── Mock Sandbox Reader ─────────────────────────────────────────────
 
 type mockSandboxReader struct {

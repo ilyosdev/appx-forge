@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +15,14 @@ import (
 	"github.com/moby/moby/api/types/network"
 	dockerclient "github.com/moby/moby/client"
 )
+
+// buildIDLabel is the Docker label stamped on ephemeral build-worker
+// containers (instead of forge.app_name). Keeping build workers out of the
+// forge.app_name namespace is load-bearing: ListContainers (and therefore the
+// heartbeat snapshot + orphan reconciler) keys exclusively on forge.app_name,
+// so a forge.build_id-labeled container is invisible to drift detection and is
+// never reaped mid-export.
+const buildIDLabel = "forge.build_id"
 
 // ── CPU Burst Cap Tracking ───────────────────────────────────────────────
 
@@ -125,17 +134,10 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 			// (see phase 19-B3-SPEC.md, section B3-4).
 			"/mnt/metro-cache:/mnt/metro-cache",
 		},
-		Resources: container.Resources{
-			Memory:   spec.MemoryMB * 1024 * 1024,
-			NanoCPUs: int64(spec.CPUCores * 1e9),
-			PidsLimit: int64Ptr(256),
-		},
-		SecurityOpt: []string{
-			"seccomp=" + spec.SeccompPath,
-			"no-new-privileges:true",
-		},
-		CapDrop:        []string{"ALL"},
-		CapAdd:         []string{"CHOWN", "SETUID", "SETGID"},
+		Resources:      hardenedResources(spec.MemoryMB, spec.CPUCores),
+		SecurityOpt:    hardenedSecurityOpt(spec.SeccompPath),
+		CapDrop:        hardenedCapDrop(),
+		CapAdd:         hardenedCapAdd(),
 		ReadonlyRootfs: false, // Metro writes cache; use tmpfs for /tmp instead
 	}
 
@@ -167,6 +169,182 @@ func (d *dockerClient) CreateContainer(ctx context.Context, spec *SandboxSpec) (
 	storeOriginalCPUCap(result.ID, int64(spec.CPUCores*1e9))
 
 	return result.ID, nil
+}
+
+// ── Shared Security Hardening ────────────────────────────────────────────
+//
+// Extracted so CreateContainer (live dev sandboxes) and CreateBuildWorker
+// (ephemeral export workers) apply BYTE-IDENTICAL hardening from one source.
+// Each returns a fresh value so callers never alias a shared mutable slice.
+//
+// NOTE on seccomp: the profile is whatever spec.SeccompPath carries today
+// (historically empty). This hardening is reused verbatim for build workers —
+// it deliberately does NOT change seccomp behavior. Any seccomp profile change
+// is a separate, independently-verified change so deploying the build-worker
+// feature can never alter live sandbox creation.
+
+func hardenedResources(memoryMB int64, cpuCores float64) container.Resources {
+	return container.Resources{
+		Memory:    memoryMB * 1024 * 1024,
+		NanoCPUs:  int64(cpuCores * 1e9),
+		PidsLimit: int64Ptr(256),
+	}
+}
+
+func hardenedSecurityOpt(seccompPath string) []string {
+	return []string{
+		"seccomp=" + seccompPath,
+		"no-new-privileges:true",
+	}
+}
+
+func hardenedCapDrop() []string { return []string{"ALL"} }
+
+func hardenedCapAdd() []string { return []string{"CHOWN", "SETUID", "SETGID"} }
+
+// ── Build Worker Lifecycle (isolated cold export) ────────────────────────
+
+// CreateBuildWorker creates and starts an ephemeral build-worker container for
+// an isolated cold web export. It is the structural fix for the dual-Metro OOM:
+// the worker has NO dev Metro (PID1 is `sleep infinity`), its own 2GiB/2cpu
+// cgroup, and mounts only a SNAPSHOT of the project code — so the exporter
+// never shares a cgroup with the running dev sandbox and never touches the live
+// /app/code.
+//
+// Divergences from CreateContainer (all load-bearing):
+//   - ENTRYPOINT is overridden to `tini --` (no entrypoint.sh): the image's
+//     seed logic re-clobbers app.json/package.json/etc over the bind mount on
+//     boot, which would replace the snapshot's PROJECT app.json with the bare
+//     template before the export's baseUrl patch runs. Bypassing it keeps the
+//     worker export byte-equivalent to the in-container export.
+//   - CMD is `sleep infinity`: the agent execs the export afterwards.
+//   - Labeled forge.build_id (NOT forge.app_name / forge.sandbox_id), so the
+//     container is invisible to ListContainers / the heartbeat reconciler and
+//     is never reaped mid-export.
+//   - No ExposedPorts / PortBindings: zero inbound surface.
+//   - Container name forge-build-<BuildID>: a namespace distinct from
+//     forge-<app>, so the idempotent pre-clean below can never remove a live
+//     dev container.
+//
+// Same hardening as CreateContainer (CapDrop/CapAdd/seccomp/no-new-privileges/
+// PidsLimit) via the shared helpers. storeOriginalCPUCap is recorded so an
+// ExecRun CPUBurst can raise+restore the cap exactly like the dev path.
+func (d *dockerClient) CreateBuildWorker(ctx context.Context, spec *BuildWorkerSpec) (string, error) {
+	if spec == nil {
+		return "", fmt.Errorf("docker: build worker spec is nil")
+	}
+	if spec.BuildID == "" {
+		return "", fmt.Errorf("docker: build worker spec missing build ID")
+	}
+	if spec.Image == "" {
+		return "", fmt.Errorf("docker: build worker spec missing image")
+	}
+	if spec.CodePath == "" {
+		return "", fmt.Errorf("docker: build worker spec missing code path")
+	}
+
+	cfg := &container.Config{
+		Image:      spec.Image,
+		Entrypoint: []string{"/usr/bin/tini", "--"},
+		Cmd:        []string{"sleep", "infinity"},
+		Labels: map[string]string{
+			buildIDLabel: spec.BuildID,
+		},
+		// No ExposedPorts — the worker serves nothing.
+	}
+
+	hostCfg := &container.HostConfig{
+		// No PortBindings — zero inbound surface.
+		Binds: []string{
+			spec.CodePath + ":/app/code",
+			// Shared Metro transform cache (cross-tenant, same trust as dev
+			// sandboxes) — keeps the cold export fast.
+			"/mnt/metro-cache:/mnt/metro-cache",
+		},
+		Resources:      hardenedResources(spec.MemoryMB, spec.CPUCores),
+		SecurityOpt:    hardenedSecurityOpt(spec.SeccompPath),
+		CapDrop:        hardenedCapDrop(),
+		CapAdd:         hardenedCapAdd(),
+		ReadonlyRootfs: false, // export writes to the RW snapshot bind
+	}
+
+	containerName := "forge-build-" + spec.BuildID
+
+	// Idempotent: remove any leftover worker of the same name. Safe — the
+	// forge-build- prefix can never collide with a live forge-<app> sandbox.
+	_, _ = d.raw().ContainerRemove(ctx, containerName, dockerclient.ContainerRemoveOptions{Force: true})
+
+	result, err := d.raw().ContainerCreate(ctx, dockerclient.ContainerCreateOptions{
+		Config:     cfg,
+		HostConfig: hostCfg,
+		Name:       containerName,
+	})
+	if err != nil {
+		return "", fmt.Errorf("docker: create build worker %s: %w", containerName, err)
+	}
+
+	if _, err := d.raw().ContainerStart(ctx, result.ID, dockerclient.ContainerStartOptions{}); err != nil {
+		return "", fmt.Errorf("docker: start build worker %s: %w", containerName, err)
+	}
+
+	// Track the original CPU cap so an ExecRun CPUBurst can restore it.
+	storeOriginalCPUCap(result.ID, int64(spec.CPUCores*1e9))
+
+	return result.ID, nil
+}
+
+// SnapshotCodeDir copies a project's live code directory to an isolated build
+// snapshot under buildsDir, returning the snapshot's code path (.../code).
+//
+// Snapshot rules (each one a correctness landmine):
+//   - Plain `cp -a` (archive mode): preserves the node_modules SYMLINK as a
+//     symlink (the v19 worker resolves /opt/expo-shared-deps internally; a
+//     dangling host symlink is fine). MUST NOT use `cp -aL`/`-L` (would
+//     dereference node_modules and copy GBs) or `cp -al` (hardlinks — a
+//     hardlinked app.json would mutate the LIVE dir when the export patches it,
+//     violating the snapshot invariant). app.json must be a real copy.
+//   - Destination lives OUTSIDE the per-app sandbox tree (buildsDir, e.g.
+//     /var/lib/forge/builds/<buildID>/code), so a dev-sandbox destroy /
+//     idle-reap / workdir GC can never wipe an in-flight build.
+//   - `cp -a SRC DEST` where DEST does not yet exist creates DEST as a copy of
+//     SRC. The parent (buildsDir/<buildID>) is created+chowned first; DEST
+//     itself must NOT pre-exist or cp would nest the copy inside it.
+func SnapshotCodeDir(ctx context.Context, buildsDir, buildID, srcCodeDir string) (string, error) {
+	if buildID == "" {
+		return "", fmt.Errorf("docker: snapshot missing build ID")
+	}
+	if strings.Contains(buildID, "..") || strings.ContainsAny(buildID, "/\\") {
+		return "", fmt.Errorf("docker: invalid build ID %q", buildID)
+	}
+
+	parent := filepath.Join(buildsDir, buildID)
+	destCode := filepath.Join(parent, "code")
+
+	// Fresh start: remove any stale snapshot for this build ID.
+	if err := os.RemoveAll(parent); err != nil {
+		return "", fmt.Errorf("docker: clear stale snapshot %s: %w", parent, err)
+	}
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return "", fmt.Errorf("docker: create snapshot parent %s: %w", parent, err)
+	}
+	// Parent owned by the sandbox user so cp -a (run as root) writing a copy
+	// that preserves source ownership (already appuser) sits under an
+	// appuser-owned tree, matching the dev bind-mount layout.
+	if err := chownFunc(parent, sandboxUserUID, sandboxUserGID); err != nil {
+		return "", fmt.Errorf("docker: chown snapshot parent %s: %w", parent, err)
+	}
+
+	// Plain archive copy. cp -a == -dR --preserve=all: recursive, preserves
+	// symlinks (node_modules) WITHOUT dereferencing, preserves ownership/mode.
+	cmd := exec.CommandContext(ctx, "cp", "-a", srcCodeDir, destCode)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// Best-effort cleanup of a partial copy on failure.
+		_ = os.RemoveAll(parent)
+		return "", fmt.Errorf("docker: snapshot cp -a %s -> %s: %w (%s)",
+			srcCodeDir, destCode, err, strings.TrimSpace(string(out)))
+	}
+
+	return destCode, nil
 }
 
 // ── Bind Mount Setup ─────────────────────────────────────────────────────

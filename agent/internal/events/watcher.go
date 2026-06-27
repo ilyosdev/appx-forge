@@ -16,6 +16,14 @@ import (
 // Only containers with this prefix are tracked.
 const containerPrefix = "forge-"
 
+// buildWorkerPrefix is the naming convention for ephemeral build-worker
+// containers (forge-build-<id>). They are deliberately EXCLUDED from event
+// reporting: a build worker has no sandbox row, so emitting
+// container_started/exited/oom events for it would push meaningless
+// sandbox_id="build-<id>" reports into the control plane. The build worker's
+// lifecycle is owned entirely by executeBuildExport + the build reaper.
+const buildWorkerPrefix = "forge-build-"
+
 // EventSource provides access to the Docker events stream.
 // This interface enables mock injection for testing.
 type EventSource interface {
@@ -161,8 +169,13 @@ func (w *Watcher) processStream(
 // Returns false if the event should be ignored (non-forge container or
 // unknown action).
 func (w *Watcher) mapEvent(ev docker.ContainerEvent) (SandboxEvent, bool) {
-	// Filter: only forge-managed containers
+	// Filter: only forge-managed sandbox containers. Build workers
+	// (forge-build-<id>) carry the forge- prefix but are NOT sandboxes —
+	// exclude them so no phantom sandbox events reach the control plane.
 	if !strings.HasPrefix(ev.ContainerName, containerPrefix) {
+		return SandboxEvent{}, false
+	}
+	if strings.HasPrefix(ev.ContainerName, buildWorkerPrefix) {
 		return SandboxEvent{}, false
 	}
 

@@ -18,6 +18,7 @@ import (
 	"github.com/appx/forge/control/internal/lifecycle"
 	"github.com/appx/forge/control/internal/scheduler"
 	"github.com/appx/forge/control/internal/store"
+	"github.com/appx/forge/shared-go/models"
 )
 
 // appNameRegex validates app_name per OpenAPI spec: ^[a-z0-9][a-z0-9-]{1,62}$
@@ -33,6 +34,7 @@ type SandboxLifecycle interface {
 	WakeSandbox(ctx context.Context, id uuid.UUID) error
 	SleepSandbox(ctx context.Context, id uuid.UUID) error
 	DispatchExec(ctx context.Context, sandboxID uuid.UUID, req lifecycle.ExecRequest) (string, error)
+	DispatchBuildExport(ctx context.Context, sandboxID uuid.UUID, req lifecycle.BuildExportRequest) (string, error)
 }
 
 // SandboxMetadataWriter abstracts the metadata-merge store write
@@ -609,6 +611,9 @@ type execResultResponse struct {
 	StdoutTruncated bool   `json:"stdout_truncated,omitempty"`
 	StderrTruncated bool   `json:"stderr_truncated,omitempty"`
 	DurationMs      int64  `json:"duration_ms,omitempty"`
+	// BuildID is set only for build_export results — it identifies the build
+	// snapshot whose dist/ the backend then fetches via ?build=<id>.
+	BuildID string `json:"build_id,omitempty"`
 }
 
 // handleExecSandbox handles POST /v1/sandboxes/{id}/exec.
@@ -697,6 +702,97 @@ func (s *Server) handleExecSandbox(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// buildExportRequest is the JSON body for POST /v1/sandboxes/{id}/build-export.
+// It mirrors execRequest (the export command + env are owned by the backend);
+// the image is resolved from the dev sandbox row server-side.
+type buildExportRequest struct {
+	Command        string            `json:"command"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Env            map[string]string `json:"env,omitempty"`
+	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
+	CPUBurst       bool              `json:"cpu_burst,omitempty"`
+	User           string            `json:"user,omitempty"`
+}
+
+// handleBuildExport handles POST /v1/sandboxes/{id}/build-export.
+// Dispatches an isolated cold web export (build_export command) to the agent
+// hosting the sandbox and returns 202 Accepted with the new command_id. The
+// caller polls GET /v1/sandboxes/{id}/exec/{cmd_id} for the result (which
+// carries build_id once complete), then fetches the dist via
+// GET /v1/sandboxes/{id}/dist?build=<build_id>.
+//
+// Unlike exec, this does NOT require the sandbox to be running: the worker
+// snapshots the on-disk code dir, which persists across a slept sandbox.
+func (s *Server) handleBuildExport(w http.ResponseWriter, r *http.Request) {
+	if s.lifecycle == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+	if s.sandboxReader == nil {
+		ServiceUnavailable(w, "sandbox service not configured")
+		return
+	}
+
+	idStr := chi.URLParam(r, "id")
+	sandboxID, err := uuid.Parse(idStr)
+	if err != nil {
+		BadRequest(w, "invalid sandbox ID: must be a valid UUID")
+		return
+	}
+
+	var req buildExportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		BadRequest(w, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Command) == "" {
+		BadRequest(w, "command is required")
+		return
+	}
+	if req.TimeoutSeconds < 0 {
+		BadRequest(w, "timeout_seconds must be non-negative")
+		return
+	}
+	if req.TimeoutSeconds > 300 {
+		req.TimeoutSeconds = 300
+	}
+
+	// Verify the sandbox exists (cleaner 404) before dispatching; lifecycle
+	// validates node assignment.
+	pgID := pgtype.UUID{Bytes: sandboxID, Valid: true}
+	if _, err := s.sandboxReader.GetSandbox(r.Context(), pgID); err != nil {
+		NotFound(w, "sandbox not found")
+		return
+	}
+
+	cmdID, err := s.lifecycle.DispatchBuildExport(r.Context(), sandboxID, lifecycle.BuildExportRequest{
+		Command:        req.Command,
+		Cwd:            req.Cwd,
+		Env:            req.Env,
+		TimeoutSeconds: req.TimeoutSeconds,
+		CPUBurst:       req.CPUBurst,
+		User:           req.User,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, lifecycle.ErrNotFound):
+			NotFound(w, "sandbox not found")
+		case errors.Is(err, lifecycle.ErrSandboxNotAssigned):
+			ServiceUnavailable(w, "sandbox not assigned to a node")
+		default:
+			s.logger.Error("build_export dispatch failed", "error", err, "sandbox_id", idStr)
+			WriteProblem(w, http.StatusInternalServerError,
+				"urn:forge:error:internal", "Internal Server Error", "failed to dispatch build_export command")
+		}
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, execAcceptResponse{
+		CommandID: cmdID,
+		Status:    "queued",
+	})
+}
+
 // handleGetExecResult handles GET /v1/sandboxes/{id}/exec/{cmd_id}.
 // Returns the current status of the exec command and, once acked, the
 // stdout/stderr/exit_code/duration extracted from the agent's ack result.
@@ -737,10 +833,11 @@ func (s *Server) handleGetExecResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Only return results for exec commands. Other command types (start_sandbox,
-	// stop_sandbox, restart_sandbox) have their own UX and shouldn't leak through
-	// this endpoint shape.
-	if cmd.CommandType != "exec" {
+	// Only return results for exec + build_export commands (the latter reuses
+	// this poll endpoint so waitForExec is shared verbatim). Other command types
+	// (start_sandbox, stop_sandbox, restart_sandbox) have their own UX and
+	// shouldn't leak through this endpoint shape.
+	if cmd.CommandType != "exec" && cmd.CommandType != string(models.CmdBuildExport) {
 		NotFound(w, "command not found")
 		return
 	}
@@ -787,6 +884,9 @@ func (s *Server) handleGetExecResult(w http.ResponseWriter, r *http.Request) {
 				}
 				if f, ok := resultMap["duration_ms"].(float64); ok {
 					resp.DurationMs = int64(f)
+				}
+				if s, ok := resultMap["build_id"].(string); ok {
+					resp.BuildID = s
 				}
 			} else {
 				s.logger.Warn("exec result parse failed",

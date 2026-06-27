@@ -76,6 +76,22 @@ type Client interface {
 	// control plane can run sandboxed shell snippets on behalf of users.
 	ExecRun(ctx context.Context, containerID string, spec ExecSpec) (*ExecResult, error)
 
+	// CreateBuildWorker creates and starts an ephemeral build-worker
+	// container (no dev Metro) for an isolated cold web export. It applies
+	// the SAME security hardening as CreateContainer but: overrides the
+	// image ENTRYPOINT+CMD to a bare `sleep infinity` (so the image seed
+	// logic never clobbers the snapshot's project files), binds a SNAPSHOT
+	// of the project code, omits all port bindings, and is labeled with
+	// `forge.build_id` (NOT `forge.app_name`) so it stays invisible to the
+	// heartbeat snapshot and the orphan reconciler. Returns the container ID.
+	CreateBuildWorker(ctx context.Context, spec *BuildWorkerSpec) (string, error)
+
+	// ListBuildWorkers returns every ephemeral build-worker container
+	// (labeled `forge.build_id`) visible to the daemon. Used by the agent's
+	// build reaper to force-remove workers leaked by an agent crash/restart
+	// — the orphan reconciler never sees them (no app_name label).
+	ListBuildWorkers(ctx context.Context) ([]BuildWorkerInfo, error)
+
 	// Close releases the underlying Docker client resources.
 	Close() error
 }
@@ -127,6 +143,50 @@ type ContainerInfo struct {
 	// wake fast-path needs the kept container's port to ack a routable
 	// upstream.
 	HostPort int
+
+	// Image is the image reference the container was created from
+	// (Config.Image, the operator-supplied tag, falling back to the
+	// resolved image ID). The isolated build-export path inspects the live
+	// dev container to reuse its EXACT image for the build worker, never the
+	// agent's stale default image.
+	Image string
+}
+
+// BuildWorkerSpec defines the parameters for an ephemeral build-worker
+// container (isolated cold web export). It deliberately mirrors the
+// security-relevant subset of SandboxSpec while diverging where the
+// invariant demands it (no dev Metro, no port binding, snapshot bind).
+type BuildWorkerSpec struct {
+	// BuildID names the container `forge-build-<BuildID>` and is stamped as
+	// the `forge.build_id` label. Distinct from the forge-<app> namespace so
+	// the idempotent pre-clean can never target a live dev sandbox, and so
+	// the heartbeat snapshot (keyed on forge.app_name) never reports it.
+	BuildID string
+
+	// Image is the Docker image — MUST be the dev sandbox's exact image
+	// (resolved by the caller), never the agent default.
+	Image string
+
+	// CodePath is the host path of the project code SNAPSHOT, bind-mounted
+	// read-write at /app/code.
+	CodePath string
+
+	// MemoryMB / CPUCores are the worker's own cgroup limits (its own
+	// 2GiB/2cpu, never shared with the dev sandbox).
+	MemoryMB int64
+	CPUCores float64
+
+	// SeccompPath is the seccomp profile path — passed through identically
+	// to CreateContainer to keep hardening parity (see hardenedSecurityOpt).
+	SeccompPath string
+}
+
+// BuildWorkerInfo is a minimal view of a build-worker container used by the
+// build reaper to decide what to force-remove.
+type BuildWorkerInfo struct {
+	ContainerID string
+	BuildID     string
+	CreatedUnix int64 // container creation time (Unix seconds); 0 if unknown
 }
 
 // ContainerEvent represents a Docker container lifecycle event.
@@ -268,6 +328,15 @@ func (d *dockerClient) InspectContainer(ctx context.Context, containerID string)
 	info := &ContainerInfo{
 		ID:   result.Container.ID,
 		Name: result.Container.Name,
+	}
+
+	// Image: prefer the operator-supplied symbolic tag (Config.Image, e.g.
+	// "appx/sandbox:v19") so a recreated container resolves the same tag;
+	// fall back to the resolved image ID when Config is unavailable.
+	if result.Container.Config != nil && result.Container.Config.Image != "" {
+		info.Image = result.Container.Config.Image
+	} else {
+		info.Image = result.Container.Image
 	}
 
 	if result.Container.State != nil {
@@ -532,6 +601,32 @@ func (d *dockerClient) ListContainers(ctx context.Context) ([]ContainerSnapshot,
 		})
 	}
 	return snapshots, nil
+}
+
+// ListBuildWorkers returns every ephemeral build-worker container (labeled
+// `forge.build_id`). These are deliberately absent from ListContainers (which
+// keys on `forge.app_name`), so the heartbeat reconciler never reaps them; the
+// agent's own build reaper uses this method to clean up workers leaked by a
+// crash/restart.
+func (d *dockerClient) ListBuildWorkers(ctx context.Context) ([]BuildWorkerInfo, error) {
+	result, err := d.raw().ContainerList(ctx, dockerclient.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, fmt.Errorf("docker: list build workers: %w", err)
+	}
+
+	workers := make([]BuildWorkerInfo, 0)
+	for _, item := range result.Items {
+		buildID := item.Labels[buildIDLabel]
+		if buildID == "" {
+			continue // not a build worker
+		}
+		workers = append(workers, BuildWorkerInfo{
+			ContainerID: item.ID,
+			BuildID:     buildID,
+			CreatedUnix: item.Created,
+		})
+	}
+	return workers, nil
 }
 
 // ── Container Port Constants ─────────────────────────────────────────────

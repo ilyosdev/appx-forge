@@ -21,14 +21,16 @@ import (
 type mockDockerClient struct {
 	mu sync.Mutex
 
-	createContainerFn  func(ctx context.Context, spec *docker.SandboxSpec) (string, error)
-	stopContainerFn    func(ctx context.Context, containerID string, timeout time.Duration) error
-	removeContainerFn  func(ctx context.Context, containerID string) error
-	restartContainerFn func(ctx context.Context, containerID string, timeout time.Duration) error
-	getLogsFn          func(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
-	startContainerFn   func(ctx context.Context, containerID string) error
-	listContainersFn   func(ctx context.Context) ([]docker.ContainerSnapshot, error)
-	execRunFn          func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
+	createContainerFn   func(ctx context.Context, spec *docker.SandboxSpec) (string, error)
+	stopContainerFn     func(ctx context.Context, containerID string, timeout time.Duration) error
+	removeContainerFn   func(ctx context.Context, containerID string) error
+	restartContainerFn  func(ctx context.Context, containerID string, timeout time.Duration) error
+	getLogsFn           func(ctx context.Context, containerID string, tail int, follow bool) (io.ReadCloser, error)
+	startContainerFn    func(ctx context.Context, containerID string) error
+	listContainersFn    func(ctx context.Context) ([]docker.ContainerSnapshot, error)
+	execRunFn           func(ctx context.Context, containerID string, spec docker.ExecSpec) (*docker.ExecResult, error)
+	createBuildWorkerFn func(ctx context.Context, spec *docker.BuildWorkerSpec) (string, error)
+	listBuildWorkersFn  func(ctx context.Context) ([]docker.BuildWorkerInfo, error)
 
 	// Track calls for assertions
 	createCalls  []docker.SandboxSpec
@@ -145,6 +147,20 @@ func (m *mockDockerClient) ExecRun(ctx context.Context, containerID string, spec
 		return fn(ctx, containerID, spec)
 	}
 	return &docker.ExecResult{ExitCode: 0}, nil
+}
+
+func (m *mockDockerClient) CreateBuildWorker(ctx context.Context, spec *docker.BuildWorkerSpec) (string, error) {
+	if m.createBuildWorkerFn != nil {
+		return m.createBuildWorkerFn(ctx, spec)
+	}
+	return "build-worker-abc123", nil
+}
+
+func (m *mockDockerClient) ListBuildWorkers(ctx context.Context) ([]docker.BuildWorkerInfo, error) {
+	if m.listBuildWorkersFn != nil {
+		return m.listBuildWorkersFn(ctx)
+	}
+	return []docker.BuildWorkerInfo{}, nil
 }
 
 func (m *mockDockerClient) Close() error {

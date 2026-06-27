@@ -60,6 +60,7 @@ func (s *Server) RegisterRoutes() {
 						r.Use(apimw.ExecJWT(s.config.execJWTSecret))
 					}
 					r.Post("/sandboxes/{id}/exec", s.handleExecSandbox)
+					r.Post("/sandboxes/{id}/build-export", s.handleBuildExport)
 					r.Get("/sandboxes/{id}/exec/{cmd_id}", s.handleGetExecResult)
 				})
 

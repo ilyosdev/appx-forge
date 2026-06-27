@@ -129,6 +129,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	// a kept container's port to a new sandbox (collision on docker start).
 	a.executor.AdoptBootSnapshot(initial)
 
+	// Build-export cleanup: on startup, force-remove every leaked build worker
+	// + snapshot (the in-memory buildDirs resolver did not survive the restart,
+	// so no in-flight build can be completed anyway). Then run a periodic reaper
+	// as the steady-state backstop bounding disk + leaked cgroups.
+	a.executor.ReapBuilds(ctx, 0)
+	go a.buildReaperLoop(ctx)
+
 	// Step 1: Register with control plane (retries internally)
 	a.logger.Info("registering with control plane", "url", a.cfg.ControlURL)
 	regResp, err := a.ctrlClient.Register(ctx)
@@ -264,6 +271,30 @@ func (a *Agent) pollLoop(ctx context.Context) {
 					"error", err,
 				)
 			}
+		}
+	}
+}
+
+// buildReaperConfig — sweep cadence + snapshot/worker retention for the
+// isolated build-export backstop. Retention sits comfortably above a cold
+// export (~73s) plus the backend's dist fetch, so the reaper never races an
+// in-flight build, while still bounding disk + leaked cgroups within minutes.
+const (
+	buildReapInterval  = 5 * time.Minute
+	buildReapRetention = 15 * time.Minute
+)
+
+// buildReaperLoop periodically reaps stale build snapshots + leaked build-worker
+// containers. Stops when ctx is cancelled.
+func (a *Agent) buildReaperLoop(ctx context.Context) {
+	ticker := time.NewTicker(buildReapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			a.executor.ReapBuilds(ctx, buildReapRetention)
 		}
 	}
 }

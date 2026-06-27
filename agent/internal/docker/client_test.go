@@ -14,7 +14,7 @@ type mockClient struct{}
 func (m *mockClient) CreateContainer(_ context.Context, _ *SandboxSpec) (string, error) {
 	return "mock-container-id", nil
 }
-func (m *mockClient) StartContainer(_ context.Context, _ string) error  { return nil }
+func (m *mockClient) StartContainer(_ context.Context, _ string) error { return nil }
 func (m *mockClient) StopContainer(_ context.Context, _ string, _ time.Duration) error {
 	return nil
 }
@@ -42,6 +42,12 @@ func (m *mockClient) ListContainers(_ context.Context) ([]ContainerSnapshot, err
 }
 func (m *mockClient) ExecRun(_ context.Context, _ string, _ ExecSpec) (*ExecResult, error) {
 	return &ExecResult{}, nil
+}
+func (m *mockClient) CreateBuildWorker(_ context.Context, _ *BuildWorkerSpec) (string, error) {
+	return "", nil
+}
+func (m *mockClient) ListBuildWorkers(_ context.Context) ([]BuildWorkerInfo, error) {
+	return nil, nil
 }
 func (m *mockClient) Close() error { return nil }
 
